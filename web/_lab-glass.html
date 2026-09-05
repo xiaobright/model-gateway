@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>液态玻璃实验台 · Model Gateway</title>
+<!-- 一次性对比用的实验页，跟正式界面无关，看完可以直接删。
+     打开 http://127.0.0.1:8317/static/_lab-glass.html -->
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+
+/* ---------------------------------------------------------- 控制条 */
+.bar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 10px 18px; background: #16181d; color: #e8e8ea; font-size: 12.5px;
+}
+.bar label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
+.bar input[type=range] { width: 108px; }
+.bar .grow { flex: 1; }
+.bar b { font-variant-numeric: tabular-nums; }
+.fps { padding: 2px 10px; border-radius: 99px; background: #2a2d35; }
+
+/* ---------------------------------------------------------- 舞台 */
+.stage { position: relative; overflow: hidden; padding: 0 0 30px; }
+.stage.light { --ink: #1d1d1f; --ink2: #47474b; --ink3: #6b6b73; background: #e9eeff; }
+.stage.dark  { --ink: #f5f5f7; --ink2: #c9c9ce; --ink3: #9a9aa1; background: #0a0b10; }
+.stage h2 { position: relative; z-index: 3; margin: 0; padding: 18px 28px 4px; font-size: 13px; color: var(--ink3); font-weight: 600; }
+
+/* 背景色团：blur 小一些才留得下可被折射的形状 */
+.lobe { position: absolute; border-radius: 50%; filter: blur(52px); will-change: transform; }
+.light .lobe { mix-blend-mode: multiply; opacity: .5; }
+.dark  .lobe { mix-blend-mode: screen; opacity: .55; }
+.l1 { width: 460px; height: 380px; background: #5b8cff; top: -90px;  left: -40px;  animation: d1 48s ease-in-out infinite alternate; }
+.l2 { width: 420px; height: 420px; background: #c168ff; bottom: -150px; left: 34%;  animation: d2 56s ease-in-out infinite alternate; }
+.l3 { width: 380px; height: 300px; background: #22d3ee; top: 28%;    right: -60px; animation: d3 42s ease-in-out infinite alternate; }
+.l4 { width: 300px; height: 300px; background: #ffb020; bottom: -90px; right: 14%;  animation: d1 62s ease-in-out infinite alternate-reverse; }
+@keyframes d1 { to { transform: translate3d(110px, 70px, 0) scale(1.18); } }
+@keyframes d2 { to { transform: translate3d(-130px, -60px, 0) scale(1.12); } }
+@keyframes d3 { to { transform: translate3d(-90px, 90px, 0) scale(1.22); } }
+body.no-flow .lobe { animation: none !important; }
+body.no-structure .lobe { filter: blur(100px); }
+
+/* 细网格：给折射一点高频可抓的东西。这就是「背景结构」的关键 */
+.grid { position: absolute; inset: 0; z-index: 0; }
+.light .grid {
+  background-image: linear-gradient(rgba(90, 110, 170, .10) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(90, 110, 170, .10) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+.dark .grid {
+  background-image: linear-gradient(rgba(255, 255, 255, .055) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255, 255, 255, .055) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+body.no-structure .grid { display: none; }
+
+/* ---------------------------------------------------------- 卡片 */
+.row { position: relative; z-index: 2; display: flex; gap: 24px; padding: 10px 28px 0; flex-wrap: wrap; align-items: flex-start; }
+.card { width: 360px; border-radius: 24px; position: relative; padding: 18px 22px 20px; color: var(--ink); }
+.card .tag { font-size: 11.5px; font-weight: 600; letter-spacing: .3px; color: var(--ink3); }
+.card h3 { margin: 2px 0 0; font-size: 13.5px; font-weight: 600; }
+.card .big { font-size: 31px; font-weight: 700; letter-spacing: -.6px; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
+.card .big span { font-size: 13px; font-weight: 500; color: var(--ink3); }
+.card .sub { font-size: 12px; color: var(--ink3); margin: 3px 0 0; }
+.card .bar2 { height: 7px; border-radius: 99px; margin-top: 14px; background: rgba(120, 140, 190, .22); overflow: hidden; }
+.dark .card .bar2 { background: rgba(255, 255, 255, .14); }
+.card .bar2 i { display: block; height: 100%; width: 68%; border-radius: 99px; background: #0a84ff; }
+.card table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+.card td { padding: 5px 2px; border-bottom: 1px solid rgba(125, 140, 180, .18); color: var(--ink2); }
+.dark .card td { border-bottom-color: rgba(255, 255, 255, .10); }
+.card td:last-child { text-align: right; color: var(--ink3); font-variant-numeric: tabular-nums; }
+
+/* ---------- 甲：现在的毛玻璃 ---------- */
+.light .now {
+  background: rgba(255, 255, 255, .68); border: 1px solid rgba(255, 255, 255, .85);
+  box-shadow: 0 4px 20px -2px rgba(31, 38, 135, .07), inset 0 1px 1.5px rgba(255, 255, 255, .95);
+  backdrop-filter: blur(32px) saturate(180%);
+}
+.dark .now {
+  background: rgba(30, 32, 42, .62); border: 1px solid rgba(255, 255, 255, .12);
+  box-shadow: 0 6px 28px rgba(0, 0, 0, .55), inset 0 1px 1px rgba(255, 255, 255, .18);
+  backdrop-filter: blur(32px) saturate(180%);
+}
+
+/* ---------- 乙：液态玻璃 ---------- */
+.glass { isolation: isolate; }
+.light .glass {
+  background: rgba(255, 255, 255, .22); border: 1px solid rgba(126, 146, 196, .28);
+  box-shadow: 0 14px 38px -12px rgba(24, 34, 86, .30),
+              inset 0 1px 0 rgba(255, 255, 255, .98),
+              inset 0 -1px 0 rgba(255, 255, 255, .42),
+              inset 0 -22px 26px -24px rgba(40, 55, 110, .30);
+}
+.dark .glass {
+  background: rgba(255, 255, 255, .055); border: 1px solid rgba(255, 255, 255, .16);
+  box-shadow: 0 16px 40px -10px rgba(0, 0, 0, .70),
+              inset 0 1px 0 rgba(255, 255, 255, .42),
+              inset 0 -1px 0 rgba(255, 255, 255, .10),
+              inset 0 -24px 28px -26px rgba(0, 0, 0, .50);
+}
+/* 镜面高光弧：1.5px 的环，亮处集中在上缘和左缘（光源在左上） */
+.glass::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: 1;
+  padding: 1.5px;
+  background: conic-gradient(from 205deg,
+    rgba(255, 255, 255, 0) 0deg, rgba(255, 255, 255, .90) 42deg, rgba(255, 255, 255, .15) 96deg,
+    rgba(255, 255, 255, 0) 150deg, rgba(255, 255, 255, .55) 232deg, rgba(255, 255, 255, .05) 300deg,
+    rgba(255, 255, 255, 0) 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+body.no-rim .glass::before { display: none; }
+
+/* 可读性纱：只在上半部压一层同色薄纱，把文字所在区域垫实 */
+.glass::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: 0;
+  background: linear-gradient(180deg, rgba(255, 255, 255, .30), rgba(255, 255, 255, .06) 62%, rgba(255, 255, 255, 0));
+}
+.dark .glass::after {
+  background: linear-gradient(180deg, rgba(20, 24, 36, .34), rgba(20, 24, 36, .10) 62%, rgba(20, 24, 36, 0));
+}
+body.no-scrim .glass::after { display: none; }
+.glass > * { position: relative; z-index: 2; }
+
+/* 无障碍兜底：系统要求减少透明或提高对比时，玻璃直接退成实底 */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  .glass { backdrop-filter: none !important; }
+  .light .glass { background: #f4f6fd; }
+  .dark  .glass { background: #16181f; }
+}
+</style>
+</head>
+<body>
+<div class="bar">
+  <label><input type="checkbox" id="t-refract" checked> 折射(SVG)</label>
+  <label><input type="checkbox" id="t-rim" checked> 镜面弧</label>
+  <label><input type="checkbox" id="t-structure" checked> 背景结构</label>
+  <label><input type="checkbox" id="t-flow" checked> 背景流动</label>
+  <label><input type="checkbox" id="t-scrim" checked> 可读性纱</label>
+  <label>斜面 <input type="range" id="s-bevel" min="6" max="48" value="20"><b id="v-bevel">20</b>px</label>
+  <label>折射强度 <input type="range" id="s-scale" min="0" max="120" value="46"><b id="v-scale">46</b></label>
+  <label>模糊 <input type="range" id="s-blur" min="0" max="30" value="9"><b id="v-blur">9</b>px</label>
+  <span class="grow"></span>
+  <span class="fps">帧率 <b id="fps">–</b> fps · dpr <b id="dpr"></b></span>
+</div>
+<section class="stage light" id="stage-light">
+  <div class="lobe l1"></div><div class="lobe l2"></div><div class="lobe l3"></div><div class="lobe l4"></div>
+  <div class="grid"></div>
+  <h2>浅色</h2>
+  <div class="row"></div>
+</section>
+
+<section class="stage dark" id="stage-dark">
+  <div class="lobe l1"></div><div class="lobe l2"></div><div class="lobe l3"></div><div class="lobe l4"></div>
+  <div class="grid"></div>
+  <h2>深色</h2>
+  <div class="row"></div>
+</section>
+
+<svg id="defs" width="0" height="0" style="position:absolute" aria-hidden="true"></svg>
+
+<script>
+/* 位移图：R 通道编码横向位移、G 通道编码纵向位移，128 = 不位移。
+   从边缘往里 bevel 像素内按 smoothstep 过渡，中间一大片保持 128，
+   于是只有边缘那一圈像透镜一样把背景掰弯。
+   两张渐变用 screen 叠加，正好各自只贡献一个通道。 */
+function lensMap(w, h, bevel) {
+  const prof = [0, 20, 64, 108, 128], n = prof.length - 1;
+  const stops = (len, ch) => {
+    const b = Math.min(0.45, bevel / len);
+    const col = (v) => (ch === 'r' ? `rgb(${v},0,0)` : `rgb(0,${v},0)`);
+    let s = '';
+    for (let i = 0; i <= n; i++) s += `<stop offset='${(b * i / n).toFixed(5)}' stop-color='${col(prof[i])}'/>`;
+    for (let i = n; i >= 0; i--) s += `<stop offset='${(1 - b * i / n).toFixed(5)}' stop-color='${col(255 - prof[i])}'/>`;
+    return s;
+  };
+  return "<svg xmlns='http://www.w3.org/2000/svg' width='" + w + "' height='" + h + "'><defs>"
+    + "<linearGradient id='h' x1='0' y1='0' x2='1' y2='0'>" + stops(w, 'r') + "</linearGradient>"
+    + "<linearGradient id='v' x1='0' y1='0' x2='0' y2='1'>" + stops(h, 'g') + "</linearGradient></defs>"
+    + "<rect width='100%' height='100%' fill='url(#h)'/>"
+    + "<rect width='100%' height='100%' fill='url(#v)' style='mix-blend-mode:screen'/></svg>";
+}
+
+const CARDS = [
+  { cls: 'now', tag: '甲 · 现在的毛玻璃', title: '累计转发', kind: 'kpi' },
+  { cls: 'glass', tag: '乙 · 液态玻璃', title: '累计转发', kind: 'kpi' },
+  { cls: 'glass', tag: '乙 · 液态玻璃 · 文字密集', title: '上游健康', kind: 'table' },
+];
+
+const ROWS = [['站A', '86.3% · P95 85.3s'], ['站B', '89.9% · P95 23.4s'],
+  ['站E', '100% · P95 65.3s'], ['站C', '85.7% · P95 70.7s']];
+
+function cardHtml(c) {
+  const body = c.kind === 'kpi'
+    ? `<div class="big">2,000 <span>次</span></div>
+       <div class="sub">入 207.5M · 出 835.0K tokens</div><div class="bar2"><i></i></div>`
+    : `<table>${ROWS.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table>`;
+  return `<div class="card ${c.cls}"><div class="tag">${c.tag}</div><h3>${c.title}</h3>${body}</div>`;
+}
+
+for (const row of document.querySelectorAll('.row')) {
+  row.innerHTML = CARDS.map(cardHtml).join('');
+}
+
+/* 位移图必须按每张卡的实际尺寸生成，否则 feImage 被拉伸，斜面宽度会跟着卡片
+   长宽比变形（宽卡横向斜面被拉得很宽）。所以一张卡一个 filter。 */
+const defs = document.getElementById('defs');
+const $ = (id) => document.getElementById(id);
+
+function rebuild() {
+  const bevel = +$('s-bevel').value;
+  const scale = +$('s-scale').value;
+  const blur = +$('s-blur').value;
+  const refract = $('t-refract').checked;
+  $('v-bevel').textContent = bevel;
+  $('v-scale').textContent = scale;
+  $('v-blur').textContent = blur;
+
+  let svg = '';
+  document.querySelectorAll('.glass').forEach((el, i) => {
+    const r = el.getBoundingClientRect();
+    const w = Math.max(1, Math.round(r.width));
+    const h = Math.max(1, Math.round(r.height));
+    const href = 'data:image/svg+xml;utf8,' + encodeURIComponent(lensMap(w, h, bevel));
+    svg += `<filter id="lens${i}" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB">`
+      + `<feImage result="m" preserveAspectRatio="none" x="0%" y="0%" width="100%" height="100%" href="${href}"/>`
+      + `<feDisplacementMap in="SourceGraphic" in2="m" scale="${scale}" xChannelSelector="R" yChannelSelector="G" result="d"/>`
+      + `<feGaussianBlur in="d" stdDeviation="0.7"/></filter>`;
+    const dark = el.closest('.dark');
+    el.style.backdropFilter = (refract ? `url(#lens${i}) ` : '')
+      + `blur(${blur}px) saturate(${dark ? 180 : 175}%) brightness(${dark ? 1.10 : 1.02})`;
+  });
+  defs.innerHTML = svg;
+}
+
+const TOGGLES = { 't-rim': 'no-rim', 't-structure': 'no-structure', 't-flow': 'no-flow', 't-scrim': 'no-scrim' };
+for (const [id, cls] of Object.entries(TOGGLES)) {
+  $(id).addEventListener('change', () => document.body.classList.toggle(cls, !$(id).checked));
+}
+for (const id of ['t-refract', 's-bevel', 's-scale', 's-blur']) {
+  $(id).addEventListener('input', rebuild);
+}
+
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(rebuild, 150);
+});
+
+$('dpr').textContent = window.devicePixelRatio;
+rebuild();
+
+/* 帧率：背景一直在动，所以这个数直接反映玻璃的合成开销 */
+let frames = 0, t0 = performance.now();
+(function tick() {
+  frames++;
+  const dt = performance.now() - t0;
+  if (dt >= 700) {
+    $('fps').textContent = Math.round((frames * 1000) / dt);
+    frames = 0; t0 = performance.now();
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

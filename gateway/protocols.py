@@ -1,0 +1,129 @@
+"""按协议不同的那几处细节，集中在这里。
+
+网关本身不做格式转换：下游打哪个路径，就原样转发到上游对应的路径。所以「协议」是
+请求的属性，不是站点的属性 —— 公益站基本都在同一个 base_url、同一个 key 下同时挂着
+两种接口，给上游表加 protocol 列只会逼人把同一个站注册两遍。
+
+真正随协议变的只有四件事，全在下面的描述符里：结束标记、usage 字段位置、鉴权头、
+以及网关自己产生错误时的错误体形状。要再加一种协议（比如 chat-completions），
+写一个描述符 + 一条路由即可。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Callable
+
+# 上游的 usage 是从字节流里正则捞的，不做完整 SSE 解析：只要认出数字就够记账，
+# 而任何一次解析失败都不该影响转发本身。
+Usage = tuple[int | None, int | None, int | None]   # (输入, 输出, 缓存读取)
+
+_IN = re.compile(rb'"input_tokens":\s*(\d+)')
+_OUT = re.compile(rb'"output_tokens":\s*(\d+)')
+_CACHED = re.compile(rb'"cached_tokens":\s*(\d+)')
+_CACHE_READ = re.compile(rb'"cache_read_input_tokens":\s*(\d+)')
+
+
+def _last(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
+    """最后一次出现的值：流式 usage 会被多次改写，最后那次才是终值。"""
+    for buf in reversed(bufs):
+        found = pattern.findall(buf)
+        if found:
+            return int(found[-1])
+    return None
+
+
+def _largest(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
+    """所有出现里最大的那个。用于只报一次终值、但可能被别处写成占位 0/1 的字段。"""
+    values = [int(v) for buf in bufs for v in pattern.findall(buf)]
+    return max(values) if values else None
+
+
+def openai_usage(head: bytes, tail: bytes) -> Usage:
+    """Responses API 只在最后的 response.completed 里报一次 usage，看尾巴就够。"""
+    return _last(_IN, tail), _last(_OUT, tail), _last(_CACHED, tail)
+
+
+def anthropic_usage(head: bytes, tail: bytes) -> Usage:
+    """Messages API 的 usage 被拆在流的两头。
+
+    `input_tokens` 和 `cache_read_input_tokens` 只出现在**开头**的 message_start 里，
+    终值 `output_tokens` 在**末尾**的 message_delta 里。SSE 每个 delta 事件一百多字节
+    只带几个字，几百 token 的回复就能把 message_start 挤出尾部窗口 —— 所以必须头尾都留。
+    """
+    return (
+        _largest(_IN, head, tail),
+        _last(_OUT, head, tail),
+        _largest(_CACHE_READ, head, tail),
+    )
+
+
+def openai_error(status: int, message: str) -> dict:
+    return {"error": {"message": message, "type": "gateway_error", "code": status}}
+
+
+# Anthropic 的错误体形状和 OpenAI 不一样，type 还得按状态码给对应的名字
+_ANTHROPIC_ERROR_TYPE = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    529: "overloaded_error",
+}
+
+
+def anthropic_error(status: int, message: str) -> dict:
+    kind = _ANTHROPIC_ERROR_TYPE.get(status, "api_error")
+    return {"type": "error", "error": {"type": kind, "message": message}}
+
+
+def openai_auth(api_key: str) -> dict[str, str]:
+    return {"authorization": f"Bearer {api_key}"}
+
+
+def anthropic_auth(api_key: str) -> dict[str, str]:
+    """两种鉴权头都发。
+
+    Anthropic 官方认 `x-api-key`，中转站大多两种都认。关键是 `x-api-key` 必须**覆盖**：
+    Claude Code 自己会带一个占位 key，只设 authorization 的话那个占位值会把真 key 压掉。
+    某个站只吃一种头时，用该上游的「请求头覆写」把另一个写成 null 删掉。
+    """
+    return {"authorization": f"Bearer {api_key}", "x-api-key": api_key}
+
+
+@dataclass(frozen=True, slots=True)
+class Protocol:
+    name: str
+    # 流结束的标记。少一个就会把正常结束的流误判成「被截断」
+    end_markers: tuple[bytes, ...]
+    extract_usage: Callable[[bytes, bytes], Usage]
+    error_body: Callable[[int, str], dict]
+    auth_headers: Callable[[str], dict[str, str]]
+    # 客户端没带时补上的头
+    defaults: dict[str, str] = field(default_factory=dict)
+    # 非空表示这个协议用这个头传 beta 开关（1M 上下文就走它）
+    beta_header: str = ""
+
+
+OPENAI = Protocol(
+    name="openai",
+    end_markers=(b"response.completed", b"[DONE]"),
+    extract_usage=openai_usage,
+    error_body=openai_error,
+    auth_headers=openai_auth,
+)
+
+ANTHROPIC = Protocol(
+    name="anthropic",
+    # message_stop 是 Messages API 的结束事件；[DONE] 是给「OpenAI 转 Anthropic」
+    # 那类中转站留的，它们有时会在末尾多发一行
+    end_markers=(b"message_stop", b"[DONE]"),
+    extract_usage=anthropic_usage,
+    error_body=anthropic_error,
+    auth_headers=anthropic_auth,
+    defaults={"anthropic-version": "2023-06-01"},
+    beta_header="anthropic-beta",
+)
