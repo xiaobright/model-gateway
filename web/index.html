@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Model Gateway 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css?v=5">
+<link rel="stylesheet" href="/static/style.css?v=6">
 </head>
 <body>
 <div class="blob blob-1"></div>
@@ -123,10 +123,10 @@
         <span class="grow"></span>
         <button class="btn btn-sm" data-act="new-upstream">添加供应商</button>
       </div>
-      <section class="card">
+      <section class="card" data-flat>
         <p class="card-hint">一个供应商 = 一个站（一个站根地址，<b>不带 /v1</b>）。同一个站的多把 key、
           以及 Anthropic / OpenAI 两种接口，都是它下面的<b>分组</b>：接口、key、模型列表都在分组上 ——
-          点行首的箭头展开。</p>
+          点一行的空白处展开看，或者进「编辑」里改。</p>
         <div class="card-body scroll-x">
           <table class="tbl-upstreams">
             <thead><tr>
@@ -157,7 +157,7 @@
         <button class="btn btn-ghost btn-sm" data-act="reload-log">刷新</button>
         <button class="btn btn-danger btn-sm" data-act="clear-log">清空</button>
       </div>
-      <section class="card">
+      <section class="card" data-flat>
         <div class="card-body scroll-y scroll-x">
           <table>
             <thead><tr>
@@ -175,10 +175,13 @@
   </main>
 </div>
 
-<!-- ============ 供应商编辑（只管站在哪、怎么连；key 和接口在分组里） ============ -->
+<!-- ============ 供应商编辑（站在哪、怎么连 + 它的分组；key 和接口在分组里） ============ -->
 <dialog id="up-dialog">
   <form id="up-form">
-    <div class="dlg-head"><h2 id="up-title">添加供应商</h2></div>
+    <div class="dlg-head">
+      <h2 id="up-title">添加供应商</h2><span class="grow"></span>
+      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+    </div>
     <div class="dlg-body">
       <div class="grid-2">
         <label class="field">名称
@@ -191,29 +194,48 @@
           <input type="text" id="up-base" placeholder="https://xxx.com" autocomplete="off" required>
           <span class="dim" id="up-base-hint" style="font-size:12px;margin-top:5px"></span>
         </label>
-        <label class="field wide">请求头覆写（JSON，可选；值写 null 表示删掉那个头）
-          <textarea id="up-override" rows="3" placeholder='{"user-agent": "codex_cli_rs", "originator": "codex_cli_rs"}'></textarea>
-        </label>
       </div>
-      <div class="field-row" style="margin-top:9px">
-        <button type="button" class="btn btn-ghost btn-sm" data-act="preset-fp" data-fp="openai">填入 codex 指纹</button>
-        <button type="button" class="btn btn-ghost btn-sm" data-act="preset-fp" data-fp="anthropic">填入 claude 指纹</button>
-        <span class="dim" style="font-size:12px">给按客户端指纹拦截的站点用</span>
+
+      <!-- 低频：只有被指纹拦的站才要动，默认收起来 -->
+      <details class="adv" id="up-adv">
+        <summary>请求头覆写 <span class="tag" id="up-ov-tag" hidden></span></summary>
+        <div class="adv-body">
+          <label class="field">JSON；值写 null 表示删掉那个头。给按客户端指纹拦截的站点用。
+            <textarea id="up-override" rows="3" placeholder='{"user-agent": "codex_cli_rs", "originator": "codex_cli_rs"}'></textarea>
+          </label>
+          <div class="field-row" style="margin-top:8px">
+            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-fp" data-fp="openai">填入 codex 指纹</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-fp" data-fp="anthropic">填入 claude 指纹</button>
+          </div>
+        </div>
+      </details>
+
+      <!-- 分组的二级管理：列表在这儿，改一个就叠一层分组弹窗上去 -->
+      <div id="up-groups-wrap" hidden>
+        <div class="dlg-section divider">分组 <span class="tag" id="up-gcount"></span></div>
+        <div id="up-groups"></div>
+        <div class="field-row" style="margin-top:10px">
+          <button type="button" class="btn btn-ghost btn-sm" data-act="new-group" id="up-add-group">＋ 添加分组</button>
+          <span class="dim" style="font-size:12px">接口、API Key、模型列表都在分组上</span>
+        </div>
       </div>
       <p class="card-hint" id="up-groups-hint" hidden style="margin:14px 0 0"></p>
     </div>
     <div class="dlg-foot">
+      <span class="dim" style="font-size:12px">名称 / 地址 / 覆写要点保存才生效</span>
       <span class="grow"></span>
-      <button type="button" class="btn btn-ghost" data-act="close-dialog">取消</button>
       <button type="submit" class="btn" id="up-save">保存</button>
     </div>
   </form>
 </dialog>
 
-<!-- ============ 分组编辑（哪种接口 + 哪把 key + 能看到哪些模型） ============ -->
+<!-- ============ 分组编辑（哪种接口 + 哪把 key + 有哪些模型） ============ -->
 <dialog id="group-dialog">
   <form id="group-form">
-    <div class="dlg-head"><h2 id="grp-title">添加分组</h2></div>
+    <div class="dlg-head">
+      <h2 id="grp-title">添加分组</h2><span class="grow"></span>
+      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+    </div>
     <div class="dlg-body">
       <div class="grid-2">
         <label class="field">分组名
@@ -238,25 +260,30 @@
       </div>
       <p class="card-hint" id="grp-proto-hint" hidden style="margin:12px 0 0"></p>
 
+      <!-- 模型列表是即时生效的：勾上=加候选，取消=删候选，和上面那些要保存的字段分开 -->
       <div id="grp-import" hidden>
-        <div class="dlg-section divider">用这个分组的 key 拉模型 <span class="tag" id="grp-mcount"></span></div>
+        <div class="dlg-section divider">这个分组里的模型 <span class="tag" id="grp-mcount"></span></div>
+        <p class="dim" style="font-size:12px;margin:0 0 9px">
+          勾上 / 取消<b>立刻生效</b>，不用点保存。上面的组名、接口、Key 才要保存。</p>
         <div class="field-row">
           <button type="button" class="btn btn-ghost btn-sm" data-act="pull-models">拉取模型列表</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-act="pick-all">全选</button>
+          <button type="button" class="btn btn-danger btn-sm" data-act="pick-none">全不选</button>
+          <span class="grow"></span>
           <span class="dim" id="grp-pull-status" style="font-size:12px"></span>
         </div>
-        <div class="field-row" id="grp-pick-bar" style="margin-top:9px" hidden>
+        <div class="field-row" style="margin-top:9px">
           <input type="search" class="search" id="grp-picker-filter" placeholder="过滤…">
-          <button type="button" class="btn btn-ghost btn-sm" data-act="pick-all">全选</button>
-          <button type="button" class="btn btn-ghost btn-sm" data-act="pick-none">清空</button>
-          <span class="grow"></span>
-          <button type="button" class="btn btn-sm" data-act="import-picked">导入所选</button>
+          <span class="key-wrap" style="flex:1;min-width:200px">
+            <input type="text" id="grp-manual" placeholder="上游没列出来的，手动填模型 id，回车加" autocomplete="off">
+            <button type="button" class="btn btn-ghost btn-sm" data-act="manual-add">添加</button>
+          </span>
         </div>
-        <div class="picker" id="grp-picker" hidden></div>
+        <div class="picker" id="grp-picker"></div>
       </div>
     </div>
     <div class="dlg-foot">
       <span class="grow"></span>
-      <button type="button" class="btn btn-ghost" data-act="close-dialog">取消</button>
       <button type="submit" class="btn" id="grp-save">保存</button>
     </div>
   </form>
@@ -265,7 +292,10 @@
 <!-- ============ 新增模型 / 追加候选 / 改候选 ============ -->
 <dialog id="route-dialog" class="sm">
   <form id="route-form">
-    <div class="dlg-head"><h2 id="route-title">新增模型</h2></div>
+    <div class="dlg-head">
+      <h2 id="route-title">新增模型</h2><span class="grow"></span>
+      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+    </div>
     <div class="dlg-body">
       <label class="field">模型名（下游按这个名字调用）
         <input type="text" id="rt-model" placeholder="如 gpt-5.6-luna" autocomplete="off" required>
@@ -280,7 +310,9 @@
         <select id="rt-group"></select>
       </label>
       <label class="field" style="margin-top:11px">上游那边的真实模型名
-        <input type="text" id="rt-remote" placeholder="留空 = 与模型名相同" autocomplete="off">
+        <input type="text" id="rt-remote" list="rt-remote-list" placeholder="留空 = 与模型名相同" autocomplete="off">
+        <datalist id="rt-remote-list"></datalist>
+        <span class="dim" id="rt-remote-hint" style="font-size:12px;margin-top:4px"></span>
       </label>
       <label class="checkline" id="rt-onem-wrap" style="margin-top:12px">
         <input type="checkbox" id="rt-onem">
@@ -289,7 +321,6 @@
     </div>
     <div class="dlg-foot">
       <span class="grow"></span>
-      <button type="button" class="btn btn-ghost" data-act="close-dialog">取消</button>
       <button type="submit" class="btn" id="rt-save">添加</button>
     </div>
   </form>
@@ -297,12 +328,11 @@
 
 <!-- ============ 下游接入信息 ============ -->
 <dialog id="access-dialog">
-  <div class="dlg-head"><h2>下游接入</h2></div>
+  <div class="dlg-head">
+    <h2>下游接入</h2><span class="grow"></span>
+    <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+  </div>
   <div class="dlg-body" id="access-body"></div>
-  <form method="dialog" class="dlg-foot">
-    <span class="grow"></span>
-    <button class="btn">关闭</button>
-  </form>
 </dialog>
 
 <!-- ============ 确认框：始终开在其它弹窗之上，不会被下层的模糊糊掉 ============ -->
@@ -317,6 +347,6 @@
 </dialog>
 
 <div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
-<script type="module" src="/static/app.js?v=5"></script>
+<script type="module" src="/static/app.js?v=6"></script>
 </body>
 </html>

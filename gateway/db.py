@@ -601,13 +601,24 @@ def update_model_route(model_name: str, group_id: int, remote_model: str) -> boo
         return cur.rowcount > 0
 
 
-def add_routes_for_group(group_id: int, model_names: Iterable[str]) -> int:
+def add_routes_for_group(group_id: int, model_names: Iterable[str]) -> tuple[int, tuple[str, ...]]:
+    """批量加候选，返回 (加上了几个, 跳过了哪些)。
+
+    跳过的是「这个名字已经在另一种接口下暴露了」的：拉一个站的模型列表常常几十上百个，
+    里面撞上一两个不能挂的就整批失败、一个都不落库，比跳过难用得多。重复的不算跳过
+    （已经有了本来就是想要的结果）。"""
     added = 0
+    skipped: list[str] = []
     for raw in model_names:
         name = raw.strip()
-        if name and add_model_route(name, group_id, name):
-            added += 1
-    return added
+        if not name:
+            continue
+        try:
+            if add_model_route(name, group_id, name):
+                added += 1
+        except ProtocolMismatch:
+            skipped.append(name)
+    return added, tuple(skipped)
 
 def delete_model_route(model_name: str, group_id: int) -> bool:
     with _conn() as conn:

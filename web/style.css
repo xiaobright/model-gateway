@@ -741,6 +741,16 @@ dialog.sm { max-width: 420px; }
   display: flex; align-items: center; gap: 8px;
 }
 .dlg-head h2 { font-size: 16px; margin: 0; font-weight: 600; }
+.dlg-head .grow { flex: 1; }
+/* 右上角的关闭。原来底下那个「取消」是个谎：分组里的模型勾选是即时生效的，
+   点「取消」并不会撤回来 —— 现在只留一个中性的关闭。 */
+.dlg-x {
+  border: none; background: none; cursor: pointer; color: var(--ink-3);
+  font-size: 15px; line-height: 1; padding: 5px 7px; border-radius: var(--r-sm);
+  transition: background .15s, color .15s, transform .12s cubic-bezier(.34, 1.35, .4, 1);
+}
+.dlg-x:hover { background: var(--hover); color: var(--ink); }
+.dlg-x:active { transform: scale(0.9); }
 .dlg-body { padding: 18px 20px; max-height: min(68vh, 640px); overflow: auto; }
 .dlg-foot {
   padding: 14px 20px; border-top: 1px solid var(--hair);
@@ -756,9 +766,37 @@ dialog.sm { max-width: 420px; }
 .key-wrap { display: flex; gap: 6px; }
 textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 
+/* 低频设置（指纹覆写）：收成一行小按钮，展开才占版面 */
+.adv { margin-top: 12px; }
+.adv > summary {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer; list-style: none;
+  font-size: 12px; color: var(--ink-2); padding: 5px 11px; border-radius: var(--r-sm);
+  border: 1px solid var(--hair-2); background: var(--glass-2); width: fit-content;
+  transition: border-color .18s, color .18s, background .18s;
+}
+.adv > summary::-webkit-details-marker { display: none; }
+.adv > summary::before { content: '▸'; font-size: 10px; color: var(--ink-3); }
+.adv[open] > summary::before { content: '▾'; }
+.adv > summary:hover { border-color: var(--accent); color: var(--accent); }
+.adv-body { padding: 12px 0 2px; }
+
+/* 供应商弹窗里的分组列表：一行一个分组，编辑会再叠一层弹窗上去 */
+.ug-row {
+  display: flex; align-items: center; gap: 9px; padding: 8px 10px; margin-top: 7px;
+  border: 1px solid var(--hair-2); border-radius: var(--r-sm); background: var(--glass-3);
+  font-size: 12.5px;
+}
+.ug-row:first-child { margin-top: 0; }
+.ug-name { font-weight: 500; white-space: nowrap; }
+.ug-key { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+.ug-row .grow { flex: 1; min-width: 8px; }
+.ug-row .switch { width: 32px; height: 19px; }
+.ug-row .switch::after { width: 15px; height: 15px; }
+.ug-row .switch:checked::after { transform: translateX(13px); }
+
 .picker {
-  max-height: 240px; overflow: auto; border: 1px solid var(--hair-2); border-radius: var(--r-sm);
-  padding: 6px 8px; background: var(--glass-3); margin-top: 8px;
+  max-height: 260px; overflow: auto; border: 1px solid var(--hair-2); border-radius: var(--r-sm);
+  padding: 6px 8px; background: var(--glass-3); margin-top: 9px;
 }
 .picker label {
   display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px;
@@ -768,6 +806,16 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .picker label:hover { background: var(--hover); }
 .picker input { width: auto; }
 .picker .tag { font-family: -apple-system, sans-serif; margin-left: auto; }
+/* 已录入的排在前面并且勾着，这里再给一点底色，扫一眼就知道分界在哪 */
+.picker label.on { background: color-mix(in srgb, var(--good) 9%, transparent); }
+.picker label.on:hover { background: color-mix(in srgb, var(--good) 16%, transparent); }
+.pick-sep {
+  font-size: 11.5px; color: var(--ink-3); padding: 7px 6px 4px; margin-top: 4px;
+  border-top: 1px solid var(--hair); font-family: -apple-system, sans-serif;
+}
+.pick-sep:first-child { margin-top: 0; border-top: none; padding-top: 2px; }
+/* 正在提交的那一行压暗一下，网慢的时候能看出来点了没有 */
+.picker label.busy { opacity: .55; pointer-events: none; }
 
 /* 侧栏底部：「下游接入」和主题切换并排，接入按钮占满剩余宽度 */
 .foot-row { display: flex; align-items: center; gap: 8px; }
@@ -778,12 +826,20 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .checkline input[type="checkbox"] { width: auto; margin: 0; }
 .checkline code { font-family: var(--mono); font-size: 11.5px; }
 
-/* 供应商行首的展开箭头 */
+/* 供应商行首的展开箭头。原来只有 11px 一个字符，太难瞄 —— 撑出一个 22px 的方块，
+   整行也可以点（见 .up-row），箭头只是个提示。 */
 .tw {
   border: none; background: none; cursor: pointer; color: var(--ink-3);
-  font-size: 11px; padding: 0 6px 0 0; line-height: 1; transition: color .15s;
+  font-size: 11px; width: 22px; height: 22px; padding: 0; margin-right: 2px;
+  border-radius: 6px; line-height: 1; vertical-align: middle;
+  transition: color .15s, background .15s;
 }
-.tw:hover { color: var(--accent); }
+.tw:hover { color: var(--accent); background: var(--hover); }
+.up-row { cursor: pointer; }
+/* 行里的按钮和开关自己有事做，别继承那只手 */
+.up-row button, .up-row input, .up-row a { cursor: default; }
+.up-row .btn, .up-row .switch, .up-row .tw { cursor: pointer; }
+.up-row.is-open > td { background: var(--hover); }
 /* 标记和分组数挤在一行；列窄了宁可整表横向滚动（card-body 已经 scroll-x），
    也别让每个标签各占一行、把行高撑成三倍 */
 .up-sub { display: flex; gap: 5px; align-items: center; margin-top: 5px; flex-wrap: nowrap; }

@@ -307,11 +307,11 @@ def get_model_routes() -> list[dict[str, Any]]:
     return sorted(grouped.values(), key=lambda g: g["model_name"])
 
 
-def _mismatch(exc: db.ProtocolMismatch) -> HTTPException:
+def _mismatch(model_name: str, exc: db.ProtocolMismatch) -> HTTPException:
     mine, theirs = exc.args
     return HTTPException(
         409,
-        f"这个模型已经在 {mine} 接口下暴露了，不能再挂一个 {theirs} 接口的分组 —— "
+        f"「{model_name}」已经在 {mine} 接口下暴露了，不能再挂一个 {theirs} 接口的分组 —— "
         "同一个模型名的候选必须都在同一种接口上",
     )
 
@@ -324,7 +324,7 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
     try:
         added = db.add_model_route(model_name, payload.group_id, remote_model)
     except db.ProtocolMismatch as exc:
-        raise _mismatch(exc) from exc
+        raise _mismatch(model_name, exc) from exc
     if not added:
         raise HTTPException(409, f"「{model_name}」在这个分组下已存在")
     return {
@@ -347,12 +347,11 @@ def put_model_route(payload: ModelRouteIn) -> dict[str, Any]:
 
 
 @router.post("/models/bulk-add")
-def post_bulk_add(payload: BulkAddIn) -> dict[str, int]:
+def post_bulk_add(payload: BulkAddIn) -> dict[str, Any]:
+    """批量导入。撞上「已经在另一种接口下暴露」的名字只跳过它，别把整批退回去。"""
     _require_group(payload.group_id)
-    try:
-        return {"added": db.add_routes_for_group(payload.group_id, payload.model_names)}
-    except db.ProtocolMismatch as exc:
-        raise _mismatch(exc) from exc
+    added, skipped = db.add_routes_for_group(payload.group_id, payload.model_names)
+    return {"added": added, "skipped": list(skipped)}
 
 
 @router.post("/models/switch")

@@ -285,7 +285,7 @@ def test_import_models_and_switch_without_interrupting_stream(gateway):
         added = gateway.post(
             "/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": pulled}
         ).json()
-        assert added == {"added": 2}
+        assert added == {"added": 2, "skipped": []}
 
         add_route(gateway, "gpt-test", g_b, "gpt-test")
 
@@ -1003,9 +1003,30 @@ def test_model_is_bound_to_one_interface(gateway):
 
         dup = gateway.post("/admin/api/models", json={"model_name": "opus", "group_id": g_oa})
         assert dup.status_code == 409 and "接口" in dup.json()["detail"]
+        assert "opus" in dup.json()["detail"], "得说清是哪个模型名撞了，一批几十个时才找得到"
 
         bad = gateway.post(f"/admin/api/upstreams/{uid}/groups", json={"name": "x", "protocol": "nope"})
         assert bad.status_code == 400
+
+
+def test_bulk_add_skips_cross_interface_names_instead_of_failing(gateway):
+    """拉一个站的模型列表动辄几十上百个，里面撞上一两个「已经在另一种接口下暴露」的名字，
+    整批退回去、一个都不落库是最难用的结果。跳过它们，并且说清跳了哪些。"""
+    with MockUpstream("siteA") as a:
+        g_an = add_upstream(gateway, a, "siteA", "anthropic")
+        g_oa = add_group(gateway, provider_id(gateway, "siteA"), "openai", name="gpt", api_key="k")
+        add_route(gateway, "claude-test", g_an, "claude-test")
+
+        # claude-test 已经在 anthropic 下了，gpt-test 是干净的
+        resp = gateway.post(
+            "/admin/api/models/bulk-add",
+            json={"group_id": g_oa, "model_names": ["gpt-test", "claude-test"]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"added": 1, "skipped": ["claude-test"]}
+
+        routes = {g["model_name"]: g["protocol"] for g in gateway.get("/admin/api/models").json()}
+        assert routes == {"claude-test": "anthropic", "gpt-test": "openai"}
 
 
 def test_group_protocol_decides_the_pull_auth_headers(gateway):

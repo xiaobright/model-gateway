@@ -357,11 +357,53 @@ function groupRow(u, g) {
     </td></tr>`;
 }
 
+/** 供应商弹窗里的分组列表：管理分组的主路径，点「编辑」会再叠一层分组弹窗。
+    表里那个可展开的行是同一套东西的只读快照，两边最后都调 openGroup。 */
+export function renderUpGroups() {
+  const wrap = $('up-groups-wrap');
+  const u = state.editing === null ? null : state.upstreams.find((x) => x.id === state.editing);
+  if (!$('up-dialog').open || !u) { wrap.hidden = true; return; }
+
+  const groups = u.groups || [];
+  wrap.hidden = false;
+  $('up-gcount').textContent = groups.length ? `${groups.length} 个` : '还没有';
+  $('up-add-group').dataset.uid = String(u.id);
+
+  const only = groups.length === 1 ? groups[0] : null;
+  const other = only && only.protocol === 'anthropic' ? 'openai' : 'anthropic';
+  $('up-groups').innerHTML = groups.map((g) => {
+    const n = modelsOfGroup(g.id).length;
+    const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
+      + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${PROTO_LABEL[g.protocol] || '?'}</span>`;
+    return `<div class="ug-row">
+      <span class="ug-name">${esc(g.name)}</span>${tag}
+      <span class="ug-key">${maskKey(g.api_key)}</span>
+      <span class="grow"></span>
+      <span class="dim" style="font-size:12px">${n} 个模型</span>
+      <input type="checkbox" class="switch" ${g.enabled ? 'checked' : ''}
+             data-act="toggle-group" data-gid="${g.id}" aria-label="启用分组 ${esc(g.name)}">
+      <button type="button" class="btn btn-ghost btn-sm" data-act="edit-group" data-gid="${g.id}">编辑</button>
+      <button type="button" class="btn btn-danger btn-sm" data-act="del-group" data-gid="${g.id}">删除</button>
+    </div>`;
+  }).join('') || '<p class="dim" style="font-size:12px;margin:0">'
+    + '没有分组的供应商用不了 —— 加一个，选接口、填那把 key。</p>';
+
+  // 一把 key 两种接口都能用的站不少，而接口是分组的属性，所以给个一键复制
+  const clone = $('up-clone-group');
+  if (clone) clone.remove();
+  if (only && only.api_key) {
+    $('up-add-group').insertAdjacentHTML('afterend',
+      `<button type="button" class="btn btn-ghost btn-sm" id="up-clone-group"
+               data-act="clone-group" data-gid="${only.id}">复制这把 key 到 ${PROTO_LABEL[other]}</button>`);
+  }
+}
+
 export function renderUpstreams() {
   const list = state.upstreams;
   $('upstream-count').textContent = `${list.length} 个`;
   const on = list.filter((u) => u.enabled).length;
   $('badge-upstreams').textContent = `${on}/${list.length}`;
+  renderUpGroups();
 
   if (!list.length) {
     $('upstream-body').innerHTML =
@@ -380,10 +422,13 @@ export function renderUpstreams() {
       ? `<span class="tone-${toneOf(h.ok_rate)}-ink">${Math.round(h.ok_rate * 1000) / 10}%</span>`
         + `<span class="dim"> · ${fmtSec(h.p95)}</span>`
       : '<span class="dim">—</span>';
-    rows.push(`<tr>
+    // 整行都是展开开关（那个小三角太难瞄）。行里的按钮和开关有自己的 data-act，
+    // 事件委托取的是最近的那个，所以不会被这里截走
+    rows.push(`<tr class="up-row${open ? ' is-open' : ''}" data-act="toggle-groups" data-uid="${u.id}"
+                   title="点这一行展开 / 收起它的分组">
       <td>
-        <button type="button" class="tw" data-act="toggle-groups" data-uid="${u.id}"
-                aria-expanded="${open}" title="展开 / 收起分组">${open ? '▾' : '▸'}</button>
+        <button type="button" class="tw" aria-expanded="${open}"
+                aria-label="展开 / 收起分组">${open ? '▾' : '▸'}</button>
         ${esc(u.name)}${u.enabled ? '' : ' <span class="tag"><span class="dot dot-off"></span>停用</span>'}
         <div class="up-sub">${ifaceTags(u)}<span class="tag">${groups.length} 组</span></div>
       </td>
@@ -505,14 +550,17 @@ function flushPending() {
   insertRows(list, lastRows.length);
 }
 
-/** 把 list 按 id 从大到小 prepend 进去，再按 cap 裁掉尾部 */
+/** 把 list（按 id 升序）prepend 进去，再按 cap 裁掉尾部 */
 function insertRows(list, cap) {
   const body = $('log-body');
   const known = state.logIds;
   const tmp = document.createElement('tbody');
   tmp.innerHTML = list.map(logRow).join('');
-  const added = [...tmp.children].reverse();   // 大 id 先插，最后大 id 在最上面
-  for (const tr of added) {
+  /* 逐个 prepend：最后插进去的那个（id 最大）留在最上面，正好接上下面按 id 降序的老行。
+     这里不能先 reverse —— 一次只来一行时看不出区别，但切出去再切回来、或者标签页
+     不可见时攒了十几条，一批插进来就会整块倒过来：上面那块从旧到新，还压在
+     原来最新的那行上面。点「刷新」是整表重画，所以又好了。 */
+  for (const tr of [...tmp.children]) {
     body.prepend(tr);
     known.add(Number(tr.dataset.id));
     slideIn(tr);

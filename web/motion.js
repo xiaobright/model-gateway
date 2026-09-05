@@ -276,7 +276,7 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
    注意一定要按角点算：若按「边中点位移 = half²·角度/P」去定，解出的
    ax / ay = w²/h²，宽扁卡片会把短边那一轴多转 长宽比 倍（1130×263 是 4.3 倍）——
    横向推鼠标几乎看不出动静，纵向一推整张卡被透视拉成大梯形，角点能跑出 35px。 */
-const TRAVEL_PX = 8;                            // 想整体加减幅度，只调这个数
+const TRAVEL_PX = 6;                            // 想整体加减幅度，只调这个数
 const PERSPECTIVE = 280;                        // 一阶效果与 P 无关，取小是为了角度小、不出现 cos 压扁
 const MAX_SKEW = 0.06;                          // 位移不超过半对角线的 6%，等价于把透视形变卡在 6%
 const LIFT_PX = (PERSPECTIVE * 0.002).toFixed(2); // 固定放大 0.2% 的抬起感，与尺寸无关
@@ -299,7 +299,10 @@ function tiltGeometry(card) {
 export function initSpotlightAndTilt(container = document.body) {
   if (reduceMotion()) return;
 
-  const tiltCards = container.querySelectorAll('.card, .kpi');
+  /* 标了 data-flat 的卡片不跟着鼠标转：它们是整屏高的表格，里面全是开关、
+     小箭头和成对的按钮。倾斜再小，在这种密集点选的表面上也是「瞄准一个会动的
+     目标」，晃眼睛。光斑和边缘高光照旧，只是不动。 */
+  const tiltCards = container.querySelectorAll('.card:not([data-flat]), .kpi');
   tiltCards.forEach((card) => {
     if (card.dataset.tiltInit) return;
     card.dataset.tiltInit = 'true';

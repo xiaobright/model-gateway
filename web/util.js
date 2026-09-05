@@ -14,9 +14,12 @@ export const state = {
   filter: '',
   iface: '',         // 模型路由按接口筛选：'' | 'anthropic' | 'openai'
   proto: '',         // 转发记录的协议筛选：'' | 'anthropic' | 'openai'
-  // 下面三个是「当前打开的弹窗在编辑谁」。只由 openUpstream / openGroup / openRoute 设置，
+  // 下面这些是「当前打开的弹窗在编辑谁」。只由 openUpstream / openGroup / openRoute 设置，
   // 弹窗关闭时故意不清（close 是异步任务，会晚于紧接着打开的下一个弹窗）
-  editing: null,    // 这个弹窗关联的供应商 id；openUpstream(null) = 新建供应商
+  editing: null,      // 供应商弹窗的目标 id；openUpstream(null) = 新建供应商
+  // 分组弹窗单独记自己的供应商：它可以叠在供应商弹窗之上开着，而「搬到别的供应商」
+  // 会改这个值 —— 要是和 editing 共用，一搬就把底下那个弹窗的目标也换掉了
+  editingUp: null,
   editingGroup: null, // 正在编辑的分组 id，null = 新建
   editingCand: null,  // 正在改的候选 {model, gid}，null = 新增
   openUpstreams: new Set(),  // 「上游站点」里展开了分组的那几行
@@ -159,6 +162,19 @@ export const modelsOfGroup = (gid) =>
 
 export const modelsOfUpstream = (uid) =>
   state.routes.filter((r) => r.candidates.some((c) => c.upstream_id === uid)).map((r) => r.model_name);
+
+/** 这个分组已经用过的「上游真名」（去掉 [1m] 后缀）。拉不动的站至少还能从这里下拉选。 */
+export const remotesOfGroup = (gid) => {
+  const out = new Set();
+  for (const r of state.routes) {
+    for (const c of r.candidates) {
+      if (c.group_id !== gid) continue;
+      const bare = splitOneM(c.remote_model).bare;
+      if (bare) out.add(bare);
+    }
+  }
+  return [...out];
+};
 
 export const upstreamOfGroup = (gid) =>
   state.upstreams.find((u) => (u.groups || []).some((g) => g.id === gid)) || null;

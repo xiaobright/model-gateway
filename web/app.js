@@ -8,7 +8,7 @@
 
 import {
   $, state, api, toast, confirmBox, run, esc,
-  modelsOfGroup, modelsOfUpstream, groupLabel, upstreamOfGroup, groupOf,
+  modelsOfGroup, modelsOfUpstream, groupLabel, upstreamOfGroup, groupOf, remotesOfGroup,
   supportsIface, groupsOfIface, splitOneM, withOneM,
   PROTO_LABEL, PROTO_PATH, PROTO_CLIENT, PROTOCOLS,
 } from './util.js';
@@ -23,7 +23,8 @@ async function refreshConfig() {
     api('GET', '/admin/api/models'),
   ]);
   views.renderRoutes();
-  views.renderUpstreams();
+  views.renderUpstreams();   // 里面会把供应商弹窗的分组列表一起刷
+  syncPickerChecks();
 }
 
 async function refreshStats() {
@@ -295,20 +296,29 @@ function openUpstream(id) {
   $('up-override').value = u ? (u.header_override || '') : '';
   $('up-enabled').checked = u ? u.enabled : true;
   baseHint();
+  markOverride();
 
   const hint = $('up-groups-hint');
-  hint.hidden = false;
-  if (!u) {
-    hint.innerHTML = '保存后会接着让你建第一个分组：选接口（Anthropic / OpenAI）＋ 填那把 key。';
-  } else {
-    const names = (u.groups || [])
-      .map((g) => `${g.name}（${PROTO_LABEL[g.protocol] || '?'}）`).join('、');
-    hint.innerHTML = names
-      ? `Key 和接口按分组维护。当前分组：<b>${esc(names)}</b> —— 在列表里展开这一行去改。`
-      : '这个供应商还没有分组，用不了。展开这一行加一个（选接口 ＋ 填 key）。';
-  }
+  hint.hidden = Boolean(u);
+  if (!u) hint.innerHTML = '保存后就能在这里加第一个分组：选接口（Anthropic / OpenAI）＋ 填那把 key。';
   $('up-dialog').showModal();
+  views.renderUpGroups();      // 已有的供应商在这儿直接管分组，不用回列表里展开
   $('up-name').focus();
+}
+
+/* 指纹覆写是低频功能，收在 <details> 里。已经设了的话把它展开、并在标题上标几个头，
+   否则「这个站到底改过没有」得点开才知道。 */
+function markOverride() {
+  const raw = $('up-override').value.trim();
+  const tag = $('up-ov-tag');
+  let count = 0;
+  if (raw) {
+    try { count = Object.keys(JSON.parse(raw)).length; } catch { count = -1; }
+  }
+  tag.hidden = !raw;
+  tag.textContent = count < 0 ? '格式有问题' : `${count} 个头`;
+  tag.className = count < 0 ? 'tag tag-warn' : 'tag tag-accent';
+  $('up-adv').open = Boolean(raw);
 }
 
 function upstreamPayload() {
@@ -333,15 +343,19 @@ async function saveUpstream() {
   }
   if (state.editing === null) {
     const created = await api('POST', '/admin/api/upstreams', payload);
+    // 供应商弹窗不关：分组就在它下半部分管。新建的供应商还没有分组、用不了，
+    // 所以直接把分组弹窗叠上去；关掉那层就回到这儿，新分组已经列在下面了
+    state.editing = created.id;
+    $('up-title').textContent = `编辑供应商：${created.name}`;
+    $('up-groups-hint').hidden = true;
     await refreshConfig();
-    $('up-dialog').close();
-    // 新建的供应商还没有分组，用不了 —— 直接把分组弹窗接上
     toast('已保存，接着建第一个分组', 'ok');
     openGroup(created.id, null);
     return;
   }
   await api('PUT', `/admin/api/upstreams/${state.editing}`, payload);
   toast('已保存', 'ok');
+  markOverride();
   await refreshConfig();
 }
 
@@ -359,7 +373,7 @@ function openGroup(upstreamId, gid) {
   const up = state.upstreams.find((u) => u.id === Number(upstreamId));
   if (!up) return toast('供应商不存在了，刷新一下', 'err');
   const g = gid === null ? null : (up.groups || []).find((x) => x.id === gid);
-  state.editing = up.id;
+  state.editingUp = up.id;
   state.editingGroup = g ? g.id : null;
 
   $('grp-title').textContent = g ? `编辑分组：${up.name} · ${g.name}` : `给「${up.name}」加分组`;
@@ -387,19 +401,14 @@ function openGroup(upstreamId, gid) {
   $('grp-upstream').value = String(up.id);
   $('grp-move-wrap').hidden = !g;      // 新建时没得搬
 
-  resetPicker();
+  pulled = [];
+  $('grp-pull-status').textContent = '';
+  $('grp-picker-filter').value = '';
+  $('grp-manual').value = '';
   $('grp-import').hidden = !g;
-  if (g) $('grp-mcount').textContent = `已录入 ${taken} 个`;
+  renderPicker();
   $('group-dialog').showModal();
   $('grp-name').focus();
-}
-
-function resetPicker() {
-  $('grp-picker').hidden = true;
-  $('grp-picker').innerHTML = '';
-  $('grp-pull-status').textContent = '';
-  $('grp-pick-bar').hidden = true;
-  $('grp-picker-filter').value = '';
 }
 
 async function saveGroup() {
@@ -411,33 +420,131 @@ async function saveGroup() {
   };
   if (!payload.name) return toast('分组名不能为空', 'err');
   if (state.editingGroup === null) {
-    const created = await api('POST', `/admin/api/upstreams/${state.editing}/groups`, payload);
+    const created = await api('POST', `/admin/api/upstreams/${state.editingUp}/groups`, payload);
     state.editingGroup = created.id;
+    const owner = state.upstreams.find((x) => x.id === state.editingUp);
+    $('grp-title').textContent = `编辑分组：${owner ? owner.name : ''} · ${created.name}`;
     $('grp-import').hidden = false;
     $('grp-move-wrap').hidden = false;
-    $('grp-mcount').textContent = '已录入 0 个';
-    toast('已保存，接着可以拉取模型', 'ok');
+    toast('已保存，接着挑模型', 'ok');
   } else {
     const moveTo = Number($('grp-upstream').value);
-    if (moveTo && moveTo !== state.editing) payload.upstream_id = moveTo;
+    if (moveTo && moveTo !== state.editingUp) payload.upstream_id = moveTo;
     await api('PUT', `/admin/api/groups/${state.editingGroup}`, payload);
-    if (payload.upstream_id) state.editing = payload.upstream_id;
+    if (payload.upstream_id) state.editingUp = payload.upstream_id;
     toast(payload.upstream_id ? '已保存并搬到新供应商下' : '已保存', 'ok');
   }
   await refreshConfig();
+  renderPicker();
 }
 
-function renderPicker(models) {
-  const existing = new Set(modelsOfGroup(state.editingGroup));
-  $('grp-picker').innerHTML = models.map((m) => `
-    <label>
-      <input type="checkbox" value="${esc(m)}" ${existing.has(m) ? '' : 'checked'}>
-      <span>${esc(m)}</span>
-      ${existing.has(m) ? '<span class="tag tag-good">已录入</span>' : ''}
-    </label>`).join('') || '<div class="dim" style="padding:6px">上游没返回任何模型</div>';
-  $('grp-picker').hidden = false;
-  $('grp-pick-bar').hidden = false;
-  $('grp-pull-status').textContent = `共 ${models.length} 个，未录入的已默认勾上`;
+/* ---------------------------------------------------------------- 分组里的模型
+
+   这一段是「所见即所存」：勾选框的状态就是库里的候选，勾上/取消当场发请求，没有
+   「导入所选」也没有保存按钮。上面的组名 / 接口 / key 才是要保存的东西。
+   已录入的排在前面（勾着），后面是这次拉取到、还没录入的。 */
+
+let pulled = [];   // 最近一次从上游拉到的模型名；换分组就清空
+
+const pickRow = (name, on) => `<label class="${on ? 'on' : ''}">
+    <input type="checkbox" ${on ? 'checked' : ''} data-act="pick-toggle" data-name="${esc(name)}">
+    <span>${esc(name)}</span>
+  </label>`;
+
+function renderPicker() {
+  const gid = state.editingGroup;
+  const host = $('grp-picker');
+  if (gid === null) { host.innerHTML = ''; return; }
+
+  const mine = modelsOfGroup(gid);
+  const owned = new Set(mine);
+  const rest = pulled.filter((m) => !owned.has(m));
+
+  const head = `<div class="pick-sep">这个分组里的 ${mine.length} 个</div>`;
+  const body = mine.length
+    ? mine.map((m) => pickRow(m, true)).join('')
+    : '<div class="dim" style="padding:4px 6px;font-size:12px">还没有。点「拉取模型列表」，或者手动填一个。</div>';
+  const tail = rest.length
+    ? `<div class="pick-sep">上游还有 ${rest.length} 个没录入</div>${rest.map((m) => pickRow(m, false)).join('')}`
+    : '';
+
+  host.innerHTML = head + body + tail;
+  $('grp-mcount').textContent = `${mine.length} 个`;
+  applyPickerFilter();
+}
+
+/** 请求失败或别处改了配置之后，把勾选状态拉回库里的真相，顺序不动（重排会让人点空） */
+function syncPickerChecks() {
+  const gid = state.editingGroup;
+  if (gid === null || !$('group-dialog').open) return;
+  const owned = new Set(modelsOfGroup(gid));
+  for (const box of $('grp-picker').querySelectorAll('input[data-act="pick-toggle"]')) {
+    box.checked = owned.has(box.dataset.name);
+    box.closest('label').classList.toggle('on', box.checked);
+  }
+  $('grp-mcount').textContent = `${owned.size} 个`;
+}
+
+function applyPickerFilter() {
+  const kw = $('grp-picker-filter').value.trim().toLowerCase();
+  const host = $('grp-picker');
+  for (const label of host.querySelectorAll('label')) {
+    label.hidden = Boolean(kw) && !label.textContent.toLowerCase().includes(kw);
+  }
+  if (!kw) {
+    for (const sep of host.querySelectorAll('.pick-sep')) sep.hidden = false;
+    return;
+  }
+  // 过滤到一个不剩的那节连小标题一起收起，别留个「上游还有 42 个没录入」的空壳
+  let sep = null;
+  let seen = 0;
+  const settle = () => { if (sep) sep.hidden = seen === 0; };
+  for (const node of host.children) {
+    if (node.classList.contains('pick-sep')) { settle(); sep = node; seen = 0; continue; }
+    if (node.tagName === 'LABEL' && !node.hidden) seen += 1;
+  }
+  settle();
+}
+
+const visibleRows = (checked) =>
+  [...$('grp-picker').querySelectorAll('label:not([hidden]) input[data-act="pick-toggle"]')]
+    .filter((b) => b.checked === checked).map((b) => b.dataset.name);
+
+async function addModels(names) {
+  if (!names.length) return;
+  const r = await api('POST', '/admin/api/models/bulk-add', {
+    group_id: state.editingGroup, model_names: names,
+  });
+  const skipped = r.skipped || [];
+  // 撞上「已经在另一种接口下暴露」的名字只跳过它，剩下的照样进；但得说清是哪些
+  if (skipped.length) {
+    toast(
+      `加上了 ${r.added} 个，跳过 ${skipped.length} 个（${skipped.slice(0, 3).join('、')}`
+      + `${skipped.length > 3 ? ' 等' : ''}已经在另一种接口下暴露了）`,
+      'err',
+    );
+    return;
+  }
+  toast(names.length === 1 ? `已加上 ${names[0]}` : `加上了 ${r.added} 个`, 'ok');
+}
+
+/** 取消勾选就是删候选。删到某个模型一个候选都不剩时先问一句 —— 那等于把模型下线了 */
+async function removeModel(name) {
+  const row = state.routes.find((r) => r.model_name === name);
+  if (row && row.candidates.length === 1) {
+    const okay = await confirmBox({
+      title: '这是它唯一的候选',
+      body: `<b>${esc(name)}</b> 只在这个分组里有候选，取消勾选等于把这个模型下线，`
+        + '下游再调它就是 404。<br><br>只是想换个站的话，先在「模型路由」里给它加一个别的候选。',
+      ok: '下线它',
+    });
+    if (!okay) return false;
+  }
+  await api(
+    'DELETE',
+    `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${state.editingGroup}`,
+  );
+  return true;
 }
 
 /* ---------------------------------------------------------------- 路由弹窗 */
@@ -470,6 +577,18 @@ function openRoute(model, gid) {
     fillGroupSelect('rt-group', cand.upstream_id, iface);
     $('rt-group').value = String(gid);
   } else {
+    // 加候选时先落在「还有空分组」的供应商上：默认给第一个的话，遇到它唯一的分组
+    // 已经是候选（很常见），弹窗一开就是个死局，点保存只能换来一句 409
+    const taken = new Set(row ? row.candidates.map((c) => c.group_id) : []);
+    const free = pool.find((u) => groupsOfIface(u, iface).some((g) => !taken.has(g.id)));
+    if (!free && row) {
+      return toast(
+        `${model} 在每个 ${PROTO_LABEL[iface]} 分组下都已经是候选了 —— `
+        + '要再加就先去「上游站点」建一个新分组',
+        'err',
+      );
+    }
+    if (free) $('rt-upstream').value = String(free.id);
     fillGroupSelect('rt-group', $('rt-upstream').value, iface);
     markTakenGroups(model);
   }
@@ -478,8 +597,48 @@ function openRoute(model, gid) {
   $('rt-remote').value = bare && bare !== model ? bare : '';
   $('rt-onem').checked = onem;
   $('rt-onem-wrap').hidden = iface !== 'anthropic';   // beta 头只有 Anthropic 那边有
+  fillRemoteList(Number($('rt-group').value));
   $('route-dialog').showModal();
   (model ? $('rt-remote') : $('rt-model')).focus();
+}
+
+/* 「上游那边的真实模型名」得跟分组对上 —— 同一个站两把 key 能看到的东西都不一样，
+   靠记是记不住的。分组一选定就把那个分组能拉到的模型灌进 datalist，点输入框直接选；
+   拉不动的站退回「这个分组已经用过的那些名字」，照样能填。 */
+const remoteCache = new Map();      // gid -> string[]
+const remoteBusy = new Set();
+const remoteDead = new Set();       // 拉过一次没成的，别每次开弹窗都再撞一遍
+
+function fillRemoteList(gid) {
+  const hint = $('rt-remote-hint');
+  if (!gid) { $('rt-remote-list').innerHTML = ''; hint.textContent = ''; return; }
+  const pulledNames = remoteCache.get(gid);
+  const names = [...new Set([...(pulledNames || []), ...remotesOfGroup(gid)])];
+  $('rt-remote-list').innerHTML = names.map((n) => `<option value="${esc(n)}"></option>`).join('');
+
+  if (pulledNames) hint.textContent = `这个分组能拉到 ${pulledNames.length} 个模型，点输入框下拉选`;
+  else if (remoteBusy.has(gid)) hint.textContent = '正在拉这个分组的模型列表…';
+  else if (remoteDead.has(gid)) hint.textContent = names.length
+    ? `拉不动这个分组，下拉里是它已经用过的 ${names.length} 个名字`
+    : '拉不动这个分组的模型列表，手动填';
+  else hint.textContent = '';
+
+  if (!pulledNames && !remoteBusy.has(gid) && !remoteDead.has(gid)) pullRemoteList(gid);
+}
+
+async function pullRemoteList(gid) {
+  remoteBusy.add(gid);
+  $('rt-remote-hint').textContent = '正在拉这个分组的模型列表…';
+  try {
+    const data = await api('GET', `/admin/api/groups/${gid}/remote-models`);
+    remoteCache.set(gid, data.models);
+  } catch {
+    remoteDead.add(gid);          // 公益站三天两头连不上，静默降级就行，别弹提示条
+  } finally {
+    remoteBusy.delete(gid);
+    // 拉的过程里可能已经换了分组、或者把弹窗关了
+    if ($('route-dialog').open && Number($('rt-group').value) === gid) fillRemoteList(gid);
+  }
 }
 
 /** 已经是候选的分组在下拉里禁掉，比提交后再报 409 友好 */
@@ -537,7 +696,10 @@ const ACTIONS = {
   'new-upstream': () => openUpstream(null),
   'edit-upstream': ({ uid }) => openUpstream(Number(uid)),
 
+  // 整行都是展开开关，所以要放过「我只是想选中那段 base_url」
   'toggle-groups': ({ uid }) => {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim()) return;
     const id = Number(uid);
     if (state.openUpstreams.has(id)) state.openUpstreams.delete(id);
     else state.openUpstreams.add(id);
@@ -631,33 +793,88 @@ const ACTIONS = {
     $('up-override').value = fp === 'anthropic'
       ? '{\n  "user-agent": "claude-cli/2.0.0 (external, cli)",\n  "x-app": "cli"\n}'
       : '{\n  "user-agent": "codex_cli_rs",\n  "originator": "codex_cli_rs"\n}';
+    markOverride();
   },
 
+  /* 拉取用的是**服务端存着的**那把 key。key 改了没保存就点拉取，拉的是旧 key，
+     回来一个 401 让人一头雾水 —— 先把改动落库，再拉。 */
   'pull-models': async () => {
+    if (groupDirty()) await saveGroup();
     $('grp-pull-status').textContent = '拉取中…';
     try {
       const data = await api('GET', `/admin/api/groups/${state.editingGroup}/remote-models`);
-      renderPicker(data.models);
+      pulled = data.models;
+      remoteCache.set(state.editingGroup, data.models);
+      remoteDead.delete(state.editingGroup);
+      renderPicker();
+      const mine = modelsOfGroup(state.editingGroup);
+      const hit = pulled.filter((m) => mine.includes(m)).length;
+      $('grp-pull-status').textContent = `上游列出 ${pulled.length} 个，其中 ${hit} 个已录入`;
     } catch (e) {
       $('grp-pull-status').textContent = '';
       throw e;
     }
   },
 
-  'pick-all': () => togglePicked(true),
-  'pick-none': () => togglePicked(false),
+  /* 勾选即生效：勾上=加候选，取消=删候选。失败就把勾回滚到库里的真相。 */
+  'pick-toggle': async ({ name }, el) => {
+    if (state.editingGroup === null) return;
+    const label = el.closest('label');
+    label.classList.add('busy');
+    try {
+      if (el.checked) await addModels([name]);
+      else await removeModel(name);
+    } finally {
+      label.classList.remove('busy');
+      await refreshConfig();      // 末尾的 syncPickerChecks 负责把勾选拉回真相
+    }
+  },
 
-  'import-picked': async () => {
-    const boxes = [...$('grp-picker').querySelectorAll('input[type="checkbox"]')];
-    const names = boxes.filter((b) => b.checked).map((b) => b.value);
-    if (!names.length) return toast('一个都没勾选', 'err');
-    const r = await api('POST', '/admin/api/models/bulk-add', {
-      group_id: state.editingGroup, model_names: names,
-    });
+  'pick-all': async () => {
+    const names = visibleRows(false);
+    if (!names.length) return toast('没有可加的了', 'ok');
+    await addModels(names);
     await refreshConfig();
-    $('grp-mcount').textContent = `已录入 ${modelsOfGroup(state.editingGroup).length} 个`;
-    renderPicker(boxes.map((b) => b.value));
-    toast(`导入了 ${r.added} 个${r.added < names.length ? '（重复的已跳过）' : ''}`, 'ok');
+    renderPicker();
+  },
+
+  'pick-none': async () => {
+    const names = visibleRows(true);
+    if (!names.length) return toast('本来就一个都没勾', 'ok');
+    // 只在这个分组有候选的模型会直接下线，这个后果得先说清楚
+    const orphan = names.filter((n) => {
+      const row = state.routes.find((r) => r.model_name === n);
+      return row && row.candidates.length === 1;
+    });
+    const okay = await confirmBox({
+      title: '清空这个分组的模型',
+      body: `要把 <b>${names.length}</b> 个模型从这个分组里去掉。`
+        + (orphan.length
+          ? `<br><br>其中 <b>${orphan.length}</b> 个只有这一个候选，去掉就等于下线，下游再调是 404。`
+          : '<br><br>它们在别的分组还有候选，流量会自动落到那边。'),
+      ok: '去掉',
+    });
+    if (!okay) return;
+    for (const name of names) {
+      await api(
+        'DELETE',
+        `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${state.editingGroup}`,
+      );
+    }
+    await refreshConfig();
+    renderPicker();
+    toast(`去掉了 ${names.length} 个`, 'ok');
+  },
+
+  /* 上游不肯列全的时候（不少站的 /v1/models 就是残的）自己填一个 */
+  'manual-add': async () => {
+    const name = $('grp-manual').value.trim();
+    if (!name) return toast('填个模型 id', 'err');
+    if (modelsOfGroup(state.editingGroup).includes(name)) return toast('这个分组已经有它了', 'err');
+    await addModels([name]);
+    $('grp-manual').value = '';
+    await refreshConfig();
+    renderPicker();
   },
 
   'new-route': () => openRoute('', null),
@@ -730,10 +947,14 @@ const ACTIONS = {
   },
 };
 
-function togglePicked(on) {
-  for (const box of $('grp-picker').querySelectorAll('label:not([hidden]) input[type="checkbox"]')) {
-    box.checked = on;
-  }
+/* 分组弹窗上半部分（组名 / 接口 / key / 启用）有没有改过。拉取和删组之前要知道。 */
+function groupDirty() {
+  const g = state.editingGroup === null ? null : groupOf(state.editingGroup);
+  if (!g) return false;
+  return $('grp-name').value.trim() !== g.name
+    || $('grp-proto').value !== g.protocol
+    || $('grp-key').value.trim() !== g.api_key
+    || $('grp-enabled').checked !== g.enabled;
 }
 
 /* ---------------------------------------------------------------- 事件绑定 */
@@ -788,7 +1009,11 @@ $('route-form').addEventListener('submit', (ev) => {
 $('rt-upstream').addEventListener('change', () => {
   fillGroupSelect('rt-group', $('rt-upstream').value, $('rt-iface').value);
   markTakenGroups($('rt-model').value.trim());
+  fillRemoteList(Number($('rt-group').value));
 });
+
+// 分组定了才知道「上游真名」能填哪些
+$('rt-group').addEventListener('change', () => fillRemoteList(Number($('rt-group').value)));
 
 $('rt-iface').addEventListener('change', () => {
   const iface = $('rt-iface').value;
@@ -797,17 +1022,32 @@ $('rt-iface').addEventListener('change', () => {
   fillUpstreamSelect('rt-upstream', pool);
   fillGroupSelect('rt-group', $('rt-upstream').value, iface);
   markTakenGroups($('rt-model').value.trim());
+  fillRemoteList(Number($('rt-group').value));
   $('rt-onem-wrap').hidden = iface !== 'anthropic';
 });
 
 // 站根填/改的时候把补出来的两个地址实时显示出来，免得又把 /v1 带上
 $('up-base').addEventListener('input', baseHint);
+$('up-override').addEventListener('input', markOverride);
 
-/* 弹窗关掉后刷一次列表（Esc 关闭也走这里，所以挂在 close 上而不是「取消」按钮上）。
-   注意这里**不清** state.editing / state.editingGroup：close 是排成任务异步触发的，
-   而「建完供应商直接接上分组弹窗」这种链路里，它会晚于新的 openGroup 跑 ——
-   清掉的话紧接着保存分组就会往 /upstreams/null/groups 发请求。
-   这两个字段每次 openUpstream / openGroup 都会重设，留着旧值没人读得到。 */
+/* 手填模型名：回车直接加，别提交整个表单（那是保存分组的按钮）。
+   过滤框也一样 —— 它是 type=search，回车默认会提交表单。 */
+$('grp-manual').addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  run(null, ACTIONS['manual-add']);
+});
+
+$('grp-picker-filter').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') ev.preventDefault();
+});
+
+/* 弹窗关掉后刷一次列表（Esc 关闭也走这里，所以挂在 close 上而不是关闭按钮上）。
+   这里**不清** state.editing / editingUp / editingGroup：close 是排成任务异步触发的，
+   会晚于紧接着打开的下一个弹窗跑 —— 清掉的话「建完供应商接着建分组」就会往
+   /upstreams/null/groups 发请求。这几个字段每次 open* 都会重设，留着旧值没人读得到。
+   分组弹窗另有一份 editingUp，所以它叠在供应商弹窗上面开着、甚至把分组搬到别的
+   供应商，也不会把底下那个弹窗的目标换掉。 */
 $('up-dialog').addEventListener('close', () => run(null, refreshConfig));
 $('group-dialog').addEventListener('close', () => run(null, refreshConfig));
 
@@ -818,12 +1058,7 @@ $('route-filter').addEventListener('input', (ev) => {
   views.renderRoutes();
 });
 
-$('grp-picker-filter').addEventListener('input', (ev) => {
-  const kw = ev.target.value.trim().toLowerCase();
-  for (const label of $('grp-picker').querySelectorAll('label')) {
-    label.hidden = Boolean(kw) && !label.textContent.toLowerCase().includes(kw);
-  }
-});
+$('grp-picker-filter').addEventListener('input', applyPickerFilter);
 
 window.addEventListener('resize', () => {
   moveMarker($('nav-marker'), document.querySelector(`.nav-item[data-view="${currentView}"]`));
