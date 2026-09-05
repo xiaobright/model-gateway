@@ -11,6 +11,9 @@ export const state = {
   routes: [],
   stats: null,      // /admin/api/stats：累计值 + 活跃流
   overview: null,   // /admin/api/overview：时间线 + 健康 + 热度
+  // /admin/api/failover：{enabled:{anthropic,openai}, breakers:[{group_id,cooling_ms,...}]}
+  // 开关按接口分开：Claude 侧全是坏得勤的中转站，GPT 侧要花钱的站得手动确认
+  failover: { enabled: {}, breakers: [] },
   filter: '',
   iface: '',         // 模型路由按接口筛选：'' | 'anthropic' | 'openai'
   proto: '',         // 转发记录的协议筛选：'' | 'anthropic' | 'openai'
@@ -55,6 +58,12 @@ export const fmtDur = (ms) => (ms >= 10000 ? Math.round(ms / 1000) + 's' : (ms /
 
 /** 毫秒 -> 秒，保留一位；给 P95 这类大数用 */
 export const fmtSec = (ms) => (ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : Math.round(ms) + 'ms');
+
+/** 冷却剩余：毫秒 -> m:ss / 12s */
+export function fmtLeft(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` : `${s}s`;
+}
 
 /** epoch 秒 -> HH:MM，给时间线横轴用 */
 export function fmtClock(epochSec) {

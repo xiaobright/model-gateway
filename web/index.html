@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Model Gateway 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css?v=6">
+<link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
 <div class="blob blob-1"></div>
@@ -86,10 +86,12 @@
             <button type="button" class="seg-item" data-iface="openai">OpenAI</button>
             <button type="button" class="seg-item is-on" data-iface="">全部</button>
           </span>
+          <span class="fo-box" id="failover-box"></span>
           <input type="search" class="search" id="route-filter" placeholder="筛选模型名…" aria-label="筛选模型名">
           <button class="btn btn-sm" data-act="new-route">新增模型</button>
         </div>
-        <p class="card-hint">点候选圆片即把该模型切到那个分组（高亮的是当前生效的）。切换只影响新请求，进行中的流会走完旧上游。</p>
+        <p class="card-hint">点候选圆片即把该模型切到那个分组（高亮的是当前生效的，也是自动降级的起点）。
+          圆片从左到右就是<b>依次尝试的顺序</b>，在圆片的 ✎ 里调。切换只影响新请求，进行中的流会走完旧上游。</p>
         <div class="card-body scroll-y" id="route-list"></div>
       </section>
 
@@ -309,6 +311,14 @@
       <label class="field" style="margin-top:11px">分组
         <select id="rt-group"></select>
       </label>
+      <div class="field" id="rt-order-wrap" style="margin-top:11px" hidden>
+        <span>尝试顺序（自动降级按这个顺序往下试，改了立刻生效）</span>
+        <div class="field-row">
+          <button type="button" class="btn btn-ghost btn-sm" data-act="move-cand" data-dir="-1">◂ 前移</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-act="move-cand" data-dir="1">后移 ▸</button>
+          <span class="dim" id="rt-order-hint" style="font-size:12px"></span>
+        </div>
+      </div>
       <label class="field" style="margin-top:11px">上游那边的真实模型名
         <input type="text" id="rt-remote" list="rt-remote-list" placeholder="留空 = 与模型名相同" autocomplete="off">
         <datalist id="rt-remote-list"></datalist>
@@ -347,6 +357,6 @@
 </dialog>
 
 <div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
-<script type="module" src="/static/app.js?v=6"></script>
+<script type="module" src="/static/app.js?v=7"></script>
 </body>
 </html>

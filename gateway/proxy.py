@@ -10,11 +10,13 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, db, naming, protocols, stats
+from . import config, db, failover, naming, protocols, stats
 from .reqlog import log
 from .upstream import endpoint as upstream_endpoint, parse_override
 
-PROXY_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=600.0)
+# connect 只给 8 秒：真库里 104 个 502 全是连不上，平均白等 16.6 秒（旧值是 15 秒的
+# connect 超时在磨）。握手 8 秒都完不成的站，也扛不住几十万 token 的请求体。
+PROXY_TIMEOUT = httpx.Timeout(connect=8.0, read=600.0, write=60.0, pool=600.0)
 PROXY_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 
 # httpx 在 Windows 上会读注册表里的系统代理（Clash 之类），而注册表的 bypass 列表通常是空的，
@@ -146,10 +148,11 @@ async def forward(
     *,
     record: bool = True,
 ) -> StreamingResponse | JSONResponse:
-    """把一个请求原样转到当前生效的上游。
+    """把一个请求转到当前生效的上游；打不通就按优先级换下一个候选（见 failover.py）。
 
     唯一会改动请求体的地方是 model 字段（换成上游那边的真名）。两边名字一致时继续发
-    原始字节，「字节级透传」这个特性就还在。
+    原始字节，「字节级透传」这个特性就还在。**每个候选的真名和 key 都可能不一样**，
+    所以请求体和请求头都在循环里按候选重建。
 
     record=False 给 count_tokens 这类元数据请求用：照样转发、照样记文本日志，但不进
     转发记录、不计入活跃流，否则它会把「累计转发」和模型热度冲得没法看。
@@ -165,8 +168,8 @@ async def forward(
 
     requested = str(payload.get("model", ""))
     asked, flag = naming.split_model(requested)
-    route = db.resolve_route(asked, proto.name)
-    if route is None:
+    chain = db.resolve_chain(asked, proto.name)
+    if not chain:
         # 模型录在另一个接口下时说清楚：这种 404 光看「未配置」会以为是没导入
         elsewhere = db.protocol_of_model(asked)
         why = (
@@ -176,51 +179,123 @@ async def forward(
         )
         log(f"POST {endpoint} model={requested!r} -> 404 ({why}) req={len(body)}B")
         return _error(proto, 404, why)
-    if route.model_name != asked:
-        log(f"POST {endpoint} model={asked!r} 没配过，按档位关键字落到 {route.model_name!r}")
+    if chain[0].model_name != asked:
+        log(f"POST {endpoint} model={asked!r} 没配过，按档位关键字落到 {chain[0].model_name!r}")
 
     stream_flag = bool(payload.get("stream"))
-    # 上游只认它那边的真名。[1m] 是 Claude Code 自己的档位约定，请求侧和配置侧都可能带，一并摘掉
-    remote, remote_flag = naming.split_model(route.remote_model)
-    want_1m = naming.wants_1m(flag) or naming.wants_1m(remote_flag)
-    if remote != requested:
-        payload["model"] = remote
-        # ensure_ascii=False：否则中文请求体会涨三到六倍
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    # 有副作用的 OpenAI 请求不降级：上游可能已经把它存下来了才失败，重试会留下两条
+    stateful = payload.get("store") is not None or payload.get("previous_response_id") is not None
+    can_failover = failover.enabled(proto.name) and len(chain) > 1 and not stateful
+    candidates = failover.order_chain(chain)[: failover.MAX_ATTEMPTS] if can_failover else [chain[0]]
 
-    _maybe_capture_headers(request)
-    # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
-    url = upstream_endpoint(route.upstream.base_url, path)
-    headers = _build_headers(request, route.upstream, proto, want_1m)
     started = time.monotonic()
     client = get_client()
+    resp: httpx.Response | None = None
+    route = candidates[0]
+    remote = ""
+    attempt = 0
+    fail: Exception | None = None
 
-    # 这一段是将来做「自动降级」唯一安全的落点：状态码已经拿到手，但还没往下游发过
-    # 任何字节，换个上游重试客户端完全无感。第一个字节一旦发出去就不能再换了。
-    try:
-        resp = await client.send(client.build_request("POST", url, content=body, headers=headers), stream=True)
-    except httpx.HTTPError as exc:
-        elapsed = time.monotonic() - started
+    # 这里是「自动降级」唯一安全的落点：状态码已经拿到手，但还没往下游发过任何字节，
+    # 换个上游重试客户端完全无感。第一个字节一旦发出去就不能再换了。
+    for index, route in enumerate(candidates, start=1):
+        attempt = index
+        last_one = index == len(candidates)
+        if index > 1:
+            if await request.is_disconnected():
+                log(f"  客户端已经走了，不再降级（试过 {index - 1} 个）")
+                break
+            if time.monotonic() - started > failover.START_DEADLINE:
+                log(f"  已经耗了 {time.monotonic() - started:.0f}s，不再开新尝试")
+                break
+
+        # 上游只认它那边的真名。[1m] 是 Claude Code 自己的档位约定，请求侧和配置侧都可能带，一并摘掉
+        remote, remote_flag = naming.split_model(route.remote_model)
+        want_1m = naming.wants_1m(flag) or naming.wants_1m(remote_flag)
+        sent_body = body
+        if remote != requested:
+            # ensure_ascii=False：否则中文请求体会涨三到六倍
+            sent_body = json.dumps(
+                {**payload, "model": remote}, ensure_ascii=False, separators=(",", ":")
+            ).encode()
+
+        _maybe_capture_headers(request)
+        # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
+        url = upstream_endpoint(route.upstream.base_url, path)
+        headers = _build_headers(request, route.upstream, proto, want_1m)
+        began = time.monotonic()
+        try:
+            resp = await client.send(
+                client.build_request("POST", url, content=sent_body, headers=headers), stream=True
+            )
+        except httpx.HTTPError as exc:
+            fail, resp = exc, None
+            elapsed = time.monotonic() - began
+            log(
+                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} -> 502 "
+                f"({exc.__class__.__name__}: {exc}) after {elapsed:.1f}s req={len(sent_body)}B"
+                f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
+            )
+            failover.note_fail(route.group_id, 502, f"{route.upstream.name}/{route.group_name}")
+            if record:
+                _record(
+                    request=request, route=route, proto=proto, model=asked,
+                    remote_model=remote, status=502, stream_flag=stream_flag,
+                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    head=b"", tail=b"", note="connect_failed", attempt=attempt,
+                )
+            if last_one:
+                break
+            continue
+
+        detail = ""
+        if payload.get("store") is not None or payload.get("previous_response_id") is not None:
+            detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}"
         log(
-            f"POST {endpoint} model={requested!r} upstream={route.upstream.name} -> 502 "
-            f"({exc.__class__.__name__}: {exc}) after {elapsed:.1f}s req={len(body)}B"
+            f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
+            f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
+            f"req={len(sent_body)}B ua={request.headers.get('user-agent', '')[:48]!r}"
+            f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
         )
+
+        retryable = resp.status_code in failover.RETRY_STATUS
+        if not retryable:
+            failover.note_ok(route.group_id)
+            break
+        failover.note_fail(route.group_id, resp.status_code, f"{route.upstream.name}/{route.group_name}")
+        if last_one:
+            # 没有退路了就把上游的响应原样透传下去，和没有降级时的行为一字不差
+            break
+        # 还有候选可试：把这次的错误体读出来记一行（错误体都很小），然后换下一个
+        with contextlib.suppress(Exception):
+            raw = await resp.aread()
+            log(f"  上游返回 {resp.status_code}，换下一个候选。响应开头: {raw[:180]!r}")
+        elapsed = time.monotonic() - began
         if record:
             _record(
-                request=request, route=route, proto=proto, model=asked, remote_model=remote,
-                status=502, stream_flag=stream_flag, req_bytes=len(body), resp_bytes=0,
-                elapsed=elapsed, head=b"", tail=b"", note="connect_failed",
+                request=request, route=route, proto=proto, model=asked,
+                remote_model=remote, status=resp.status_code, stream_flag=stream_flag,
+                req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                head=b"", tail=b"", note="failed_over", attempt=attempt,
             )
-        return _error(proto, 502, f"上游 {route.upstream.name} 请求失败: {exc}")
+        with contextlib.suppress(Exception):
+            await resp.aclose()
+        resp = None
 
-    detail = ""
-    if payload.get("store") is not None or payload.get("previous_response_id") is not None:
-        detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}"
-    log(
-        f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
-        f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
-        f"req={len(body)}B ua={request.headers.get('user-agent', '')[:48]!r}"
-    )
+    if resp is None:
+        if fail is not None:
+            why = f"上游 {route.upstream.name} 请求失败: {fail}"
+        else:
+            why = f"上游 {route.upstream.name} 没能给出可用的响应"
+        if attempt > 1:
+            why += f"（试过 {attempt} 个候选）"
+        return _error(proto, 502, why)
+
+    won = route
+    won_attempt = attempt
+    won_remote = remote
+    won_bytes = len(sent_body)
+    upstream_resp = resp
 
     async def relay() -> AsyncIterator[bytes]:
         sent = 0
@@ -232,7 +307,7 @@ async def forward(
         if record:
             stats.live_enter(stream_flag)
         try:
-            async for chunk in resp.aiter_bytes():
+            async for chunk in upstream_resp.aiter_bytes():
                 sent += len(chunk)
                 if len(head) < HEAD_KEEP:
                     head.extend(chunk[: HEAD_KEEP - len(head)])
@@ -254,30 +329,31 @@ async def forward(
             raise
         else:
             # 只有「上游说 200 且是流式」时缺完成事件才算被截断，4xx/5xx 本来就没有完成事件
-            if stream_flag and resp.status_code < 300 and not seen_end:
+            if stream_flag and upstream_resp.status_code < 300 and not seen_end:
                 note = "truncated"
-                log(f"  WARN stream ended WITHOUT completion event status={resp.status_code} resp={sent}B")
+                log(f"  WARN stream ended WITHOUT completion event status={upstream_resp.status_code} resp={sent}B")
             else:
-                log(f"  done status={resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
+                log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
             # 先落库（纯同步，即使外层在取消也能跑完），再还连接
             if record:
                 stats.live_exit(stream_flag)
                 _record(
-                    request=request, route=route, proto=proto, model=asked, remote_model=remote,
-                    status=resp.status_code, stream_flag=stream_flag, req_bytes=len(body),
+                    request=request, route=won, proto=proto, model=asked,
+                    remote_model=won_remote, status=upstream_resp.status_code,
+                    stream_flag=stream_flag, req_bytes=won_bytes,
                     resp_bytes=sent, elapsed=time.monotonic() - started,
-                    head=bytes(head), tail=bytes(tail), note=note,
+                    head=bytes(head), tail=bytes(tail), note=note, attempt=won_attempt,
                 )
             with contextlib.suppress(Exception):
-                await resp.aclose()
+                await upstream_resp.aclose()
 
-    passthrough = {k: v for k, v in resp.headers.items() if k.lower() not in RESP_DROP}
+    passthrough = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in RESP_DROP}
     return StreamingResponse(
         relay(),
-        status_code=resp.status_code,
+        status_code=upstream_resp.status_code,
         headers=passthrough,
-        media_type=resp.headers.get("content-type", "application/json"),
+        media_type=upstream_resp.headers.get("content-type", "application/json"),
     )
 
 def _record(
@@ -295,6 +371,7 @@ def _record(
     head: bytes,
     tail: bytes,
     note: str,
+    attempt: int = 1,
 ) -> None:
     input_tokens, output_tokens, cached_tokens = proto.extract_usage(head, tail)
     try:
@@ -314,6 +391,7 @@ def _record(
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
             note=note,
+            attempt=attempt,
         )
     except Exception as exc:  # 记日志失败绝不能影响转发本身
         log(f"  request_log insert failed: {exc}")

@@ -18,9 +18,10 @@ import * as views from './views.js';
 /* ---------------------------------------------------------------- 数据 */
 
 async function refreshConfig() {
-  [state.upstreams, state.routes] = await Promise.all([
+  [state.upstreams, state.routes, state.failover] = await Promise.all([
     api('GET', '/admin/api/upstreams'),
     api('GET', '/admin/api/models'),
+    api('GET', '/admin/api/failover'),
   ]);
   views.renderRoutes();
   views.renderUpstreams();   // 里面会把供应商弹窗的分组列表一起刷
@@ -598,8 +599,25 @@ function openRoute(model, gid) {
   $('rt-onem').checked = onem;
   $('rt-onem-wrap').hidden = iface !== 'anthropic';   // beta 头只有 Anthropic 那边有
   fillRemoteList(Number($('rt-group').value));
+  // 顺序只在「改某个候选」时能调：新增的那条还不在链上
+  $('rt-order-wrap').hidden = !cand;
+  orderHint();
   $('route-dialog').showModal();
   (model ? $('rt-remote') : $('rt-model')).focus();
+}
+
+/** 「第 2 / 5 位」以及两个按钮该不该禁用 */
+function orderHint() {
+  const cand = state.editingCand;
+  if (!cand) return;
+  const row = state.routes.find((r) => r.model_name === cand.model);
+  const ids = row ? row.candidates.map((c) => c.group_id) : [];
+  const at = ids.indexOf(cand.gid);
+  $('rt-order-hint').textContent = at < 0 ? '' : `第 ${at + 1} / ${ids.length} 位`;
+  for (const btn of $('rt-order-wrap').querySelectorAll('[data-act="move-cand"]')) {
+    const to = at + Number(btn.dataset.dir);
+    btn.disabled = at < 0 || to < 0 || to >= ids.length;
+  }
 }
 
 /* 「上游那边的真实模型名」得跟分组对上 —— 同一个站两把 key 能看到的东西都不一样，
@@ -881,6 +899,40 @@ const ACTIONS = {
   'add-candidate': ({ model }) => openRoute(model, null),
   'edit-candidate': ({ model, gid }) => openRoute(model, Number(gid)),
 
+  /* 自动降级开关。按接口分开：Claude 侧的中转站坏得勤、值得自动换；
+     GPT 侧除了 站A 都是要花钱的站，花钱图稳定，得手动确认。
+     属性名用 data-fo 而不是 data-iface —— 后者被模型路由那个分段选择器占了，
+     开关会连带把筛选也切掉（preset-fp 当初就踩过这个坑）。 */
+  'toggle-failover': async ({ fo }, el) => {
+    try {
+      state.failover = await api('POST', '/admin/api/failover', {
+        protocol: fo, enabled: el.checked,
+      });
+    } catch (e) {
+      el.checked = !el.checked;
+      throw e;
+    }
+    views.renderRoutes();
+    toast(`${PROTO_LABEL[fo]} 自动降级已${el.checked ? '开启' : '关闭'}`, 'ok');
+  },
+
+  /* 候选在链上前移 / 后移一位。即时生效，不用保存 */
+  'move-cand': async ({ dir }) => {
+    const cand = state.editingCand;
+    if (!cand) return;
+    const row = state.routes.find((r) => r.model_name === cand.model);
+    if (!row) return;
+    const ids = row.candidates.map((c) => c.group_id);
+    const at = ids.indexOf(cand.gid);
+    const to = at + Number(dir);
+    if (at < 0 || to < 0 || to >= ids.length) return;
+    ids.splice(to, 0, ids.splice(at, 1)[0]);
+    await api('POST', '/admin/api/models/order', { model_name: cand.model, order: ids });
+    await refreshConfig();
+    // rAF：run() 的 finally 会把刚点的那个按钮重新启用，得等它跑完再按新位置算禁用
+    requestAnimationFrame(orderHint);
+  },
+
   'switch': async ({ model, gid }) => {
     const id = Number(gid);
     const group = state.routes.find((r) => r.model_name === model);
@@ -1076,11 +1128,12 @@ const ticking = () => document.visibilityState === 'visible' && !document.queryS
 // 快轮只取活跃流：3 秒一次，让"进行中的请求"真的是实时的
 setInterval(() => { if (ticking()) run(null, refreshStats); }, 3000);
 
-// 慢轮取统计和记录：数据量大一些，15 秒足够
+// 慢轮取统计和记录：数据量大一些，15 秒足够。配置也跟着刷 —— 断路器的冷却剩余
+// 在候选圆片上是要走字的，而且从别处（另一个标签页、手动切换）改过的配置也该跟上
 setInterval(() => {
   if (!ticking()) return;
   run(null, async () => {
-    await Promise.all([refreshOverview(), refreshLog()]);
+    await Promise.all([refreshOverview(), refreshLog(), refreshConfig()]);
   });
 }, 15000);
 

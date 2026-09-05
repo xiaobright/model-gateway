@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import db, stats as stats_mod, upstream as upstream_mod
+from . import db, failover, stats as stats_mod, upstream as upstream_mod
 from .reqlog import log
 
 router = APIRouter(prefix="/admin/api")
@@ -46,6 +46,17 @@ class BulkAddIn(BaseModel):
 class SwitchIn(BaseModel):
     model_name: str = Field(min_length=1)
     group_id: int
+
+
+class OrderIn(BaseModel):
+    model_name: str = Field(min_length=1)
+    # 自动降级依次尝试的顺序，从先到后
+    order: tuple[int, ...] = Field(min_length=1)
+
+
+class FailoverIn(BaseModel):
+    protocol: str = Field(min_length=1)
+    enabled: bool
 
 
 def _validate_protocol(protocol: str) -> str:
@@ -270,6 +281,7 @@ async def get_remote_models(group_id: int) -> dict[str, Any]:
 
 @router.get("/models")
 def get_model_routes() -> list[dict[str, Any]]:
+    cooling = {b["group_id"]: b for b in failover.snapshot()}
     grouped: dict[str, dict[str, Any]] = {}
     for row in db.list_routes():
         group = grouped.setdefault(
@@ -286,6 +298,7 @@ def get_model_routes() -> list[dict[str, Any]]:
         is_active = bool(row["is_active"])
         upstream_on = bool(row["upstream_enabled"])
         group_on = bool(row["group_enabled"])
+        breaker = cooling.get(row["group_id"])
         group["candidates"].append(
             {
                 "group_id": row["group_id"],
@@ -297,6 +310,10 @@ def get_model_routes() -> list[dict[str, Any]]:
                 "upstream_enabled": upstream_on,
                 "remote_model": row["remote_model"],
                 "is_active": is_active,
+                # 候选按 priority 排好了；圆片从左到右就是自动降级的尝试顺序
+                "priority": row["priority"],
+                "cooling_ms": breaker["cooling_ms"] if breaker else 0,
+                "fails": breaker["fails"] if breaker else 0,
             }
         )
         if is_active:
@@ -361,8 +378,35 @@ def post_switch(payload: SwitchIn) -> dict[str, bool]:
     group = db.get_group(payload.group_id)
     target = db.get_upstream(group.upstream_id) if group else None
     label = f"{target.name}/{group.name}" if target and group else str(payload.group_id)
+    # 手动指定了就立刻给它机会：之前的连续失败不该继续把它挡在外面
+    failover.clear(payload.group_id)
     log(f"SWITCH model={payload.model_name!r} -> {label}")
     return {"ok": True}
+
+
+@router.post("/models/order")
+def post_order(payload: OrderIn) -> dict[str, Any]:
+    """重排一个模型的候选顺序 = 自动降级依次尝试的顺序。"""
+    n = db.set_route_order(payload.model_name, payload.order)
+    if n == 0:
+        raise HTTPException(404, f"「{payload.model_name}」没有这些候选")
+    log(f"ORDER model={payload.model_name!r} -> {list(payload.order)}")
+    return {"ok": True, "ordered": n}
+
+
+# ---------------------------------------------------------------- 自动降级
+
+
+@router.get("/failover")
+def get_failover() -> dict[str, Any]:
+    return {"enabled": failover.all_enabled(), "breakers": failover.snapshot()}
+
+
+@router.post("/failover")
+def post_failover(payload: FailoverIn) -> dict[str, Any]:
+    protocol = _validate_protocol(payload.protocol)
+    failover.set_enabled(protocol, payload.enabled)
+    return {"enabled": failover.all_enabled()}
 
 
 @router.delete("/models")

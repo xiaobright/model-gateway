@@ -4,8 +4,8 @@
    - 所有列表更新都走增量：无变化就不碰 DOM，避免动画乱闪 */
 
 import {
-  $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec,
-  modelsOfGroup, modelsOfUpstream, splitOneM, PROTO_LABEL, PROTO_PATH,
+  $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft,
+  modelsOfGroup, modelsOfUpstream, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -90,7 +90,9 @@ export function renderKpis() {
   if (dot) dot.classList.toggle('is-live', live.requests > 0);
 
   setNum('req', t.requests || 0, (v) => fmtInt(Math.round(v)));
-  setNote('req', `入 ${fmtTokens(t.input_tokens)} · 出 ${fmtTokens(t.output_tokens)} tokens`);
+  // 「救回」= 第二次以上的尝试还成了。只在真发生过时才占这行的位置
+  setNote('req', `入 ${fmtTokens(t.input_tokens)} · 出 ${fmtTokens(t.output_tokens)} tokens`
+    + (t.saved ? ` · 救回 <b>${fmtInt(t.saved)}</b>` : ''));
 
   setNum('p95', (t.p95 || 0) / 1000, (v) => v.toFixed(1) + 's');
   setNote('p95', '最近 2000 条请求的耗时分位');
@@ -229,22 +231,44 @@ function multiGroupIds() {
 
 function chipHtml(model, c, showGroup) {
   const live = c.upstream_enabled && c.group_enabled;
-  const cls = ['chip', c.is_active ? 'chip-on' : '', live ? '' : 'chip-off'].filter(Boolean).join(' ');
+  const cool = c.cooling_ms > 0;
+  const cls = ['chip', c.is_active ? 'chip-on' : '', live ? '' : 'chip-off',
+    cool ? 'chip-cool' : ''].filter(Boolean).join(' ');
   const label = showGroup ? `${c.upstream_name} · ${c.group_name}` : c.upstream_name;
   const { bare, onem } = splitOneM(c.remote_model);
   const remote = bare && bare !== model ? ` <span class="remote">${esc(bare)}</span>` : '';
   const wide = onem ? ' <span class="tag tag-accent">1M</span>' : '';
   const off = live ? ''
     : ` <span class="tag">${c.upstream_enabled ? '分组停用' : '停用'}</span>`;
+  // 冷却 = 它连着失败过，自动降级这段时间内会跳过它（手动点它照样能切过去）
+  const cd = cool
+    ? ` <span class="tag tag-warn" title="连续失败 ${c.fails} 次，冷却期内自动降级会跳过它">`
+      + `冷却 ${fmtLeft(c.cooling_ms)}</span>` : '';
   const tip = c.is_active ? '当前生效的分组' : `切到 ${label}`;
   return `<span class="${cls}" data-gid="${c.group_id}">
     <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"
-            data-gid="${c.group_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${off}</button>
+            data-gid="${c.group_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
     <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"
-            data-gid="${c.group_id}" title="改上游真名 / 1M">✎</button>
+            data-gid="${c.group_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
     <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"
             data-gid="${c.group_id}" title="从这个分组移除该模型">✕</button>
   </span>`;
+}
+
+/* 自动降级开关。按接口分开，所以跟着当前的接口筛选走：筛了哪个就只显示那个的开关，
+   「全部」时两个都显示 —— 一个开关代表两种接口会让人以为 GPT 侧也在自动换站。
+   不复用 .checkline：它那条 input[type=checkbox]{width:auto} 选择器权重更高，
+   会把开关压成 0 宽、只剩个滑块糊在文字上。 */
+function failoverBox() {
+  const box = $('failover-box');
+  if (!box) return;
+  const on = (state.failover && state.failover.enabled) || {};
+  const list = state.iface ? [state.iface] : PROTOCOLS;
+  box.innerHTML = list.map((p) => `<label class="fo-item" title="打不通就按候选顺序换下一个">
+      <input type="checkbox" class="switch" ${on[p] ? 'checked' : ''}
+             data-act="toggle-failover" data-fo="${p}">
+      <span>${list.length > 1 ? PROTO_LABEL[p] + ' ' : '自动'}降级</span>
+    </label>`).join('');
 }
 
 const EMPTY_BY_IFACE = {
@@ -254,6 +278,7 @@ const EMPTY_BY_IFACE = {
 };
 
 export function renderRoutes() {
+  failoverBox();
   const kw = state.filter.trim().toLowerCase();
   const iface = state.iface;
   const byIface = iface ? state.routes.filter((r) => r.protocol === iface) : state.routes;
@@ -475,6 +500,8 @@ const NOTE_LABEL = {
   connect_failed: ['crit', '连不上'],
   upstream_abort: ['crit', '上游断流'],
   client_abort: ['', '客户端断开'],
+  // 这一次失败被自动降级接住了：客户端没看到它，但钱和时间是真花了，所以照样留痕
+  failed_over: ['warn', '已降级'],
 };
 
 function noteTag(note) {
@@ -498,12 +525,15 @@ function logRow(r) {
   const grp = r.group_name && r.group_name !== '默认'
     ? ` <span class="dim">· ${esc(r.group_name)}</span>` : '';
   const upTip = r.group_name ? `${r.upstream} · ${r.group_name}` : r.upstream;
+  // 第几次尝试：> 1 就是前面的候选没打通、换到这个站来的
+  const nth = r.attempt > 1
+    ? ` <span class="tag tag-accent" title="前 ${r.attempt - 1} 个候选没打通">第 ${r.attempt} 次</span>` : '';
   return `<tr data-id="${r.id}" data-log-proto="${esc(proto)}">
       <td class="dim nowrap" title="${esc(r.ts || '')}">${esc((r.ts || '').slice(5))}</td>
       <td class="truncate" title="${esc(r.client)}">${esc(r.client)}</td>
       <td class="nowrap">${protoCell}</td>
       <td class="mono truncate" title="${esc(modelTip)}">${esc(r.model)}${remote}${r.stream ? ' <span class="tag">流</span>' : ''}</td>
-      <td class="truncate" title="${esc(upTip)}">${esc(r.upstream)}${grp}</td>
+      <td class="truncate" title="${esc(upTip)}">${esc(r.upstream)}${grp}${nth}</td>
       <td>${statusTag(r.status)}</td>
       <td class="num mono nowrap">${tokens}</td>
       <td class="num dim nowrap" title="上行 ${fmtBytes(r.req_bytes)} · 下行 ${fmtBytes(r.resp_bytes)}">${fmtDur(r.duration_ms)}</td>

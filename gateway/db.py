@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS model_routes(
   group_id INTEGER NOT NULL REFERENCES upstream_groups(id) ON DELETE CASCADE,
   remote_model TEXT NOT NULL,
   is_active INTEGER NOT NULL DEFAULT 0,
+  priority INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(model_name, group_id)
 );
 CREATE TABLE IF NOT EXISTS request_log(
@@ -62,7 +63,12 @@ CREATE TABLE IF NOT EXISTS request_log(
   input_tokens INTEGER,
   output_tokens INTEGER,
   cached_tokens INTEGER,
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  attempt INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS settings(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 """
 
@@ -218,7 +224,8 @@ def _migrate_to_groups(conn: sqlite3.Connection) -> None:
         )
 
     # model_routes 的主键要从 upstream_id 换成 group_id，只能重建。此刻每个供应商
-    # 恰好一个分组，所以下面这个 join 是一对一的
+    # 恰好一个分组，所以下面这个 join 是一对一的。
+    # 建表语句要和 _SCHEMA 保持一致（漏了 priority 的话后面 list_routes 直接报没这列）
     conn.execute("ALTER TABLE model_routes RENAME TO model_routes_pre_group")
     conn.execute("""
         CREATE TABLE model_routes(
@@ -226,6 +233,7 @@ def _migrate_to_groups(conn: sqlite3.Connection) -> None:
           group_id INTEGER NOT NULL REFERENCES upstream_groups(id) ON DELETE CASCADE,
           remote_model TEXT NOT NULL,
           is_active INTEGER NOT NULL DEFAULT 0,
+          priority INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(model_name, group_id)
         )""")
     conn.execute("""
@@ -335,10 +343,16 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         "upstreams": [
             ("header_override", "TEXT NOT NULL DEFAULT ''"),
         ],
+        "model_routes": [
+            # 自动降级的尝试顺序：小的先试。0 = 还没排过，按 group_id 兜底
+            ("priority", "INTEGER NOT NULL DEFAULT 0"),
+        ],
         "request_log": [
             ("remote_model", "TEXT NOT NULL DEFAULT ''"),
             ("protocol", "TEXT NOT NULL DEFAULT ''"),
             ("group_name", "TEXT NOT NULL DEFAULT ''"),
+            # 这条记录是这个请求的第几次尝试；> 1 就是被自动降级救回来的
+            ("attempt", "INTEGER NOT NULL DEFAULT 1"),
         ],
     }
     for table, columns in wanted.items():
@@ -369,6 +383,9 @@ def init_db() -> None:
             _normalize_base_urls(conn)
             _backfill_log_protocol(conn)
             _warn_mixed_models(conn)
+            # 迁移里有重建表的动作，再补一次列：漏一个字段的代价是启动之后到处报
+            # 「no such column」，而这个检查是幂等的、几乎不花时间
+            _add_missing_columns(conn)
     if backup:
         log(f"db migrated to per-group protocol schema, backup at data/{backup}")
 
@@ -538,16 +555,39 @@ def delete_group(group_id: int) -> bool:
 
 def list_routes() -> tuple[dict, ...]:
     query = """
-        SELECT m.model_name, m.group_id, m.remote_model, m.is_active,
+        SELECT m.model_name, m.group_id, m.remote_model, m.is_active, m.priority,
                g.name AS group_name, g.protocol, g.enabled AS group_enabled,
                u.id AS upstream_id, u.name AS upstream_name, u.enabled AS upstream_enabled
         FROM model_routes m
         JOIN upstream_groups g ON g.id = m.group_id
         JOIN upstreams u ON u.id = g.upstream_id
-        ORDER BY m.model_name, u.name, g.name
+        ORDER BY m.model_name, m.priority, m.group_id
     """
     with _conn() as conn:
         return tuple(dict(r) for r in conn.execute(query))
+
+
+def set_route_order(model_name: str, group_ids: Iterable[int]) -> int:
+    """按给定顺序重排这个模型的候选（自动降级依次尝试的顺序）。返回排到的条数。
+
+    只认真的存在的候选，没提到的留在后面（priority 从 len(order) 起排，保持它们原来的相对次序）。
+    """
+    with _conn() as conn:
+        have = [
+            r["group_id"]
+            for r in conn.execute(
+                "SELECT group_id FROM model_routes WHERE model_name=? ORDER BY priority, group_id",
+                (model_name,),
+            )
+        ]
+        wanted = [gid for gid in group_ids if gid in have]
+        rest = [gid for gid in have if gid not in wanted]
+        for i, gid in enumerate(wanted + rest):
+            conn.execute(
+                "UPDATE model_routes SET priority=? WHERE model_name=? AND group_id=?",
+                (i, model_name, gid),
+            )
+        return len(wanted)
 
 
 def _group_protocol(conn: sqlite3.Connection, group_id: int) -> str:
@@ -584,9 +624,15 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> bool:
         count = conn.execute(
             "SELECT COUNT(*) AS n FROM model_routes WHERE model_name=?", (model_name,)
         ).fetchone()["n"]
+        # 新候选排在链尾：自动降级按 priority 从小到大试，刚加的那个不该抢到最前面去
+        nxt = conn.execute(
+            "SELECT COALESCE(MAX(priority), -1) + 1 AS p FROM model_routes WHERE model_name=?",
+            (model_name,),
+        ).fetchone()["p"]
         conn.execute(
-            "INSERT INTO model_routes(model_name, group_id, remote_model, is_active) VALUES(?,?,?,?)",
-            (model_name, group_id, remote_model, 1 if count == 0 else 0),
+            "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
+            " VALUES(?,?,?,?,?)",
+            (model_name, group_id, remote_model, 1 if count == 0 else 0, nxt),
         )
     return True
 
@@ -652,19 +698,6 @@ def switch_route(model_name: str, group_id: int) -> bool:
     return True
 
 
-_ACTIVE_QUERY = """
-    SELECT u.*, g.id AS group_id, g.name AS group_name, g.api_key, m.remote_model
-    FROM model_routes m
-    JOIN upstream_groups g ON g.id = m.group_id
-    JOIN upstreams u ON u.id = g.upstream_id
-    WHERE m.model_name=? AND g.protocol=? AND m.is_active=1 AND u.enabled=1 AND g.enabled=1
-"""
-
-
-def _active_row(conn: sqlite3.Connection, model_name: str, protocol: str) -> sqlite3.Row | None:
-    return conn.execute(_ACTIVE_QUERY, (model_name, protocol)).fetchone()
-
-
 def _tier_match(conn: sqlite3.Connection, model_name: str, protocol: str) -> str:
     """在**这个接口下**已录入的模型名里找同档位的那一个；不唯一就不猜，返回空串。"""
     tier = naming.tier_of(model_name)
@@ -698,20 +731,43 @@ def resolve_route(model_name: str, protocol: str) -> Route | None:
 
     api_key 取自命中的**分组**，填进 Upstream.api_key，这样 proxy 那边一行都不用改。
     """
+    chain = resolve_chain(model_name, protocol)
+    return chain[0] if chain else None
+
+
+_CHAIN_QUERY = """
+    SELECT u.*, g.id AS group_id, g.name AS group_name, g.api_key, m.remote_model
+    FROM model_routes m
+    JOIN upstream_groups g ON g.id = m.group_id
+    JOIN upstreams u ON u.id = g.upstream_id
+    WHERE m.model_name=? AND g.protocol=? AND u.enabled=1 AND g.enabled=1
+    ORDER BY m.is_active DESC, m.priority, m.group_id
+"""
+
+
+def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
+    """这个模型在这个接口下所有能用的候选，按「先打谁」排好。
+
+    第一个就是 resolve_route 的答案（生效的那个候选排最前），后面是自动降级的退路，
+    顺序由 priority 决定（小的先试）。停用的供应商 / 分组不在里面。
+
+    档位关键字兜底和 resolve_route 是同一套：先定下实际命中的模型名，再取它的整条链。
+    """
     with _conn() as conn:
         matched = model_name
-        row = _active_row(conn, model_name, protocol)
-        if row is None:
+        rows = conn.execute(_CHAIN_QUERY, (model_name, protocol)).fetchall()
+        if not rows:
             matched = _tier_match(conn, model_name, protocol)
-            row = _active_row(conn, matched, protocol) if matched else None
-    if row is None:
-        return None
-    return Route(
-        model_name=matched,
-        upstream=_to_upstream(row, api_key=row["api_key"]),
-        remote_model=row["remote_model"],
-        group_id=row["group_id"],
-        group_name=row["group_name"],
+            rows = conn.execute(_CHAIN_QUERY, (matched, protocol)).fetchall() if matched else []
+    return tuple(
+        Route(
+            model_name=matched,
+            upstream=_to_upstream(row, api_key=row["api_key"]),
+            remote_model=row["remote_model"],
+            group_id=row["group_id"],
+            group_name=row["group_name"],
+        )
+        for row in rows
     )
 
 
@@ -771,14 +827,16 @@ def insert_request(
     remote_model: str = "",
     protocol: str = "",
     group_name: str = "",
+    attempt: int = 1,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             "INSERT INTO request_log(client, model, remote_model, protocol, upstream, group_name,"
             " status, stream, req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens,"
-            " cached_tokens, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " cached_tokens, note, attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (client, model, remote_model, protocol, upstream, group_name, status, int(stream),
-             req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens, note),
+             req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens, note,
+             attempt),
         )
         conn.execute(
             "DELETE FROM request_log WHERE id <= (SELECT MAX(id) - ? FROM request_log)", (LOG_KEEP_ROWS,)
@@ -791,6 +849,24 @@ def recent_requests(limit: int = 50) -> tuple[dict, ...]:
     return tuple(dict(r) for r in rows)
 
 
+# ---------------------------------------------------------------- 设置
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with _conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row is not None else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+
 def clear_request_log() -> int:
     with _conn() as conn:
         return conn.execute("DELETE FROM request_log").rowcount
@@ -800,6 +876,16 @@ def request_stats() -> dict:
     with _conn() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS n, COALESCE(SUM(input_tokens),0) AS it,"
-            " COALESCE(SUM(output_tokens),0) AS ot, COALESCE(SUM(cached_tokens),0) AS ct FROM request_log"
+            " COALESCE(SUM(output_tokens),0) AS ot, COALESCE(SUM(cached_tokens),0) AS ct,"
+            # 第二次以上的尝试还成了，就是被自动降级救回来的一次
+            " COALESCE(SUM(attempt > 1 AND status < 400),0) AS saved,"
+            " COALESCE(SUM(note='failed_over'),0) AS failed_over FROM request_log"
         ).fetchone()
-    return {"requests": row["n"], "input_tokens": row["it"], "output_tokens": row["ot"], "cached_tokens": row["ct"]}
+    return {
+        "requests": row["n"],
+        "input_tokens": row["it"],
+        "output_tokens": row["ot"],
+        "cached_tokens": row["ct"],
+        "saved": row["saved"],
+        "failed_over": row["failed_over"],
+    }

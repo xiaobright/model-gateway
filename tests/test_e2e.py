@@ -39,8 +39,17 @@ def wait_server_started(server: uvicorn.Server, thread: threading.Thread, timeou
     raise RuntimeError("server did not start in time")
 
 
-def build_upstream_app(name: str) -> FastAPI:
+def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
     app = FastAPI()
+    # sick["status"] 一被设上，两个转发端点就一律回那个状态码 —— 用来演「这个站坏了」。
+    # 放在字典里是为了能在运行中翻转（测冷却期满之后自己恢复）
+    sick = sick if sick is not None else {"status": None}
+
+    def sick_now() -> JSONResponse | None:
+        code = sick.get("status")
+        if not code:
+            return None
+        return JSONResponse({"error": {"message": f"{name} is sick", "code": code}}, status_code=code)
 
     @app.get("/v1/models")
     def models(request: Request) -> dict:
@@ -56,6 +65,8 @@ def build_upstream_app(name: str) -> FastAPI:
 
     @app.post("/v1/responses")
     async def responses(request: Request) -> object:
+        if (bad := sick_now()) is not None:
+            return bad
         body = json.loads((await request.body()) or b"{}")
         if body.get("stream"):
             mode = body.get("mode", "")
@@ -97,6 +108,8 @@ def build_upstream_app(name: str) -> FastAPI:
 
     @app.post("/v1/messages")
     async def messages(request: Request) -> object:
+        if (bad := sick_now()) is not None:
+            return bad
         raw = await request.body()
         body = json.loads(raw or b"{}")
         echo = {
@@ -172,10 +185,20 @@ class MockUpstream:
         self.port = free_port()
         # 站根：/v1 由网关按接口自己补，两种接口的路径都在它底下
         self.base_url = f"http://127.0.0.1:{self.port}"
+        # 运行中可翻转的「病历」：设了 status 就一律回那个码，用来演故障与恢复
+        self.sick: dict = {"status": None}
         self._server = uvicorn.Server(
-            uvicorn.Config(build_upstream_app(name), host="127.0.0.1", port=self.port, log_level="error")
+            uvicorn.Config(
+                build_upstream_app(name, self.sick), host="127.0.0.1", port=self.port, log_level="error"
+            )
         )
         self._thread = threading.Thread(target=self._server.run, daemon=True)
+
+    def fail_with(self, status: int) -> None:
+        self.sick["status"] = status
+
+    def heal(self) -> None:
+        self.sick["status"] = None
 
     def __enter__(self) -> "MockUpstream":
         self._thread.start()
@@ -189,12 +212,14 @@ class MockUpstream:
 
 @pytest.fixture()
 def gateway(tmp_path, monkeypatch):
-    from gateway import config
+    from gateway import config, failover
     from gateway.server import start_server_thread
 
     data_dir = tmp_path / "data"
     monkeypatch.setattr(config, "DATA_DIR", data_dir)
     monkeypatch.setattr(config, "DB_PATH", data_dir / "gateway.db")
+    # 断路器是进程内的内存状态，测试跑在同一个进程里 —— 不清会串到下一个用例
+    failover.reset()
 
     port = free_port()
     server, thread = start_server_thread(port)
@@ -272,6 +297,25 @@ def parse_sse_events(raw: str) -> list[dict]:
         for line in raw.splitlines()
         if line.startswith("data: ") and line != "data: [DONE]"
     ]
+
+
+def wait_rows(client: httpx.Client, n: int, timeout: float = 8.0) -> list[dict]:
+    """等到至少 n 条转发记录，返回**时间升序**的列表。
+
+    失败的那几次尝试是同步落库的，但胜出那次要等流收尾才写，所以得等。
+    """
+    deadline = time.monotonic() + timeout
+    rows: list[dict] = []
+    while time.monotonic() < deadline:
+        rows = client.get("/admin/api/requests?limit=50").json()
+        if len(rows) >= n:
+            return list(reversed(rows))
+        time.sleep(0.05)
+    raise AssertionError(f"等不到 {n} 条转发记录，只有 {len(rows)} 条: {rows}")
+
+
+def rows_on(client: httpx.Client, upstream: str) -> int:
+    return sum(1 for r in client.get("/admin/api/requests?limit=50").json() if r["upstream"] == upstream)
 
 
 def test_import_models_and_switch_without_interrupting_stream(gateway):
@@ -1294,6 +1338,187 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
     db.init_db()   # 幂等
     assert len(db.list_groups()) == 5
     assert len(list(data_dir.glob("gateway.db.bak-*"))) == 1
+
+
+# ================================================================ 自动降级
+#
+# 只在 Anthropic 接口默认开着：那边全是坏得勤的中转站。OpenAI 那边除了一个公益站
+# 都是花钱买稳定的，换站要人点头，所以默认关闭 —— 见 test_failover_is_off_on_openai。
+
+
+def two_anthropic_sites(gateway, a, b, remote_a="claude-opus-4-1", remote_b="claude-opus-4-5"):
+    """两个站各一个 anthropic 分组，同一个模型两条候选（a 是活跃的那条）。"""
+    g_a = add_upstream(gateway, a, "siteA", "anthropic")
+    g_b = add_upstream(gateway, b, "siteB", "anthropic")
+    add_route(gateway, "opus", g_a, remote_a)
+    add_route(gateway, "opus", g_b, remote_b)
+    return g_a, g_b
+
+
+def test_failover_moves_to_the_next_candidate(gateway):
+    """第一个候选打不通就换下一个，客户端不该看见这件事。
+
+    每个候选的**上游真名和 key 都可能不一样**（真库里 claude-sonnet-5 在一个站叫
+    claude-sonnet-5、在另一个站映射到 claude-opus-5），所以请求体和请求头都得按候选重建。
+    """
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        two_anthropic_sites(gateway, a, b)
+        a.fail_with(503)
+
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["upstream"] == "siteB"
+        assert body["model"] == "claude-opus-4-5", "换站之后请求体里的 model 要跟着换"
+        assert body["x_api_key"] == "key-siteB", "key 也得是新候选那把"
+
+        rows = wait_rows(gateway, 2)
+        assert [(r["upstream"], r["status"], r["attempt"], r["note"]) for r in rows] == [
+            ("siteA", 503, 1, "failed_over"),
+            ("siteB", 200, 2, "ok"),
+        ], "被降级掉的那次失败也要留痕：客户端没看见，但这次调用是真花了钱的"
+        assert gateway.get("/admin/api/stats").json()["saved"] == 1
+
+def test_failover_works_for_streams(gateway):
+    """流式也能降级：状态码已经拿到、还没往下游发过任何字节，这是唯一安全的落点。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        two_anthropic_sites(gateway, a, b)
+        a.fail_with(503)
+
+        with gateway.stream("POST", "/v1/messages", json=msg("opus", stream=True)) as stream:
+            assert stream.status_code == 200
+            raw = "".join(stream.iter_text())
+        events = parse_sse_events(raw)
+        assert events[0]["type"] == "message_start", "不能把坏站的半截响应混进来"
+        assert events[-1]["type"] == "message_stop"
+        assert events[0]["message"]["model"] == "claude-opus-4-5"
+
+
+def test_failover_is_off_on_openai(gateway):
+    """GPT 那边默认不自动换站，行为和加这个功能之前一字不差；打开开关才降级。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA")
+        g_b = add_upstream(gateway, b, "siteB")
+        add_route(gateway, "gpt-test", g_a)
+        add_route(gateway, "gpt-test", g_b)
+        a.fail_with(503)
+
+        assert gateway.get("/admin/api/failover").json()["enabled"] == {
+            "anthropic": True, "openai": False,
+        }
+        resp = gateway.post("/v1/responses", json={"model": "gpt-test"})
+        assert resp.status_code == 503, "没开降级就该把上游的 503 原样透传下去"
+        rows = wait_rows(gateway, 1)
+        assert len(rows) == 1 and rows[0]["upstream"] == "siteA"
+
+        gateway.post("/admin/api/failover", json={"protocol": "openai", "enabled": True})
+        again = gateway.post("/v1/responses", json={"model": "gpt-test"})
+        assert again.status_code == 200 and again.json()["upstream"] == "siteB"
+
+
+def test_failover_skips_a_bad_request(gateway):
+    """400 换个站也是同样的答案，重试只是白花一次调用。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        two_anthropic_sites(gateway, a, b)
+        a.fail_with(400)
+
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        assert resp.status_code == 400
+        rows = wait_rows(gateway, 1)
+        assert len(rows) == 1 and rows[0]["upstream"] == "siteA"
+
+def test_failover_gives_up_after_three_attempts(gateway):
+    """全都坏的时候要有个头：打三个就把最后那个的响应还给客户端，别把 40 万 token 重发五遍。"""
+    from gateway import failover
+
+    with MockUpstream("s1") as s1, MockUpstream("s2") as s2, \
+            MockUpstream("s3") as s3, MockUpstream("s4") as s4:
+        for i, site in enumerate((s1, s2, s3, s4), start=1):
+            gid = add_upstream(gateway, site, site.name, "anthropic")
+            add_route(gateway, "opus", gid, f"remote-{i}")
+            site.fail_with(503)
+
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        assert resp.status_code == 503
+        rows = wait_rows(gateway, failover.MAX_ATTEMPTS)
+        assert [r["upstream"] for r in rows] == ["s1", "s2", "s3"]
+        assert [r["attempt"] for r in rows] == [1, 2, 3]
+        # 最后那次是原样透传下去的，不算「被降级接住」
+        assert rows[-1]["note"] != "failed_over"
+
+
+def test_breaker_stops_paying_for_a_dead_site(gateway):
+    """真库里 站A 连续失败过 60 次、平均每次白等 16.6 秒 —— 连着坏就得躲开它，
+    否则每个请求都要重新交一遍学费。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a, _ = two_anthropic_sites(gateway, a, b)
+        a.fail_with(503)
+
+        for _ in range(2):
+            assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
+
+        breakers = gateway.get("/admin/api/failover").json()["breakers"]
+        assert [(x["group_id"], x["fails"], x["cooling_ms"] > 0) for x in breakers] == [(g_a, 2, True)]
+
+        hits = rows_on(gateway, "siteA")
+        assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
+        assert rows_on(gateway, "siteA") == hits, "冷却期内根本不该再打它"
+
+
+def test_manual_switch_clears_the_cooldown(gateway):
+    """手动点了那个圆片就是明确指定，之前的连续失败不该继续把它挡在外面。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a, _ = two_anthropic_sites(gateway, a, b)
+        a.fail_with(503)
+        for _ in range(2):
+            gateway.post("/v1/messages", json=msg("opus"))
+        assert gateway.get("/admin/api/failover").json()["breakers"], "先让它进冷却"
+
+        assert gateway.post(
+            "/admin/api/models/switch", json={"model_name": "opus", "group_id": g_a}
+        ).json() == {"ok": True}
+        assert gateway.get("/admin/api/failover").json()["breakers"] == []
+
+        hits = rows_on(gateway, "siteA")
+        assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
+        assert rows_on(gateway, "siteA") == hits + 1, "清了冷却就该重新试它一次"
+
+def test_route_order_decides_who_is_tried_next(gateway):
+    """圆片从左到右就是尝试顺序，站H 这种最稳的排最后当保底。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b, MockUpstream("siteC") as c:
+        g_a, g_b = two_anthropic_sites(gateway, a, b)
+        g_c = add_upstream(gateway, c, "siteC", "anthropic")
+        add_route(gateway, "opus", g_c, "claude-opus-4-9")
+
+        ordered = gateway.post(
+            "/admin/api/models/order", json={"model_name": "opus", "order": [g_a, g_c, g_b]}
+        )
+        assert ordered.json() == {"ok": True, "ordered": 3}
+        row = next(r for r in gateway.get("/admin/api/models").json() if r["model_name"] == "opus")
+        assert [cand["group_id"] for cand in row["candidates"]] == [g_a, g_c, g_b]
+
+        a.fail_with(503)
+        b.fail_with(503)
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        assert resp.status_code == 200 and resp.json()["upstream"] == "siteC"
+        rows = wait_rows(gateway, 2)
+        assert [r["upstream"] for r in rows] == ["siteA", "siteC"], "第二个该按顺序轮到 C 而不是 B"
+
+
+def test_stateful_openai_request_is_not_failed_over(gateway):
+    """带 store / previous_response_id 的请求，上游可能已经存下来了才失败，重试会留下两条。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA")
+        g_b = add_upstream(gateway, b, "siteB")
+        add_route(gateway, "gpt-test", g_a)
+        add_route(gateway, "gpt-test", g_b)
+        gateway.post("/admin/api/failover", json={"protocol": "openai", "enabled": True})
+        a.fail_with(503)
+
+        resp = gateway.post("/v1/responses", json={"model": "gpt-test", "store": True})
+        assert resp.status_code == 503
+        rows = wait_rows(gateway, 1)
+        assert len(rows) == 1 and rows[0]["upstream"] == "siteA"
 
 
 

@@ -995,6 +995,23 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .chip-on .chip-label { font-weight: 600; cursor: default; }
 .chip-on .remote { color: var(--accent); opacity: 0.85; }
 .chip-off { opacity: 0.55; }
+/* 冷却中：它连着失败过，自动降级这段时间会跳过它。虚线边 + 警示色，
+   和「停用」区分开 —— 停用是你关的，冷却是它自己作的，而且会自己好。
+   还生效着（chip-on）的那个不动它的底色：不然一冷却起来整行就没有高亮的圆片了，
+   「我的流量现在在哪」反而看不出来 */
+.chip-cool { border-style: dashed; border-color: var(--warn); }
+.chip-cool:not(.chip-on) { background: var(--glass-3); }
+.chip-cool:not(.chip-on) .chip-label { color: var(--ink-2); }
+/* 自动降级开关：卡头里那个 switch 比正文小一号，别抢标题的视觉重量 */
+.fo-box { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.fo-item {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  font-size: 12px; color: var(--ink-3); white-space: nowrap;
+}
+.fo-item:hover { color: var(--ink-2); }
+.fo-item .switch { width: 32px; height: 19px; margin: 0; }
+.fo-item .switch::after { width: 15px; height: 15px; }
+.fo-item .switch:checked::after { transform: translateX(13px); }
 /* 圆片右侧的两个动作（改配置 / 移除）：平时收成 0 宽，指过去才展开 */
 .chip-x, .chip-e {
   display: grid; place-items: center; width: 0; height: 20px; margin-right: 0;
