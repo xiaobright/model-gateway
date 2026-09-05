@@ -8,7 +8,9 @@
 
 import {
   $, state, api, toast, confirmBox, run, esc,
-  modelsOfGroup, modelsOfUpstream, groupLabel, upstreamOfGroup, groupOf, supportsSide, SIDE_LABEL,
+  modelsOfGroup, modelsOfUpstream, groupLabel, upstreamOfGroup, groupOf,
+  supportsIface, groupsOfIface, splitOneM, withOneM,
+  PROTO_LABEL, PROTO_PATH, PROTO_CLIENT, PROTOCOLS,
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
@@ -95,15 +97,15 @@ async function setWindow(w) {
   });
 }
 
-/* ---------------------------------------------------------------- 分侧与协议筛选 */
+/* ---------------------------------------------------------------- 接口与协议筛选 */
 
 /* 两个都是纯前端筛选，不重新拉数据。
-   data-side 在模型路由的分段上，data-proto 在转发记录的分段上，各自独立不会撞。 */
-function setSide(s) {
-  if (s === state.side) return;
-  state.side = s;
-  localStorage.setItem('mg-side', s);
-  for (const b of $('seg-side').children) b.classList.toggle('is-on', b.dataset.side === s);
+   data-iface 在模型路由的分段上，data-proto 在转发记录的分段上，各自独立不会撞。 */
+function setIface(v) {
+  if (v === state.iface) return;
+  state.iface = v;
+  localStorage.setItem('mg-iface', v);
+  for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === v);
   views.renderRoutes();
 }
 
@@ -200,9 +202,12 @@ const TIERS = [
   { key: 'fable', fallback: 'claude-fable-5-1', env: '' },
 ];
 
-/** 已录入的模型名里属于这个档位的那个；没有就给个默认名 */
+/** 已录入的 Anthropic 接口模型里属于这个档位的那个；没有就给个默认名 */
 function tierModel(tier) {
-  const hit = state.routes.map((r) => r.model_name).filter((n) => n.toLowerCase().includes(tier.key));
+  const hit = state.routes
+    .filter((r) => r.protocol === 'anthropic')
+    .map((r) => r.model_name)
+    .filter((n) => n.toLowerCase().includes(tier.key));
   return hit[0] || tier.fallback;
 }
 
@@ -241,17 +246,19 @@ function showAccess() {
     </div>
     <p class="card-hint" style="margin:16px 0 0">
       两边的 API Key 都随便填 —— 本地服务没做鉴权，真正的 key 存在每个分组里。模型名必须和「模型路由」
-      里录入的一致，没配过的名字会 404（只有认得出档位关键字的才会被兜到同档位那条配置上）。
-      fable 档没有对应的环境变量，在 Claude Code 里用 <code>/model</code> 选。
+      里录入的一致，而且要在对应的接口下：Claude Code 打的是 <code>/v1/messages</code>，只能用
+      Anthropic 接口下的模型，反之同理。没配过的名字会 404（只有认得出档位关键字的才会被兜到
+      同接口、同档位那条配置上）。fable 档没有对应的环境变量，在 Claude Code 里用 <code>/model</code> 选。
     </p>`;
   $('access-dialog').showModal();
 }
 
-/* ---------------------------------------------------------------- Claude 档位 */
+/* ---------------------------------------------------------------- 两级选择器 */
 
-/** 只列标了 Claude 的供应商 —— 没打标记的也列出来，否则新装的库一个都选不出来 */
-function claudeUpstreams() {
-  return state.upstreams.filter((u) => supportsSide(u, 'anthropic'));
+/* 「先选供应商、再选分组」在两个弹窗里都要用。接口是分组的属性，所以供应商这一级
+   只列「有那种接口的分组」的站 —— 没有 Anthropic 分组的站不该出现在 Anthropic 模型的选择里。 */
+function upstreamsFor(iface) {
+  return state.upstreams.filter((u) => supportsIface(u, iface));
 }
 
 function fillUpstreamSelect(selectId, pool) {
@@ -259,90 +266,26 @@ function fillUpstreamSelect(selectId, pool) {
     `<option value="${u.id}">${esc(u.name)}${u.enabled ? '' : '（停用）'}</option>`).join('');
 }
 
-/** 供应商选好之后填它的分组；只有一个分组时下拉框还是留着，省得布局跳 */
-function fillGroupSelect(selectId, upstreamId) {
+/** 供应商选好之后填它在这个接口下的分组 */
+function fillGroupSelect(selectId, upstreamId, iface) {
   const up = state.upstreams.find((u) => u.id === Number(upstreamId));
-  const groups = (up && up.groups) || [];
+  const groups = up ? groupsOfIface(up, iface) : [];
   $(selectId).innerHTML = groups.map((g) =>
     `<option value="${g.id}">${esc(g.name)}${g.enabled ? '' : '（停用）'}</option>`).join('')
-    || '<option value="">（这个供应商还没有分组）</option>';
-}
-
-function openTiers() {
-  const pool = claudeUpstreams();
-  if (!pool.length) {
-    return toast('没有标了 Claude 的供应商。先去「上游站点」给支持 Anthropic 的站勾上 Claude', 'err');
-  }
-  fillUpstreamSelect('tier-upstream', pool);
-  fillGroupSelect('tier-group', $('tier-upstream').value);
-  $('tier-models').innerHTML = '';
-  $('tier-pull-status').textContent = '';
-  $('tier-grid').innerHTML = `
-    <span class="t-head">档位</span>
-    <span class="t-head">对下游暴露的名字</span>
-    <span class="t-head">上游那边的真实名</span>
-    <span class="t-head">1M</span>`
-    + TIERS.map((t) => `
-      <span class="t-name">${t.key}</span>
-      <input type="text" data-tier="${t.key}" data-role="name" value="${esc(tierModel(t))}"
-             placeholder="留空跳过" autocomplete="off">
-      <input type="text" data-tier="${t.key}" data-role="remote" list="tier-models"
-             placeholder="留空 = 同名" autocomplete="off">
-      <input type="checkbox" data-tier="${t.key}" data-role="onem" aria-label="${t.key} 档用 1M 上下文">`).join('');
-  $('tier-dialog').showModal();
-  $('tier-upstream').focus();
-}
-
-function tierRows() {
-  return TIERS.map((t) => {
-    const pick = (role) => $('tier-grid').querySelector(`[data-tier="${t.key}"][data-role="${role}"]`);
-    return { key: t.key, name: pick('name').value.trim(), remote: pick('remote'), onem: pick('onem').checked };
-  });
-}
-
-/** 拉到模型列表后只在档位关键字唯一命中时自动填，多个候选就交给下拉框，不瞎猜 */
-function prefillRemotes(models) {
-  let filled = 0;
-  for (const row of tierRows()) {
-    if (row.remote.value.trim()) continue;
-    const hit = models.filter((m) => m.toLowerCase().includes(row.key));
-    if (hit.length === 1) { row.remote.value = hit[0]; filled += 1; }
-  }
-  return filled;
-}
-
-async function saveTiers() {
-  const gid = Number($('tier-group').value);
-  if (!gid) return toast('这个供应商还没有分组', 'err');
-  const wanted = tierRows()
-    .map((r) => ({ ...r, remote: r.remote.value.trim() }))
-    .filter((r) => r.name);
-  if (!wanted.length) return toast('四个档位都是空的', 'err');
-
-  let added = 0;
-  const failed = [];
-  for (const r of wanted) {
-    // 勾了 1M 就把后缀写进真实模型名：网关转发时摘掉它、换成 anthropic-beta 头
-    const remote = (r.remote || r.name) + (r.onem ? '[1m]' : '');
-    try {
-      await api('POST', '/admin/api/models', {
-        model_name: r.name, group_id: gid, remote_model: remote, side: 'anthropic',
-      });
-      added += 1;
-    } catch (e) {
-      failed.push(`${r.key}: ${e.message}`);
-    }
-  }
-  await refreshConfig();
-  $('tier-dialog').close();
-  if (added) toast(`建了 ${added} 档${failed.length ? `，${failed.length} 档没建成` : ''}`, 'ok');
-  if (failed.length) toast(failed.join('；'), 'err');
+    || '<option value="">（这个供应商没有这种接口的分组）</option>';
 }
 
 /* ---------------------------------------------------------------- 供应商弹窗 */
 
-/* 供应商管「站在哪、怎么连」，key 和模型列表在分组里。新建时这里还有一个 API Key 字段，
-   它落到自动创建的「默认」分组上 —— 一把 key 的常见情况就不用再开一次分组弹窗了。 */
+/* 供应商只管「站在哪、怎么连」：一个站根，key 和接口都在分组里。base_url 不带 /v1 ——
+   两种接口的路径都在 /v1 底下，网关按接口自己补，所以这里把它显示出来免得填错。 */
+function baseHint() {
+  const root = $('up-base').value.trim().replace(/\/+$/, '').replace(/\/v1$/i, '');
+  $('up-base-hint').innerHTML = root
+    ? `将转发到 <code>${esc(root)}/v1/responses</code> 与 <code>${esc(root)}/v1/messages</code>`
+    : '填到域名（或站点路径）为止，末尾的 /v1 会被自动去掉';
+}
+
 function openUpstream(id) {
   state.editing = id;
   const u = id === null ? null : state.upstreams.find((x) => x.id === id);
@@ -351,35 +294,29 @@ function openUpstream(id) {
   $('up-base').value = u ? u.base_url : '';
   $('up-override').value = u ? (u.header_override || '') : '';
   $('up-enabled').checked = u ? u.enabled : true;
-  $('up-key').value = '';
-  $('up-key').type = 'password';
-  // 编辑时不给 key 字段：一个供应商可能有好几把，改哪一把得说清楚，所以只在分组里改
-  $('up-key-wrap').hidden = Boolean(u);
-  const marks = u ? (u.protocols || []) : ['anthropic', 'openai'];
-  $('up-proto-anthropic').checked = marks.includes('anthropic');
-  $('up-proto-openai').checked = marks.includes('openai');
+  baseHint();
+
   const hint = $('up-groups-hint');
-  hint.hidden = !u;
-  if (u) {
-    const names = (u.groups || []).map((g) => g.name).join('、') || '（没有分组）';
-    hint.innerHTML = `Key 和模型列表按分组维护。当前分组：<b>${esc(names)}</b>`
-      + ' —— 在列表里展开这一行去改。';
+  hint.hidden = false;
+  if (!u) {
+    hint.innerHTML = '保存后会接着让你建第一个分组：选接口（Anthropic / OpenAI）＋ 填那把 key。';
+  } else {
+    const names = (u.groups || [])
+      .map((g) => `${g.name}（${PROTO_LABEL[g.protocol] || '?'}）`).join('、');
+    hint.innerHTML = names
+      ? `Key 和接口按分组维护。当前分组：<b>${esc(names)}</b> —— 在列表里展开这一行去改。`
+      : '这个供应商还没有分组，用不了。展开这一行加一个（选接口 ＋ 填 key）。';
   }
   $('up-dialog').showModal();
   $('up-name').focus();
 }
 
 function upstreamPayload() {
-  const protocols = [];
-  if ($('up-proto-anthropic').checked) protocols.push('anthropic');
-  if ($('up-proto-openai').checked) protocols.push('openai');
   return {
     name: $('up-name').value.trim(),
     base_url: $('up-base').value.trim(),
     enabled: $('up-enabled').checked,
     header_override: $('up-override').value.trim(),
-    protocols,
-    api_key: $('up-key').value.trim(),
   };
 }
 
@@ -398,10 +335,9 @@ async function saveUpstream() {
     const created = await api('POST', '/admin/api/upstreams', payload);
     await refreshConfig();
     $('up-dialog').close();
-    // 建完直接把默认分组的弹窗接上：紧接着要干的事就是拉模型列表
-    const gid = created.groups && created.groups[0] && created.groups[0].id;
-    toast('已保存', 'ok');
-    if (gid) openGroup(created.id, gid);
+    // 新建的供应商还没有分组，用不了 —— 直接把分组弹窗接上
+    toast('已保存，接着建第一个分组', 'ok');
+    openGroup(created.id, null);
     return;
   }
   await api('PUT', `/admin/api/upstreams/${state.editing}`, payload);
@@ -411,8 +347,14 @@ async function saveUpstream() {
 
 /* ---------------------------------------------------------------- 分组弹窗 */
 
-/* 分组管「用哪把 key、能看到哪些模型」。模型列表必须跟着 key 走 —— 同一个站的两把 key
-   能拉到的东西常常不一样，这也是分组存在的理由。 */
+/* 分组管「走哪种接口、用哪把 key、能看到哪些模型」。模型列表必须跟着 key 走 —— 同一个站的
+   两把 key 能拉到的东西常常不一样，这也是分组存在的理由。 */
+function fillIfaceSelect(selectId, value) {
+  $(selectId).innerHTML = PROTOCOLS.map((p) =>
+    `<option value="${p}">${PROTO_LABEL[p]}　${PROTO_PATH[p]} · ${PROTO_CLIENT[p]}</option>`).join('');
+  $(selectId).value = value;
+}
+
 function openGroup(upstreamId, gid) {
   const up = state.upstreams.find((u) => u.id === Number(upstreamId));
   if (!up) return toast('供应商不存在了，刷新一下', 'err');
@@ -421,28 +363,33 @@ function openGroup(upstreamId, gid) {
   state.editingGroup = g ? g.id : null;
 
   $('grp-title').textContent = g ? `编辑分组：${up.name} · ${g.name}` : `给「${up.name}」加分组`;
-  $('grp-name').value = g ? g.name : '';
+  $('grp-name').value = g ? g.name : '默认';
   $('grp-key').value = g ? g.api_key : '';
   $('grp-key').type = 'password';
   $('grp-enabled').checked = g ? g.enabled : true;
+
+  // 新分组的接口：这个站只有一种接口时默认补上缺的那种，否则跟当前分段
+  const have = up.supports || [];
+  const missing = PROTOCOLS.find((p) => !have.includes(p));
+  fillIfaceSelect('grp-proto', g ? g.protocol
+    : (have.length === 1 && missing ? missing : (state.iface || 'openai')));
+
+  // 有候选就不给改接口了：候选是「这个模型在哪个接口下暴露」的唯一记录（后端也会拒）
+  const taken = g ? modelsOfGroup(g.id).length : 0;
+  $('grp-proto').disabled = taken > 0;
+  $('grp-proto-hint').hidden = taken === 0;
+  if (taken) {
+    $('grp-proto-hint').innerHTML = `这个分组下有 <b>${taken}</b> 个模型候选，接口锁住了 ——`
+      + ' 要换接口就给另一种接口新建一个分组，别把已录入的模型悄悄换成另一种线格式。';
+  }
+
   fillUpstreamSelect('grp-upstream', state.upstreams);
   $('grp-upstream').value = String(up.id);
   $('grp-move-wrap').hidden = !g;      // 新建时没得搬
 
-  $('grp-side').innerHTML = ['openai', 'anthropic']
-    .map((s) => `<option value="${s}">${SIDE_LABEL[s]}</option>`).join('');
-  // 「导入为哪一侧」的默认值，按信号强弱：这个分组已录入模型的侧别 > 站点只标了一侧 > 当前分段
-  const already = new Set(state.routes
-    .filter((r) => g && (r.candidates || []).some((c) => c.group_id === g.id))
-    .map((r) => r.side).filter(Boolean));
-  const marks = up.protocols || [];
-  if (already.size === 1) $('grp-side').value = [...already][0];
-  else if (marks.length === 1) $('grp-side').value = marks[0];
-  else if (state.side) $('grp-side').value = state.side;
-
   resetPicker();
   $('grp-import').hidden = !g;
-  if (g) $('grp-mcount').textContent = `已录入 ${modelsOfGroup(g.id).length} 个`;
+  if (g) $('grp-mcount').textContent = `已录入 ${taken} 个`;
   $('group-dialog').showModal();
   $('grp-name').focus();
 }
@@ -458,6 +405,7 @@ function resetPicker() {
 async function saveGroup() {
   const payload = {
     name: $('grp-name').value.trim(),
+    protocol: $('grp-proto').value,
     api_key: $('grp-key').value.trim(),
     enabled: $('grp-enabled').checked,
   };
@@ -494,28 +442,44 @@ function renderPicker(models) {
 
 /* ---------------------------------------------------------------- 路由弹窗 */
 
-function openRoute(model) {
-  const group = model ? state.routes.find((r) => r.model_name === model) : null;
-  // 追加候选时侧别已经定了，新增模型时跟当前分段（分段在「全部」就默认 GPT）
-  const side = group ? group.side : (state.side || 'openai');
-  const pool = state.upstreams.filter((u) => supportsSide(u, side));
+/* 一个弹窗三种用法：新增模型 / 给已有模型加候选 / 改某个候选（上游真名 + 1M）。
+   「接口」在这里只是个过滤器 —— 真正决定模型走哪种接口的是它候选所在分组的接口。 */
+function openRoute(model, gid) {
+  const row = model ? state.routes.find((r) => r.model_name === model) : null;
+  const cand = row && gid ? row.candidates.find((c) => c.group_id === gid) : null;
+  // 已有模型的接口已经定了；新增时跟当前分段（分段在「全部」就默认 OpenAI）
+  const iface = row ? row.protocol : (state.iface || 'openai');
+  const pool = upstreamsFor(iface);
   if (!pool.length) {
-    return toast(`没有标了 ${SIDE_LABEL[side] || side} 的供应商，先去「上游站点」勾上`, 'err');
+    return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
   }
+  state.editingCand = cand ? { model, gid } : null;
 
-  $('route-title').textContent = model ? `给「${model}」加候选` : '新增模型';
+  $('route-title').textContent = cand ? `改候选：${model}` : (model ? `给「${model}」加候选` : '新增模型');
+  $('rt-save').textContent = cand ? '保存' : '添加';
   $('rt-model').value = model || '';
   $('rt-model').readOnly = Boolean(model);
-  $('rt-remote').value = '';
-  $('rt-side').innerHTML = ['openai', 'anthropic']
-    .map((s) => `<option value="${s}">${SIDE_LABEL[s]}</option>`).join('');
-  $('rt-side').value = side;
-  $('rt-side-wrap').hidden = Boolean(model);   // 已有模型的侧别不给改
+  fillIfaceSelect('rt-iface', iface);
+  $('rt-iface-wrap').hidden = Boolean(row);   // 已有模型的接口不给改
   fillUpstreamSelect('rt-upstream', pool);
-  fillGroupSelect('rt-group', $('rt-upstream').value);
-  markTakenGroups(model);
+  $('rt-upstream').disabled = Boolean(cand);
+  $('rt-group').disabled = Boolean(cand);     // 改候选就是改这一条，别顺手换成另一个分组
+
+  if (cand) {
+    $('rt-upstream').value = String(cand.upstream_id);
+    fillGroupSelect('rt-group', cand.upstream_id, iface);
+    $('rt-group').value = String(gid);
+  } else {
+    fillGroupSelect('rt-group', $('rt-upstream').value, iface);
+    markTakenGroups(model);
+  }
+
+  const { bare, onem } = splitOneM(cand ? cand.remote_model : '');
+  $('rt-remote').value = bare && bare !== model ? bare : '';
+  $('rt-onem').checked = onem;
+  $('rt-onem-wrap').hidden = iface !== 'anthropic';   // beta 头只有 Anthropic 那边有
   $('route-dialog').showModal();
-  (model ? $('rt-upstream') : $('rt-model')).focus();
+  (model ? $('rt-remote') : $('rt-model')).focus();
 }
 
 /** 已经是候选的分组在下拉里禁掉，比提交后再报 409 友好 */
@@ -532,19 +496,22 @@ function markTakenGroups(model) {
 }
 
 async function saveRoute() {
+  const editing = Boolean(state.editingCand);
   const model = $('rt-model').value.trim();
   if (!model) return toast('模型名不能为空', 'err');
   const gid = Number($('rt-group').value);
-  if (!gid) return toast('这个供应商还没有分组', 'err');
-  await api('POST', '/admin/api/models', {
-    model_name: model,
-    group_id: gid,
-    remote_model: $('rt-remote').value.trim(),
-    side: $('rt-side').value,
+  if (!gid) return toast('这个供应商没有对应接口的分组', 'err');
+  // 勾了 1M 就把后缀写进真实模型名：网关转发时摘掉它、换成 anthropic-beta 头
+  const remote = withOneM(
+    $('rt-remote').value.trim() || model,
+    $('rt-onem').checked && !$('rt-onem-wrap').hidden,
+  );
+  await api(editing ? 'PUT' : 'POST', '/admin/api/models', {
+    model_name: model, group_id: gid, remote_model: remote,
   });
   $('route-dialog').close();
   await refreshConfig();
-  toast('已添加', 'ok');
+  toast(editing ? '已保存' : '已添加', 'ok');
 }
 
 /* ---------------------------------------------------------------- 动作表 */
@@ -567,23 +534,6 @@ const ACTIONS = {
 
   'close-dialog': (_d, el) => el.closest('dialog').close(),
 
-  'new-tiers': openTiers,
-
-  'tier-pull': async () => {
-    const gid = Number($('tier-group').value);
-    if (!gid) return toast('这个供应商还没有分组', 'err');
-    $('tier-pull-status').textContent = '拉取中…';
-    try {
-      const data = await api('GET', `/admin/api/groups/${gid}/remote-models`);
-      $('tier-models').innerHTML = data.models.map((m) => `<option value="${esc(m)}">`).join('');
-      const filled = prefillRemotes(data.models);
-      $('tier-pull-status').textContent = `共 ${data.models.length} 个${filled ? `，自动填了 ${filled} 档` : ''}，第三列可下拉选`;
-    } catch (e) {
-      $('tier-pull-status').textContent = '';
-      throw e;
-    }
-  },
-
   'new-upstream': () => openUpstream(null),
   'edit-upstream': ({ uid }) => openUpstream(Number(uid)),
 
@@ -599,7 +549,7 @@ const ACTIONS = {
     try {
       await api('PUT', `/admin/api/upstreams/${u.id}`, {
         name: u.name, base_url: u.base_url, header_override: u.header_override,
-        protocols: u.protocols, enabled: el.checked,
+        enabled: el.checked,
       });
     } catch (e) {
       el.checked = !el.checked;
@@ -632,11 +582,18 @@ const ACTIONS = {
     if (up) openGroup(up.id, Number(gid));
   },
 
+  'clone-group': async ({ gid }) => {
+    const created = await api('POST', `/admin/api/groups/${gid}/clone`);
+    await refreshConfig();
+    toast(`已复制成 ${PROTO_LABEL[created.protocol]} 接口的分组「${created.name}」`, 'ok');
+    openGroup(created.upstream_id, created.id);
+  },
+
   'toggle-group': async ({ gid }, el) => {
     const g = groupOf(Number(gid));
     try {
       await api('PUT', `/admin/api/groups/${g.id}`, {
-        name: g.name, api_key: g.api_key, enabled: el.checked,
+        name: g.name, protocol: g.protocol, api_key: g.api_key, enabled: el.checked,
       });
     } catch (e) {
       el.checked = !el.checked;
@@ -650,11 +607,13 @@ const ACTIONS = {
     const g = groupOf(id);
     const up = upstreamOfGroup(id);
     const n = modelsOfGroup(id).length;
+    const last = up && (up.groups || []).length === 1;
     const okay = await confirmBox({
       title: '删除分组',
-      body: `要删掉 <b>${esc(up ? up.name : '?')}</b> 下的分组 <b>${esc(g ? g.name : id)}</b>，`
-        + `连带它的 ${n} 条模型候选。`
-        + '<br><br>这把 key 也会一起没掉。只想临时停用的话，把它的开关关掉就行。',
+      body: `要删掉 <b>${esc(up ? up.name : '?')}</b> 下的 ${PROTO_LABEL[g ? g.protocol : ''] || ''}`
+        + ` 分组 <b>${esc(g ? g.name : id)}</b>，连带它的 ${n} 条模型候选。`
+        + '<br><br>这把 key 也会一起没掉。只想临时停用的话，把它的开关关掉就行。'
+        + (last ? '<br><br>它是这个供应商唯一的分组，删完这个站就没有可用的 key 了。' : ''),
       ok: '删除',
     });
     if (!okay) return;
@@ -668,8 +627,10 @@ const ACTIONS = {
     el.type = el.type === 'password' ? 'text' : 'password';
   },
 
-  'preset-codex': () => {
-    $('up-override').value = '{\n  "user-agent": "codex_cli_rs",\n  "originator": "codex_cli_rs"\n}';
+  'preset-fp': ({ fp }) => {
+    $('up-override').value = fp === 'anthropic'
+      ? '{\n  "user-agent": "claude-cli/2.0.0 (external, cli)",\n  "x-app": "cli"\n}'
+      : '{\n  "user-agent": "codex_cli_rs",\n  "originator": "codex_cli_rs"\n}';
   },
 
   'pull-models': async () => {
@@ -691,7 +652,7 @@ const ACTIONS = {
     const names = boxes.filter((b) => b.checked).map((b) => b.value);
     if (!names.length) return toast('一个都没勾选', 'err');
     const r = await api('POST', '/admin/api/models/bulk-add', {
-      group_id: state.editingGroup, model_names: names, side: $('grp-side').value,
+      group_id: state.editingGroup, model_names: names,
     });
     await refreshConfig();
     $('grp-mcount').textContent = `已录入 ${modelsOfGroup(state.editingGroup).length} 个`;
@@ -699,8 +660,9 @@ const ACTIONS = {
     toast(`导入了 ${r.added} 个${r.added < names.length ? '（重复的已跳过）' : ''}`, 'ok');
   },
 
-  'new-route': () => openRoute(''),
-  'add-candidate': ({ model }) => openRoute(model),
+  'new-route': () => openRoute('', null),
+  'add-candidate': ({ model }) => openRoute(model, null),
+  'edit-candidate': ({ model, gid }) => openRoute(model, Number(gid)),
 
   'switch': async ({ model, gid }) => {
     const id = Number(gid);
@@ -783,10 +745,10 @@ document.addEventListener('click', (ev) => {
   const seg = ev.target.closest('[data-window]');
   if (seg) { setWindow(seg.dataset.window); return; }
 
-  // 两个分段选择器：data-side 在模型路由上，data-proto 在转发记录上。
+  // 两个分段选择器：data-iface 在模型路由上，data-proto 在转发记录上。
   // 记录行用的是 data-log-proto、候选圆片用 data-gid，都不会被这里的 closest 命中
-  const sideSeg = ev.target.closest('[data-side]');
-  if (sideSeg) { setSide(sideSeg.dataset.side); return; }
+  const ifaceSeg = ev.target.closest('[data-iface]');
+  if (ifaceSeg) { setIface(ifaceSeg.dataset.iface); return; }
 
   const proto = ev.target.closest('[data-proto]');
   if (proto) { setProto(proto.dataset.proto); return; }
@@ -819,37 +781,37 @@ $('group-form').addEventListener('submit', (ev) => {
 
 $('route-form').addEventListener('submit', (ev) => {
   ev.preventDefault();
-  run($('route-form').querySelector('[type="submit"]'), saveRoute);
+  run($('rt-save'), saveRoute);
 });
 
-$('tier-form').addEventListener('submit', (ev) => {
-  ev.preventDefault();
-  run($('tier-form').querySelector('[type="submit"]'), saveTiers);
-});
-
-// 供应商换了就把分组下拉重填一遍，这三个弹窗都是「先选供应商再选分组」
+// 供应商换了就把分组下拉重填一遍；接口换了连供应商池一起换
 $('rt-upstream').addEventListener('change', () => {
-  fillGroupSelect('rt-group', $('rt-upstream').value);
+  fillGroupSelect('rt-group', $('rt-upstream').value, $('rt-iface').value);
   markTakenGroups($('rt-model').value.trim());
 });
 
-$('tier-upstream').addEventListener('change', () => {
-  fillGroupSelect('tier-group', $('tier-upstream').value);
-  $('tier-pull-status').textContent = '';
-  $('tier-models').innerHTML = '';
+$('rt-iface').addEventListener('change', () => {
+  const iface = $('rt-iface').value;
+  const pool = upstreamsFor(iface);
+  if (!pool.length) toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」加一个`, 'err');
+  fillUpstreamSelect('rt-upstream', pool);
+  fillGroupSelect('rt-group', $('rt-upstream').value, iface);
+  markTakenGroups($('rt-model').value.trim());
+  $('rt-onem-wrap').hidden = iface !== 'anthropic';
 });
 
-// Esc 关闭也要走这里，所以刷新放在 close 上而不是「取消」按钮上
-$('up-dialog').addEventListener('close', () => {
-  state.editing = null;
-  run(null, refreshConfig);
-});
+// 站根填/改的时候把补出来的两个地址实时显示出来，免得又把 /v1 带上
+$('up-base').addEventListener('input', baseHint);
 
-$('group-dialog').addEventListener('close', () => {
-  state.editing = null;
-  state.editingGroup = null;
-  run(null, refreshConfig);
-});
+/* 弹窗关掉后刷一次列表（Esc 关闭也走这里，所以挂在 close 上而不是「取消」按钮上）。
+   注意这里**不清** state.editing / state.editingGroup：close 是排成任务异步触发的，
+   而「建完供应商直接接上分组弹窗」这种链路里，它会晚于新的 openGroup 跑 ——
+   清掉的话紧接着保存分组就会往 /upstreams/null/groups 发请求。
+   这两个字段每次 openUpstream / openGroup 都会重设，留着旧值没人读得到。 */
+$('up-dialog').addEventListener('close', () => run(null, refreshConfig));
+$('group-dialog').addEventListener('close', () => run(null, refreshConfig));
+
+// route-dialog 的 editingCand 同理：也只由 openRoute 负责重设，close 时不动
 
 $('route-filter').addEventListener('input', (ev) => {
   state.filter = ev.target.value;
@@ -894,8 +856,8 @@ $('endpoint').textContent = `${location.origin}/v1`;
 views.initLogFollow();   // 「自动跟随新记录」的勾选状态变化时补插攒下的行
 for (const b of $('seg-window').children) b.classList.toggle('is-on', b.dataset.window === state.window);
 
-state.side = localStorage.getItem('mg-side') || '';
-for (const b of $('seg-side').children) b.classList.toggle('is-on', b.dataset.side === state.side);
+state.iface = localStorage.getItem('mg-iface') || '';
+for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
 
 const initial = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
 currentView = '';

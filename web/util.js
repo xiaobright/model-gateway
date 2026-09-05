@@ -12,10 +12,13 @@ export const state = {
   stats: null,      // /admin/api/stats：累计值 + 活跃流
   overview: null,   // /admin/api/overview：时间线 + 健康 + 热度
   filter: '',
-  side: '',          // 模型路由分侧：'' | 'anthropic' | 'openai'
+  iface: '',         // 模型路由按接口筛选：'' | 'anthropic' | 'openai'
   proto: '',         // 转发记录的协议筛选：'' | 'anthropic' | 'openai'
-  editing: null,    // 正在编辑的供应商 id，null = 新建
+  // 下面三个是「当前打开的弹窗在编辑谁」。只由 openUpstream / openGroup / openRoute 设置，
+  // 弹窗关闭时故意不清（close 是异步任务，会晚于紧接着打开的下一个弹窗）
+  editing: null,    // 这个弹窗关联的供应商 id；openUpstream(null) = 新建供应商
   editingGroup: null, // 正在编辑的分组 id，null = 新建
+  editingCand: null,  // 正在改的候选 {model, gid}，null = 新增
   openUpstreams: new Set(),  // 「上游站点」里展开了分组的那几行
   view: 'overview',
   // 默认 24 小时：1 小时窗口在空闲时段是空的，一进来看到空图会以为坏了
@@ -173,8 +176,28 @@ export function groupLabel(gid) {
   return up.groups.length > 1 && grp ? `${up.name} · ${grp.name}` : up.name;
 }
 
-/** 供应商支持哪几侧。没打标记的当成两侧都行，否则新装的库什么都选不出来 */
-export const supportsSide = (upstream, side) =>
-  !side || !upstream.protocols || !upstream.protocols.length || upstream.protocols.includes(side);
+/** 这个供应商在某个接口下的分组。没有就说明它不支持这种接口 */
+export const groupsOfIface = (upstream, iface) =>
+  (upstream.groups || []).filter((g) => !iface || g.protocol === iface);
 
-export const SIDE_LABEL = { anthropic: 'Claude', openai: 'GPT' };
+/** 接口是分组的属性，所以「这个供应商支不支持某接口」= 它有没有那种接口的分组 */
+export const supportsIface = (upstream, iface) =>
+  !iface || (upstream.supports || []).includes(iface);
+
+/* 接口 = 一条请求走哪种线格式，也就是它打进来的那个路径。两处显示用同一套词，
+   不再有「侧」和「协议」两套说法。 */
+export const PROTO_LABEL = { anthropic: 'Anthropic', openai: 'OpenAI' };
+export const PROTO_PATH = { anthropic: '/v1/messages', openai: '/v1/responses' };
+export const PROTO_CLIENT = { anthropic: 'Claude Code', openai: 'Codex' };
+export const PROTOCOLS = ['anthropic', 'openai'];
+
+/* 1M 上下文是「上游真名」上的一个后缀（`名字[1m]`）：网关转发时摘掉它、换成
+   anthropic-beta 头。这里只管在界面和存储之间来回翻译，规则和 gateway/naming.py 对齐。 */
+const ONE_M_RE = /\[(1m|1000k|1024k|1048k)\]\s*$/i;
+
+export const splitOneM = (remote) => ({
+  bare: (remote || '').replace(ONE_M_RE, '').trim(),
+  onem: ONE_M_RE.test(remote || ''),
+});
+
+export const withOneM = (bare, onem) => (onem ? `${bare}[1m]` : bare);

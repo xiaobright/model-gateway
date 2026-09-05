@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Model Gateway 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css?v=4">
+<link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
 <div class="blob blob-1"></div>
@@ -76,18 +76,17 @@
 
       <section class="kpis" id="kpis"></section>
 
-      <!-- 模型路由：Claude 侧和 GPT 侧同级，用分段选择器换着看 -->
+      <!-- 模型路由：两种接口同级，用分段选择器换着看 -->
       <section class="card">
         <div class="card-head">
           <h2>模型路由</h2><span class="count" id="route-count"></span>
           <span class="grow"></span>
-          <span class="seg" id="seg-side" role="group" aria-label="按侧筛选">
-            <button type="button" class="seg-item" data-side="anthropic">Claude</button>
-            <button type="button" class="seg-item" data-side="openai">GPT</button>
-            <button type="button" class="seg-item is-on" data-side="">全部</button>
+          <span class="seg" id="seg-iface" role="group" aria-label="按接口筛选">
+            <button type="button" class="seg-item" data-iface="anthropic">Anthropic</button>
+            <button type="button" class="seg-item" data-iface="openai">OpenAI</button>
+            <button type="button" class="seg-item is-on" data-iface="">全部</button>
           </span>
           <input type="search" class="search" id="route-filter" placeholder="筛选模型名…" aria-label="筛选模型名">
-          <button class="btn btn-ghost btn-sm" data-act="new-tiers">Claude 档位</button>
           <button class="btn btn-sm" data-act="new-route">新增模型</button>
         </div>
         <p class="card-hint">点候选圆片即把该模型切到那个分组（高亮的是当前生效的）。切换只影响新请求，进行中的流会走完旧上游。</p>
@@ -125,12 +124,13 @@
         <button class="btn btn-sm" data-act="new-upstream">添加供应商</button>
       </div>
       <section class="card">
-        <p class="card-hint">一个供应商 = 一个站（一个 Base URL）。同一个站的多把 key 是它下面的<b>分组</b>，
-          各自维护自己的模型列表 —— 点行首的箭头展开。</p>
+        <p class="card-hint">一个供应商 = 一个站（一个站根地址，<b>不带 /v1</b>）。同一个站的多把 key、
+          以及 Anthropic / OpenAI 两种接口，都是它下面的<b>分组</b>：接口、key、模型列表都在分组上 ——
+          点行首的箭头展开。</p>
         <div class="card-body scroll-x">
           <table class="tbl-upstreams">
             <thead><tr>
-              <th style="width:172px">供应商</th><th>Base URL</th><th style="width:20%">已录入模型</th>
+              <th style="width:172px">供应商</th><th>Base URL（站根）</th><th style="width:20%">已录入模型</th>
               <th style="width:110px">实测格式</th>
               <th style="width:96px" class="num">成功率 / P95</th>
               <th style="width:54px">启用</th><th style="width:122px"></th>
@@ -175,7 +175,7 @@
   </main>
 </div>
 
-<!-- ============ 供应商编辑（怎么连；key 按分组维护） ============ -->
+<!-- ============ 供应商编辑（只管站在哪、怎么连；key 和接口在分组里） ============ -->
 <dialog id="up-dialog">
   <form id="up-form">
     <div class="dlg-head"><h2 id="up-title">添加供应商</h2></div>
@@ -187,28 +187,17 @@
         <label class="field inline-switch">
           <input type="checkbox" class="switch" id="up-enabled" checked><span>启用</span>
         </label>
-        <label class="field wide">Base URL（填到 /v1 为止，一个供应商一个地址）
-          <input type="text" id="up-base" placeholder="https://xxx.com/v1" autocomplete="off" required>
+        <label class="field wide"><span>Base URL（填到站根为止，<b>不要带 /v1</b>）</span>
+          <input type="text" id="up-base" placeholder="https://xxx.com" autocomplete="off" required>
+          <span class="dim" id="up-base-hint" style="font-size:12px;margin-top:5px"></span>
         </label>
-        <label class="field wide" id="up-key-wrap">API Key（存到自动创建的「默认」分组上，留空则透传客户端自带的）
-          <span class="key-wrap">
-            <input type="password" id="up-key" placeholder="sk-…" autocomplete="off">
-            <button type="button" class="btn btn-ghost btn-icon" data-act="peek-key" data-target="up-key"
-                    aria-label="显示或隐藏 Key">👁</button>
-          </span>
-        </label>
-        <div class="field wide">这个站有哪几种格式（决定给模型挑供应商时它出不出现）
-          <div class="field-row" style="align-items:center">
-            <label class="checkline"><input type="checkbox" id="up-proto-anthropic"><span>Claude（/v1/messages）</span></label>
-            <label class="checkline"><input type="checkbox" id="up-proto-openai"><span>GPT（/v1/responses）</span></label>
-          </div>
-        </div>
         <label class="field wide">请求头覆写（JSON，可选；值写 null 表示删掉那个头）
           <textarea id="up-override" rows="3" placeholder='{"user-agent": "codex_cli_rs", "originator": "codex_cli_rs"}'></textarea>
         </label>
       </div>
       <div class="field-row" style="margin-top:9px">
-        <button type="button" class="btn btn-ghost btn-sm" data-act="preset-codex">填入 codex 指纹</button>
+        <button type="button" class="btn btn-ghost btn-sm" data-act="preset-fp" data-fp="openai">填入 codex 指纹</button>
+        <button type="button" class="btn btn-ghost btn-sm" data-act="preset-fp" data-fp="anthropic">填入 claude 指纹</button>
         <span class="dim" style="font-size:12px">给按客户端指纹拦截的站点用</span>
       </div>
       <p class="card-hint" id="up-groups-hint" hidden style="margin:14px 0 0"></p>
@@ -221,7 +210,7 @@
   </form>
 </dialog>
 
-<!-- ============ 分组编辑（用哪把 key + 能看到哪些模型） ============ -->
+<!-- ============ 分组编辑（哪种接口 + 哪把 key + 能看到哪些模型） ============ -->
 <dialog id="group-dialog">
   <form id="group-form">
     <div class="dlg-head"><h2 id="grp-title">添加分组</h2></div>
@@ -233,7 +222,10 @@
         <label class="field inline-switch">
           <input type="checkbox" class="switch" id="grp-enabled" checked><span>启用</span>
         </label>
-        <label class="field wide">API Key（留空则透传客户端自带的 Authorization）
+        <label class="field wide">接口（这把 key 走哪种格式；决定它能被哪些模型选中）
+          <select id="grp-proto"></select>
+        </label>
+        <label class="field wide">API Key（留空则透传客户端自带的鉴权头）
           <span class="key-wrap">
             <input type="password" id="grp-key" placeholder="sk-…" autocomplete="off">
             <button type="button" class="btn btn-ghost btn-icon" data-act="peek-key" data-target="grp-key"
@@ -244,6 +236,7 @@
           <select id="grp-upstream"></select>
         </label>
       </div>
+      <p class="card-hint" id="grp-proto-hint" hidden style="margin:12px 0 0"></p>
 
       <div id="grp-import" hidden>
         <div class="dlg-section divider">用这个分组的 key 拉模型 <span class="tag" id="grp-mcount"></span></div>
@@ -256,8 +249,6 @@
           <button type="button" class="btn btn-ghost btn-sm" data-act="pick-all">全选</button>
           <button type="button" class="btn btn-ghost btn-sm" data-act="pick-none">清空</button>
           <span class="grow"></span>
-          <span class="dim" style="font-size:12px">导入为</span>
-          <select id="grp-side" style="width:auto"></select>
           <button type="button" class="btn btn-sm" data-act="import-picked">导入所选</button>
         </div>
         <div class="picker" id="grp-picker" hidden></div>
@@ -271,7 +262,7 @@
   </form>
 </dialog>
 
-<!-- ============ 新增模型 / 追加候选 ============ -->
+<!-- ============ 新增模型 / 追加候选 / 改候选 ============ -->
 <dialog id="route-dialog" class="sm">
   <form id="route-form">
     <div class="dlg-head"><h2 id="route-title">新增模型</h2></div>
@@ -279,8 +270,8 @@
       <label class="field">模型名（下游按这个名字调用）
         <input type="text" id="rt-model" placeholder="如 gpt-5.6-luna" autocomplete="off" required>
       </label>
-      <label class="field" id="rt-side-wrap" style="margin-top:11px">属于哪一侧
-        <select id="rt-side"></select>
+      <label class="field" id="rt-iface-wrap" style="margin-top:11px">在哪种接口下暴露
+        <select id="rt-iface"></select>
       </label>
       <label class="field" style="margin-top:11px">供应商
         <select id="rt-upstream"></select>
@@ -291,11 +282,15 @@
       <label class="field" style="margin-top:11px">上游那边的真实模型名
         <input type="text" id="rt-remote" placeholder="留空 = 与模型名相同" autocomplete="off">
       </label>
+      <label class="checkline" id="rt-onem-wrap" style="margin-top:12px">
+        <input type="checkbox" id="rt-onem">
+        <span>按 1M 上下文请求（真名存成 <code>名字[1m]</code>，转发时摘掉后缀、补 beta 头）</span>
+      </label>
     </div>
     <div class="dlg-foot">
       <span class="grow"></span>
       <button type="button" class="btn btn-ghost" data-act="close-dialog">取消</button>
-      <button type="submit" class="btn">添加</button>
+      <button type="submit" class="btn" id="rt-save">添加</button>
     </div>
   </form>
 </dialog>
@@ -307,42 +302,6 @@
   <form method="dialog" class="dlg-foot">
     <span class="grow"></span>
     <button class="btn">关闭</button>
-  </form>
-</dialog>
-
-<!-- ============ Claude Code 四档位一键创建 ============ -->
-<dialog id="tier-dialog">
-  <form id="tier-form">
-    <div class="dlg-head"><h2>Claude Code 档位</h2></div>
-    <div class="dlg-body">
-      <p class="card-hint" style="margin:0">
-        Claude Code 按 haiku / sonnet / opus / fable 四档选模型。这里给每档配一个上游和上游那边的真实模型名；
-        建好之后在「模型路由」里点圆片就能随时改某一档落到哪个站，不用重启客户端。留空的档位会跳过。
-      </p>
-      <label class="field" style="margin-top:14px">供应商（只列标了 Claude 的）
-        <select id="tier-upstream"></select>
-      </label>
-      <label class="field" style="margin-top:11px">分组
-        <select id="tier-group"></select>
-      </label>
-      <div class="field-row" style="margin-top:9px">
-        <button type="button" class="btn btn-ghost btn-sm" data-act="tier-pull">拉取这个分组的模型列表</button>
-        <span class="dim" id="tier-pull-status" style="font-size:12px"></span>
-      </div>
-      <div class="dlg-section divider">四个档位</div>
-      <div class="tier-grid" id="tier-grid"></div>
-      <datalist id="tier-models"></datalist>
-      <p class="card-hint" style="margin:12px 0 0">
-        勾上 1M 会把真实模型名存成 <code>名字[1m]</code>：网关转发时摘掉后缀、补上
-        <code>anthropic-beta: context-1m-2025-08-07</code>，等于这一档永远按 1M 上下文请求。
-        上游不支持时会返回 4xx，别盲开。
-      </p>
-    </div>
-    <div class="dlg-foot">
-      <span class="grow"></span>
-      <button type="button" class="btn btn-ghost" data-act="close-dialog">取消</button>
-      <button type="submit" class="btn">创建</button>
-    </div>
   </form>
 </dialog>
 
@@ -358,6 +317,6 @@
 </dialog>
 
 <div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
-<script type="module" src="/static/app.js?v=4"></script>
+<script type="module" src="/static/app.js?v=5"></script>
 </body>
 </html>

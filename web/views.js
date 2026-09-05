@@ -5,7 +5,7 @@
 
 import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec,
-  modelsOfGroup, modelsOfUpstream, SIDE_LABEL,
+  modelsOfGroup, modelsOfUpstream, splitOneM, PROTO_LABEL, PROTO_PATH,
 } from './util.js';
 import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -231,44 +231,47 @@ function chipHtml(model, c, showGroup) {
   const live = c.upstream_enabled && c.group_enabled;
   const cls = ['chip', c.is_active ? 'chip-on' : '', live ? '' : 'chip-off'].filter(Boolean).join(' ');
   const label = showGroup ? `${c.upstream_name} · ${c.group_name}` : c.upstream_name;
-  const remote = c.remote_model && c.remote_model !== model
-    ? ` <span class="remote">${esc(c.remote_model)}</span>` : '';
+  const { bare, onem } = splitOneM(c.remote_model);
+  const remote = bare && bare !== model ? ` <span class="remote">${esc(bare)}</span>` : '';
+  const wide = onem ? ' <span class="tag tag-accent">1M</span>' : '';
   const off = live ? ''
     : ` <span class="tag">${c.upstream_enabled ? '分组停用' : '停用'}</span>`;
   const tip = c.is_active ? '当前生效的分组' : `切到 ${label}`;
   return `<span class="${cls}" data-gid="${c.group_id}">
     <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"
-            data-gid="${c.group_id}" title="${esc(tip)}">${esc(label)}${remote}${off}</button>
+            data-gid="${c.group_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${off}</button>
+    <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"
+            data-gid="${c.group_id}" title="改上游真名 / 1M">✎</button>
     <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"
             data-gid="${c.group_id}" title="从这个分组移除该模型">✕</button>
   </span>`;
 }
 
-const EMPTY_BY_SIDE = {
-  anthropic: 'Claude 侧还没有模型。点右上角「Claude 档位」一次建齐四档，'
-    + '前提是先在「上游站点」把支持 Anthropic 的站勾上 Claude 标记。',
-  openai: 'GPT 侧还没有模型。去「上游站点」展开某个分组，用「拉取模型列表」导入。',
+const EMPTY_BY_IFACE = {
+  anthropic: 'Anthropic 接口下还没有模型。先在「上游站点」给某个站加一个 Anthropic 分组'
+    + '（填 Claude Code 那把 key），拉取模型列表导入，或者点右上角「新增模型」自己起名字。',
+  openai: 'OpenAI 接口下还没有模型。去「上游站点」展开某个分组，用「拉取模型列表」导入。',
 };
 
 export function renderRoutes() {
   const kw = state.filter.trim().toLowerCase();
-  const side = state.side;
-  const bySide = side ? state.routes.filter((r) => r.side === side) : state.routes;
-  const list = kw ? bySide.filter((r) => r.model_name.toLowerCase().includes(kw)) : bySide;
+  const iface = state.iface;
+  const byIface = iface ? state.routes.filter((r) => r.protocol === iface) : state.routes;
+  const list = kw ? byIface.filter((r) => r.model_name.toLowerCase().includes(kw)) : byIface;
   const total = state.routes.length;
-  $('route-count').textContent = (kw || side)
+  $('route-count').textContent = (kw || iface)
     ? `${list.length} / ${total} 个模型`
     : `${total} 个模型`;
 
   if (!total) {
     $('route-list').innerHTML =
-      '<div class="empty">还没有模型。先在「上游站点」加一个供应商，再展开它的分组用「拉取模型列表」导入，'
-      + '或点右上角「新增模型」。</div>';
+      '<div class="empty">还没有模型。先在「上游站点」加一个供应商，给它建一个分组（选接口 + 填 key），'
+      + '再用「拉取模型列表」导入，或点右上角「新增模型」。</div>';
     return;
   }
   if (!list.length) {
     $('route-list').innerHTML = `<div class="empty">${
-      kw ? '没有匹配的模型名' : (EMPTY_BY_SIDE[side] || '这一侧还没有模型')
+      kw ? '没有匹配的模型名' : (EMPTY_BY_IFACE[iface] || '这个接口下还没有模型')
     }</div>`;
     return;
   }
@@ -280,9 +283,10 @@ export function renderRoutes() {
   $('route-list').innerHTML = list.map((g) => {
     const dead = g.active_group_id === null
       ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>无可用上游</span>' : '';
-    // 「全部」视图里两侧混在一起，得标出来谁是谁
-    const sideTag = !side && g.side
-      ? ` <span class="tag${g.side === 'anthropic' ? ' tag-accent' : ''}">${SIDE_LABEL[g.side]}</span>` : '';
+    // 「全部」视图里两种接口混在一起，得标出来谁是谁
+    const ifaceTag = !iface && g.protocol
+      ? ` <span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
+        + ` title="在 ${esc(PROTO_PATH[g.protocol] || '')} 下暴露">${PROTO_LABEL[g.protocol]}</span>` : '';
     const stat = hot.get(g.model_name);
     const usage = stat
       ? `<span class="route-usage" title="最近 2000 条里的请求数 · P95 ${fmtSec(stat.p95)}">${fmtInt(stat.n)} 次</span>`
@@ -290,7 +294,7 @@ export function renderRoutes() {
     const chips = g.candidates
       .map((c) => chipHtml(g.model_name, c, multi.has(c.upstream_id))).join('');
     return `<div class="route" data-model="${esc(g.model_name)}">
-      <div class="route-name">${esc(g.model_name)}${sideTag}${dead}</div>
+      <div class="route-name">${esc(g.model_name)}${ifaceTag}${dead}</div>
       <div class="route-cands">${chips}</div>
       <div class="route-side">${usage}</div>
       <div class="route-actions">
@@ -303,10 +307,8 @@ export function renderRoutes() {
 
 /* ================================================================ 上游站点 */
 
-/* 协议是请求的属性、不是站点的属性，所以「这个站的 anthropic 接口通不通」没法静态探测，
-   只能看实际跑过的请求。这一列就是干这个的：跑过几次 + 按成功率上色。 */
-export const PROTO_LABEL = { anthropic: 'Anthropic', openai: 'OpenAI' };
-
+/* 分组声明的是「这把 key 走哪种接口」，能不能真的通是另一件事 —— 只能看实际跑过的请求。
+   这一列就是干这个的：每种接口跑过几次 + 按成功率上色。 */
 function protoTags(health) {
   const by = (health && health.by_protocol) || {};
   const keys = Object.keys(by).sort();
@@ -320,11 +322,12 @@ function protoTags(health) {
   }).join(' ');
 }
 
-function sideTags(u) {
-  const marks = u.protocols || [];
-  if (!marks.length) return '<span class="tag tag-warn">未标记</span>';
+/** 供应商支持哪几种接口，是它下面分组的接口去重（后端算好放在 supports 里） */
+function ifaceTags(u) {
+  const marks = u.supports || [];
+  if (!marks.length) return '<span class="tag tag-warn">还没有分组</span>';
   return marks.map((p) =>
-    `<span class="tag${p === 'anthropic' ? ' tag-accent' : ''}">${SIDE_LABEL[p] || p}</span>`).join(' ');
+    `<span class="tag${p === 'anthropic' ? ' tag-accent' : ''}">${PROTO_LABEL[p] || p}</span>`).join(' ');
 }
 
 const maskKey = (key) => (key ? `${esc(key.slice(0, 6))}… ${key.length}` : '<span class="dim">透传客户端</span>');
@@ -338,15 +341,17 @@ function modelTags(names) {
 
 function groupRow(u, g) {
   const names = modelsOfGroup(g.id);
+  const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
+    + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${PROTO_LABEL[g.protocol] || '?'}</span>`;
   return `<tr class="grp-row">
-    <td class="grp-name">${esc(g.name)}${g.enabled ? '' : ' <span class="tag">停用</span>'}</td>
+    <td class="grp-name">${esc(g.name)} ${tag}${g.enabled ? '' : ' <span class="tag">停用</span>'}</td>
     <td class="mono dim nowrap">${maskKey(g.api_key)}</td>
     <td>${modelTags(names)}</td>
     <td colspan="2" class="dim nowrap">${names.length} 个模型</td>
     <td><input type="checkbox" class="switch" ${g.enabled ? 'checked' : ''}
                data-act="toggle-group" data-gid="${g.id}"
                aria-label="启用分组 ${esc(g.name)}"></td>
-    <td>
+    <td class="nowrap">
       <button class="btn btn-ghost btn-sm" data-act="edit-group" data-gid="${g.id}">编辑</button>
       <button class="btn btn-danger btn-sm" data-act="del-group" data-gid="${g.id}">删除</button>
     </td></tr>`;
@@ -380,7 +385,7 @@ export function renderUpstreams() {
         <button type="button" class="tw" data-act="toggle-groups" data-uid="${u.id}"
                 aria-expanded="${open}" title="展开 / 收起分组">${open ? '▾' : '▸'}</button>
         ${esc(u.name)}${u.enabled ? '' : ' <span class="tag"><span class="dot dot-off"></span>停用</span>'}
-        <div class="up-sub">${sideTags(u)}<span class="tag">${groups.length} 组</span></div>
+        <div class="up-sub">${ifaceTags(u)}<span class="tag">${groups.length} 组</span></div>
       </td>
       <td class="mono dim truncate" title="${esc(u.base_url)}">${esc(u.base_url)}</td>
       <td>${modelTags(modelsOfUpstream(u.id))}</td>
@@ -389,15 +394,23 @@ export function renderUpstreams() {
       <td><input type="checkbox" class="switch" ${u.enabled ? 'checked' : ''}
                  data-act="toggle-upstream" data-uid="${u.id}"
                  aria-label="启用 ${esc(u.name)}"></td>
-      <td>
+      <td class="nowrap">
         <button class="btn btn-ghost btn-sm" data-act="edit-upstream" data-uid="${u.id}">编辑</button>
         <button class="btn btn-danger btn-sm" data-act="del-upstream" data-uid="${u.id}">删除</button>
       </td></tr>`);
     if (!open) continue;
     for (const g of groups) rows.push(groupRow(u, g));
+    // 一把 key 两种接口都能用的站不少，而接口是分组的属性，所以给个一键复制
+    const only = groups.length === 1 ? groups[0] : null;
+    const other = only && only.protocol === 'anthropic' ? 'openai' : 'anthropic';
+    const clone = only && only.api_key
+      ? `<button class="btn btn-ghost btn-sm" data-act="clone-group" data-gid="${only.id}">`
+        + `复制这把 key 到 ${PROTO_LABEL[other]}</button>` : '';
     rows.push(`<tr class="grp-row"><td colspan="7">
       <button class="btn btn-ghost btn-sm" data-act="new-group" data-uid="${u.id}">＋ 添加分组</button>
-      <span class="dim" style="font-size:12px;margin-left:8px">同一个站的另一把 key</span>
+      ${clone}
+      <span class="dim" style="font-size:12px;margin-left:8px">${groups.length
+        ? '同一个站的另一把 key，或者另一种接口' : '这个供应商还没有分组，先加一个（选接口 + 填 key）'}</span>
     </td></tr>`);
   }
   $('upstream-body').innerHTML = rows.join('');

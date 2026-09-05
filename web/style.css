@@ -677,6 +677,10 @@ input:focus, textarea:focus, select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-wash);
 }
+/* 锁住的字段（有候选的分组不许改接口、改候选时不许换分组）要看得出来是锁住的 */
+input:disabled, select:disabled, .dlg-body input[readonly] {
+  opacity: .62; cursor: not-allowed; background: var(--glass-sunken);
+}
 .field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--ink-3); min-width: 0; }
 .field-row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
 .search { max-width: 220px; }
@@ -769,16 +773,10 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .foot-row { display: flex; align-items: center; gap: 8px; }
 .foot-row .btn:first-child { flex: 1; }
 
-/* 档位表：档位 / 对下游暴露的名字 / 上游那边的真实名 / 1M */
-.tier-grid { display: grid; grid-template-columns: 52px 1fr 1fr 34px; gap: 9px 10px; align-items: center; }
-.tier-grid .t-head { font-size: 11px; color: var(--ink-3); }
-.tier-grid .t-name { font-size: 12.5px; color: var(--ink-2); font-weight: 500; }
-.tier-grid input[type="text"] { font-family: var(--mono); font-size: 12px; padding: 6px 8px; }
-.tier-grid input[type="checkbox"] { width: auto; justify-self: center; }
-
 /* 复选行：勾选框和文字对齐，可以并排放几个 */
 .checkline { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer; }
 .checkline input[type="checkbox"] { width: auto; margin: 0; }
+.checkline code { font-family: var(--mono); font-size: 11.5px; }
 
 /* 供应商行首的展开箭头 */
 .tw {
@@ -802,8 +800,10 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 /* 接入信息里的只读可复制字段 */
 .access-row { margin-bottom: 15px; }
 .access-row:last-child { margin-bottom: 0; }
+/* 「下游接入」里的 readonly 是给人复制的，别跟着锁住的字段一起压暗 */
 .access-row input[readonly], .access-row textarea[readonly] {
   font-family: var(--mono); font-size: 12px; color: var(--ink-2);
+  opacity: 1; background: var(--glass-2); cursor: text;
 }
 .card-hint code, .dlg-body code {
   font-family: var(--mono); font-size: 11.5px; padding: 1px 5px; border-radius: 4px;
@@ -931,20 +931,25 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
   cursor: pointer; border-radius: 999px; transition: padding .15s;
 }
 .chip:hover .chip-label, .chip:focus-within .chip-label { padding-right: 5px; }
-.chip-label:focus-visible, .chip-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chip-label:focus-visible, .chip-x:focus-visible, .chip-e:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
 .chip .remote { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
 .chip-on { background: var(--accent-wash); border-color: var(--accent); color: var(--accent); }
 .chip-on .chip-label { font-weight: 600; cursor: default; }
 .chip-on .remote { color: var(--accent); opacity: 0.85; }
 .chip-off { opacity: 0.55; }
-.chip-x {
+/* 圆片右侧的两个动作（改配置 / 移除）：平时收成 0 宽，指过去才展开 */
+.chip-x, .chip-e {
   display: grid; place-items: center; width: 0; height: 20px; margin-right: 0;
   border-radius: 50%; color: var(--ink-3); font-size: 11px; line-height: 1;
   border: none; background: none; cursor: pointer; padding: 0; flex: none;
   overflow: hidden; opacity: 0; transition: width .15s, opacity .15s, margin .15s;
 }
 .chip:hover .chip-x, .chip:focus-within .chip-x { width: 20px; margin-right: 4px; opacity: 1; }
+.chip:hover .chip-e, .chip:focus-within .chip-e { width: 20px; margin-right: 1px; opacity: 1; }
 .chip-x:hover { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit-ink); }
+.chip-e:hover { background: var(--accent-wash); color: var(--accent); }
 
 /* 切换上游时飞跃的流光粒子 */
 .flow-dot {

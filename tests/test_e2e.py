@@ -44,10 +44,13 @@ def build_upstream_app(name: str) -> FastAPI:
 
     @app.get("/v1/models")
     def models(request: Request) -> dict:
-        # 按 key 返回不同的模型列表 —— 同一个站的两把 key 能看到的东西常常不一样，
-        # 这正是「分组」要解决的问题
+        # 按 key / 按接口返回不同的模型列表 —— 同一个站的两把 key 能看到的东西常常不一样，
+        # 而 Anthropic 那边认的是 x-api-key + anthropic-version，两件事都得能断言
         ids = ["gpt-test", "claude-test"]
-        if request.headers.get("authorization", "").endswith("-vip"):
+        if request.headers.get("anthropic-version"):
+            ids = ["claude-test", "claude-haiku-test"] if request.headers.get("x-api-key") \
+                else ["missing-x-api-key"]
+        elif request.headers.get("authorization", "").endswith("-vip"):
             ids = ["gpt-test", "vip-only"]
         return {"object": "list", "data": [{"id": i, "object": "model"} for i in ids]}
 
@@ -167,7 +170,8 @@ class MockUpstream:
     def __init__(self, name: str) -> None:
         self.name = name
         self.port = free_port()
-        self.base_url = f"http://127.0.0.1:{self.port}/v1"
+        # 站根：/v1 由网关按接口自己补，两种接口的路径都在它底下
+        self.base_url = f"http://127.0.0.1:{self.port}"
         self._server = uvicorn.Server(
             uvicorn.Config(build_upstream_app(name), host="127.0.0.1", port=self.port, log_level="error")
         )
@@ -205,27 +209,44 @@ def gateway(tmp_path, monkeypatch):
         thread.join(timeout=5)
 
 
-def add_upstream(
-    client: httpx.Client, mock: MockUpstream, name: str, protocols: tuple[str, ...] = ("openai", "anthropic")
-) -> int:
-    """建一个供应商，返回它那个自动创建的「默认」分组 id。
+DEFAULT_GROUP = "默认"
 
-    候选、批量导入、拉模型列表现在都以**分组**为单位（同一个站的两把 key 能看到的模型不一样），
-    所以测试里拿到手就直接用分组 id，需要供应商 id 的地方单独调 provider_id()。
+
+def add_upstream(
+    client: httpx.Client,
+    mock: MockUpstream,
+    name: str,
+    protocol: str = "openai",
+    api_key: str | None = None,
+) -> int:
+    """建一个供应商 + 一个分组，返回**分组** id。
+
+    接口是分组的属性（那把 key 走哪种格式），所以建站的时候就得说清楚。候选、批量导入、
+    拉模型列表也都以分组为单位 —— 同一个站的两把 key 能看到的模型不一样。
+    需要供应商 id 的地方单独调 provider_id()。
     """
-    resp = client.post(
-        "/admin/api/upstreams",
-        json={
-            "name": name,
-            "base_url": mock.base_url,
-            "api_key": f"key-{name}",
-            "protocols": list(protocols),
-        },
-    )
+    resp = client.post("/admin/api/upstreams", json={"name": name, "base_url": mock.base_url})
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert len(body["groups"]) == 1 and body["groups"][0]["name"] == "默认"
-    return int(body["groups"][0]["id"])
+    assert body["groups"] == [], "新建的供应商还没有分组：接口和 key 都得自己选"
+    return add_group(
+        client, int(body["id"]), protocol, api_key=f"key-{name}" if api_key is None else api_key
+    )
+
+
+def add_group(
+    client: httpx.Client,
+    upstream_id: int,
+    protocol: str,
+    name: str = DEFAULT_GROUP,
+    api_key: str = "",
+) -> int:
+    resp = client.post(
+        f"/admin/api/upstreams/{upstream_id}/groups",
+        json={"name": name, "protocol": protocol, "api_key": api_key},
+    )
+    assert resp.status_code == 200, resp.text
+    return int(resp.json()["id"])
 
 
 def provider_id(client: httpx.Client, name: str) -> int:
@@ -233,15 +254,10 @@ def provider_id(client: httpx.Client, name: str) -> int:
     return int(row["id"])
 
 
-def add_route(client: httpx.Client, model_name: str, group_id: int, remote_model: str = "", side: str = "") -> None:
+def add_route(client: httpx.Client, model_name: str, group_id: int, remote_model: str = "") -> None:
     resp = client.post(
         "/admin/api/models",
-        json={
-            "model_name": model_name,
-            "group_id": group_id,
-            "remote_model": remote_model,
-            "side": side,
-        },
+        json={"model_name": model_name, "group_id": group_id, "remote_model": remote_model},
     )
     assert resp.status_code == 200, resp.text
 
@@ -267,7 +283,7 @@ def test_import_models_and_switch_without_interrupting_stream(gateway):
         assert set(pulled) == {"gpt-test", "claude-test"}
 
         added = gateway.post(
-            "/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": pulled, "side": "openai"}
+            "/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": pulled}
         ).json()
         assert added == {"added": 2}
 
@@ -336,11 +352,7 @@ def test_delete_active_candidate_reattaches_remaining(gateway):
 def test_client_headers_pass_through_and_auth_override(gateway):
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA")
-        created = gateway.post(
-            "/admin/api/upstreams",
-            json={"name": "nokey", "base_url": b.base_url, "api_key": "", "protocols": ["openai"]},
-        ).json()
-        g_b = created["groups"][0]["id"]
+        g_b = add_upstream(gateway, b, "nokey", api_key="")
         for gid in (g_a, g_b):
             add_route(gateway, "hdr-test", gid, "gpt-test")
 
@@ -367,7 +379,6 @@ def test_header_override_applied_per_upstream(gateway):
                 "name": detail["name"],
                 "base_url": detail["base_url"],
                 "enabled": True,
-                "protocols": detail["protocols"],
                 "header_override": override,
             },
         )
@@ -436,7 +447,10 @@ def test_disabled_group_is_not_routed(gateway):
         add_route(gateway, "gpt-test", g_a)
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
 
-        r = gateway.put(f"/admin/api/groups/{g_a}", json={"name": "默认", "api_key": "key-siteA", "enabled": False})
+        r = gateway.put(
+            f"/admin/api/groups/{g_a}",
+            json={"name": "默认", "protocol": "openai", "api_key": "key-siteA", "enabled": False},
+        )
         assert r.status_code == 200, r.text
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 404
         assert "gpt-test" in {m["id"] for m in gateway.get("/v1/models").json()["data"]}
@@ -536,12 +550,10 @@ def test_admin_api_rejects_cross_site_and_foreign_host(gateway):
 
 def test_connect_failure_is_logged_as_502(gateway):
     created = gateway.post(
-        "/admin/api/upstreams", json={"name": "dead", "base_url": "http://127.0.0.1:1/v1"}
+        "/admin/api/upstreams", json={"name": "dead", "base_url": "http://127.0.0.1:1"}
     ).json()
-    gateway.post(
-        "/admin/api/models/bulk-add",
-        json={"group_id": created["groups"][0]["id"], "model_names": ["ghost"]},
-    )
+    gid = add_group(gateway, int(created["id"]), "openai")
+    gateway.post("/admin/api/models/bulk-add", json={"group_id": gid, "model_names": ["ghost"]})
 
     assert gateway.post("/v1/responses", json={"model": "ghost"}).status_code == 502
     row = gateway.get("/admin/api/requests").json()[0]
@@ -622,7 +634,7 @@ def test_has_end_marker_spans_chunk_boundary():
 def test_anthropic_messages_rewrites_model_and_injects_both_auth_headers(gateway):
     """档位名 -> 上游真名的改写，以及 x-api-key 必须被覆盖（客户端会带占位 key）。"""
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "opus", g_a, "claude-opus-4-1")
 
         resp = gateway.post(
@@ -645,7 +657,7 @@ def test_anthropic_messages_rewrites_model_and_injects_both_auth_headers(gateway
 def test_anthropic_stream_usage_survives_message_start_falling_out_of_tail(gateway):
     """Anthropic 把输入 token 放在流开头的 message_start，只留尾巴窗口会丢掉它。"""
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "opus", g_a, "claude-opus-4-1")
 
         resp = gateway.post("/v1/messages", json=msg("opus", stream=True, mode="bulk"))
@@ -662,7 +674,7 @@ def test_anthropic_stream_usage_survives_message_start_falling_out_of_tail(gatew
 
 def test_anthropic_stream_without_message_stop_is_flagged_truncated(gateway):
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "opus", g_a, "claude-opus-4-1")
 
         assert gateway.post("/v1/messages", json=msg("opus", stream=True, mode="no_end")).status_code == 200
@@ -673,7 +685,7 @@ def test_anthropic_stream_without_message_stop_is_flagged_truncated(gateway):
 def test_one_million_suffix_is_stripped_and_beta_header_injected(gateway):
     """[1m] 是 Claude Code 自己的档位约定，上游不认；它只该变成一个 beta 头。"""
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "claude-opus-5", g_a, "claude-opus-4-1")
         # 后缀也可能被写在配置的 remote 名里
         add_route(gateway, "sonnet", g_a, "claude-sonnet-4-5[1m]")
@@ -700,7 +712,7 @@ def test_one_million_suffix_is_stripped_and_beta_header_injected(gateway):
 def test_tier_keyword_fallback_catches_unconfigured_model_ids(gateway):
     """只配了档位名时，Claude Code 发来的具体 id 也要能落到同档位那条配置上。"""
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "opus", g_a, "real-opus")
 
         seen = gateway.post("/v1/messages", json=msg("claude-opus-4-1-20250805")).json()
@@ -733,7 +745,7 @@ def test_gateway_errors_use_the_shape_of_the_endpoint(gateway):
 
 def test_upstream_error_body_is_passed_through_untouched(gateway):
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "opus", g_a, "claude-opus-4-1")
 
         resp = gateway.post("/v1/messages", json=msg("opus", fail=True))
@@ -744,7 +756,7 @@ def test_upstream_error_body_is_passed_through_untouched(gateway):
 def test_body_is_byte_exact_when_no_rename_configured(gateway):
     """名字两边一致时继续发原始字节，「透明中转」这个特性不能因为改写机制丢掉。"""
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "same", g_a, "same")
         add_route(gateway, "renamed", g_a, "other")
 
@@ -766,7 +778,7 @@ def test_body_is_byte_exact_when_no_rename_configured(gateway):
 def test_count_tokens_is_forwarded_but_kept_out_of_the_stats(gateway):
     """Claude Code 会频繁调它，记进转发记录会把累计次数和模型热度冲得没法看。"""
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "opus", g_a, "claude-opus-4-1")
 
         resp = gateway.post("/v1/messages/count_tokens", json=msg("opus"))
@@ -779,7 +791,7 @@ def test_count_tokens_is_forwarded_but_kept_out_of_the_stats(gateway):
 
 def test_models_list_satisfies_both_openai_and_anthropic_shapes(gateway):
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
         add_route(gateway, "opus", g_a, "claude-opus-4-1")
 
         listing = gateway.get("/v1/models").json()
@@ -796,8 +808,8 @@ def test_models_list_satisfies_both_openai_and_anthropic_shapes(gateway):
 def test_anthropic_switch_and_disable_reuse_the_same_routing(gateway):
     """热切换、停用兜底这些是路由层的能力，两种协议共用一套。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
-        g_a = add_upstream(gateway, a, "siteA")
-        g_b = add_upstream(gateway, b, "siteB")
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
         add_route(gateway, "opus", g_a, "on-a")
         add_route(gateway, "opus", g_b, "on-b")
 
@@ -808,11 +820,15 @@ def test_anthropic_switch_and_disable_reuse_the_same_routing(gateway):
 
 
 def test_request_log_records_protocol_and_health_splits_by_it(gateway):
-    """管理页要能回答「这条是哪种格式来的」和「这个站的哪种格式在用」。"""
+    """管理页要能回答「这条是哪种格式来的」和「这个站的哪种格式在用」。
+
+    一个站两种接口 = 两个分组，这也是那些「既有 GPT 又有 Claude」的公益站的正常形态。
+    """
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
-        add_route(gateway, "opus", g_a, "claude-opus-4-1")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        g_an = add_upstream(gateway, a, "siteA", "anthropic")
+        g_oa = add_group(gateway, provider_id(gateway, "siteA"), "openai", name="gpt", api_key="key-siteA")
+        add_route(gateway, "opus", g_an, "claude-opus-4-1")
+        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_oa, "model_names": ["gpt-test"]})
 
         assert gateway.post("/v1/messages", json=msg("opus")).status_code == 200
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
@@ -828,11 +844,11 @@ def test_request_log_records_protocol_and_health_splits_by_it(gateway):
 
 
 def test_protocol_split_exposes_a_dead_endpoint(gateway):
-    """「这个站的 anthropic 接口通不通」没法静态探测，只能靠实际跑过的请求。"""
+    """「这个站的 anthropic 接口通不通」没法静态探测（分组只是声明），只能靠实际跑过的请求。"""
     created = gateway.post(
-        "/admin/api/upstreams", json={"name": "dead", "base_url": "http://127.0.0.1:1/v1", "api_key": ""}
+        "/admin/api/upstreams", json={"name": "dead", "base_url": "http://127.0.0.1:1"}
     ).json()
-    add_route(gateway, "opus", created["groups"][0]["id"], "claude-opus-4-1")
+    add_route(gateway, "opus", add_group(gateway, int(created["id"]), "anthropic"), "claude-opus-4-1")
 
     assert gateway.post("/v1/messages", json=msg("opus")).status_code == 502
     health = next(h for h in gateway.get("/admin/api/stats/upstreams").json() if h["name"] == "dead")
@@ -871,12 +887,7 @@ def test_groups_keep_their_own_key_and_model_list(gateway):
     with MockUpstream("siteA") as a:
         g_default = add_upstream(gateway, a, "siteA")
         uid = provider_id(gateway, "siteA")
-
-        created = gateway.post(
-            f"/admin/api/upstreams/{uid}/groups", json={"name": "vip", "api_key": "key-siteA-vip"}
-        )
-        assert created.status_code == 200, created.text
-        g_vip = created.json()["id"]
+        g_vip = add_group(gateway, uid, "openai", name="vip", api_key="key-siteA-vip")
 
         plain = gateway.get(f"/admin/api/groups/{g_default}/remote-models").json()["models"]
         vip = gateway.get(f"/admin/api/groups/{g_vip}/remote-models").json()["models"]
@@ -896,9 +907,7 @@ def test_switching_between_two_groups_of_one_provider(gateway):
     with MockUpstream("siteA") as a:
         g_default = add_upstream(gateway, a, "siteA")
         uid = provider_id(gateway, "siteA")
-        g_vip = gateway.post(
-            f"/admin/api/upstreams/{uid}/groups", json={"name": "vip", "api_key": "key-siteA-vip"}
-        ).json()["id"]
+        g_vip = add_group(gateway, uid, "openai", name="vip", api_key="key-siteA-vip")
         add_route(gateway, "shared", g_default, "gpt-test")
         add_route(gateway, "shared", g_vip, "gpt-test")
 
@@ -921,7 +930,10 @@ def test_moving_a_group_merges_two_providers(gateway):
         keep_id = provider_id(gateway, "keep")
         moved = gateway.put(
             f"/admin/api/groups/{g_stray}",
-            json={"name": "luna", "api_key": "key-stray", "enabled": True, "upstream_id": keep_id},
+            json={
+                "name": "luna", "protocol": "openai", "api_key": "key-stray",
+                "enabled": True, "upstream_id": keep_id,
+            },
         )
         assert moved.status_code == 200, moved.text
 
@@ -939,31 +951,153 @@ def test_moving_a_group_merges_two_providers(gateway):
         assert gateway.delete(f"/admin/api/upstreams/{provider_id(gateway, 'stray')}").status_code == 200
 
 
-def test_last_group_cannot_be_deleted(gateway):
+def test_group_can_be_deleted_even_when_it_is_the_last_one(gateway):
+    """接口挂在分组上，所以「只剩一个分组」不是特殊状态：删完这个站就是没 key、用不了而已。"""
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        resp = gateway.delete(f"/admin/api/groups/{g_a}")
-        assert resp.status_code == 409
-        assert "唯一" in resp.json()["detail"]
+        add_route(gateway, "gpt-test", g_a)
+        assert gateway.delete(f"/admin/api/groups/{g_a}").status_code == 200
+
+        detail = gateway.get("/admin/api/upstreams").json()[0]
+        assert detail["groups"] == [] and detail["supports"] == []
+        assert gateway.get("/admin/api/models").json() == [], "候选跟着分组一起走"
+        assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 404
 
 
-def test_side_is_metadata_and_does_not_gate_forwarding(gateway):
-    """side 只用来给管理页分侧和过滤选择器，不影响转发 —— 转发只看下游打的哪个路径。"""
+def test_base_url_is_stored_as_a_root_and_v1_is_added_per_protocol(gateway):
+    """两种接口的路径都在 /v1 底下，而 Anthropic 客户端给的地址是站根、OpenAI 给的是 …/v1。
+    库里统一存站根：粘进来的 /v1 剥掉，转发时按接口补回去。"""
     with MockUpstream("siteA") as a:
-        g_a = add_upstream(gateway, a, "siteA")
-        add_route(gateway, "opus", g_a, "claude-opus-4-1", side="anthropic")
-        add_route(gateway, "gpt-test", g_a, "gpt-test", side="openai")
+        created = gateway.post(
+            "/admin/api/upstreams", json={"name": "siteA", "base_url": a.base_url + "/v1/"}
+        ).json()
+        assert created["base_url"] == a.base_url, "尾部的 /v1 要剥掉，存的是站根"
 
-        routes = {g["model_name"]: g["side"] for g in gateway.get("/admin/api/models").json()}
-        assert routes == {"opus": "anthropic", "gpt-test": "openai"}
+        uid = int(created["id"])
+        # 同名不同接口是允许的：UNIQUE 是 (供应商, 接口, 组名)
+        g_oa = add_group(gateway, uid, "openai", api_key="key-siteA")
+        g_an = add_group(gateway, uid, "anthropic", api_key="key-siteA")
+        add_route(gateway, "gpt-test", g_oa)
+        add_route(gateway, "opus", g_an, "claude-opus-4-1")
 
+        assert gateway.post("/v1/responses", json={"model": "gpt-test"}).json()["upstream"] == "siteA"
+        assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteA"
+
+
+def test_model_is_bound_to_one_interface(gateway):
+    """模型的接口 = 它候选所在分组的接口。跨接口调是 404 —— 拿 Anthropic 的请求体去打人家的
+    /v1/responses 只会得到垃圾。跨接口挂候选是 409，否则「这个名字在哪个接口下」就没答案了。"""
+    with MockUpstream("siteA") as a:
+        g_an = add_upstream(gateway, a, "siteA", "anthropic")
+        uid = provider_id(gateway, "siteA")
+        g_oa = add_group(gateway, uid, "openai", name="gpt", api_key="key-siteA")
+        add_route(gateway, "opus", g_an, "claude-opus-4-1")
+
+        assert {g["model_name"]: g["protocol"] for g in gateway.get("/admin/api/models").json()} \
+            == {"opus": "anthropic"}
         assert gateway.post("/v1/messages", json=msg("opus")).status_code == 200
-        assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
-        # 标成 anthropic 的模型走 /v1/responses 也照转（上游会自己拒），网关不多管
-        assert gateway.post("/v1/responses", json={"model": "opus"}).status_code == 200
 
-        bad = gateway.post("/admin/api/models", json={"model_name": "x", "group_id": g_a, "side": "nope"})
+        wrong = gateway.post("/v1/responses", json={"model": "opus"})
+        assert wrong.status_code == 404
+        assert "anthropic" in wrong.json()["error"]["message"]
+
+        dup = gateway.post("/admin/api/models", json={"model_name": "opus", "group_id": g_oa})
+        assert dup.status_code == 409 and "接口" in dup.json()["detail"]
+
+        bad = gateway.post(f"/admin/api/upstreams/{uid}/groups", json={"name": "x", "protocol": "nope"})
         assert bad.status_code == 400
+
+
+def test_group_protocol_decides_the_pull_auth_headers(gateway):
+    """Anthropic 站的 /v1/models 认 x-api-key + anthropic-version，只发 Bearer 多半是 401。"""
+    with MockUpstream("siteA") as a:
+        g_oa = add_upstream(gateway, a, "siteA", "openai")
+        g_an = add_group(gateway, provider_id(gateway, "siteA"), "anthropic", api_key="key-siteA")
+
+        plain = gateway.get(f"/admin/api/groups/{g_oa}/remote-models").json()["models"]
+        claude = gateway.get(f"/admin/api/groups/{g_an}/remote-models").json()["models"]
+        assert set(plain) == {"gpt-test", "claude-test"}
+        assert set(claude) == {"claude-test", "claude-haiku-test"}, "mock 只在两个头都带上时才回这个"
+
+
+def test_models_list_can_be_filtered_by_the_anthropic_version_header(gateway):
+    """一个 /v1/models 服务两种客户端。带 anthropic-version 的（Claude Code 就带）
+    只该看到它调得动的那些，认不出来的给全部。"""
+    with MockUpstream("siteA") as a:
+        g_an = add_upstream(gateway, a, "siteA", "anthropic")
+        g_oa = add_group(gateway, provider_id(gateway, "siteA"), "openai", name="gpt", api_key="key-siteA")
+        add_route(gateway, "opus", g_an, "claude-opus-4-1")
+        add_route(gateway, "gpt-test", g_oa)
+
+        every = {m["id"] for m in gateway.get("/v1/models").json()["data"]}
+        assert every == {"opus", "gpt-test"}
+        claude = gateway.get("/v1/models", headers={"anthropic-version": "2023-06-01"}).json()
+        assert {m["id"] for m in claude["data"]} == {"opus"}
+
+
+def test_candidate_remote_name_and_1m_can_be_edited(gateway):
+    """1M 开关就是 remote_model 上的 [1m] 后缀，改候选走 PUT（原来只有档位弹窗能设）。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+        assert "context-1m" not in gateway.post("/v1/messages", json=msg("opus")).json()["beta"]
+
+        r = gateway.put(
+            "/admin/api/models",
+            json={"model_name": "opus", "group_id": g_a, "remote_model": "claude-opus-4-5[1m]"},
+        )
+        assert r.status_code == 200, r.text
+
+        seen = gateway.post("/v1/messages", json=msg("opus")).json()
+        assert seen["model"] == "claude-opus-4-5", "后缀只用来推断意图，绝不传给上游"
+        assert "context-1m-2025-08-07" in seen["beta"]
+
+        assert gateway.put(
+            "/admin/api/models", json={"model_name": "nope", "group_id": g_a}
+        ).status_code == 404
+
+
+def test_pull_failure_says_which_url_it_tried(gateway):
+    """公益站三天两头连不上，而 httpx 的 DNS / 连接错误 str() 常常是空的 ——
+    只回一句「拉取失败:」没法排查，至少得说清打的是哪个地址。"""
+    created = gateway.post(
+        "/admin/api/upstreams", json={"name": "dead", "base_url": "http://127.0.0.1:1"}
+    ).json()
+    gid = add_group(gateway, int(created["id"]), "anthropic")
+
+    resp = gateway.get(f"/admin/api/groups/{gid}/remote-models")
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert "http://127.0.0.1:1/v1/models" in detail, detail
+    assert detail.strip() != "拉取失败:", "异常消息为空时也得留点线索"
+
+
+def test_group_protocol_is_locked_once_it_has_candidates(gateway):
+    """改接口等于把已录入的模型悄悄换成另一种线格式，有候选就不给改。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "openai")
+        add_route(gateway, "gpt-test", g_a)
+
+        locked = gateway.put(f"/admin/api/groups/{g_a}", json={
+            "name": "默认", "protocol": "anthropic", "api_key": "key-siteA", "enabled": True})
+        assert locked.status_code == 409 and "接口" in locked.json()["detail"]
+
+        # 名字和 key 照样能改
+        assert gateway.put(f"/admin/api/groups/{g_a}", json={
+            "name": "renamed", "protocol": "openai", "api_key": "k2", "enabled": True}).status_code == 200
+
+
+def test_cloning_a_group_copies_the_key_to_the_other_interface(gateway):
+    """一把 key 两种接口都能用的站不少，而接口是分组的属性，手动再填一遍 key 很烦。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "openai")
+        clone = gateway.post(f"/admin/api/groups/{g_a}/clone")
+        assert clone.status_code == 200, clone.text
+        assert (clone.json()["protocol"], clone.json()["api_key"]) == ("anthropic", "key-siteA")
+
+        detail = gateway.get("/admin/api/upstreams").json()[0]
+        assert detail["supports"] == ["anthropic", "openai"]
+        assert {g["name"] for g in detail["groups"]} == {"默认"}, "同名不同接口"
 
 
 _PRE_GROUP_SCHEMA = """
@@ -1018,24 +1152,127 @@ def test_migration_from_pre_group_schema(tmp_path, monkeypatch):
     assert set(groups) == {(1, "默认"), (2, "默认")}
     assert groups[(1, "默认")].api_key == "sk-aaa"
     assert groups[(2, "默认")].api_key == "sk-bbb"
+    for group in groups.values():
+        assert group.protocol == "openai", "今天之前只有 /v1/responses，历史配置就是 openai 接口"
     for upstream in db.list_upstreams():
-        assert upstream.protocols == ("openai",), "今天之前只有 /v1/responses，历史站点就是 openai 侧"
+        assert not upstream.base_url.endswith("/v1"), "base_url 统一存站根"
 
     rows = db.list_routes()
-    assert {(r["model_name"], r["upstream_name"], r["remote_model"], r["side"]) for r in rows} == {
+    assert {(r["model_name"], r["upstream_name"], r["remote_model"], r["protocol"]) for r in rows} == {
         ("m1", "siteA", "remote-1", "openai"),
         ("m1", "siteB", "remote-1b", "openai"),
         ("m2", "siteB", "remote-2", "openai"),
     }
 
-    route = db.resolve_route("m1")
+    route = db.resolve_route("m1", "openai")
     assert route.upstream.name == "siteA" and route.upstream.api_key == "sk-aaa"
     assert (route.group_name, route.remote_model) == ("默认", "remote-1")
+    assert route.upstream.base_url == "https://a.example"
+    assert db.resolve_route("m1", "anthropic") is None, "接口参与匹配"
 
     assert db.request_stats()["requests"] == 1, "历史转发记录不能丢"
+    assert db.recent_requests(1)[0]["protocol"] == "openai", "老记录的协议列要回填"
 
     db.init_db()   # 再跑一遍不能出事，也不能又建一遍分组
     assert len(db.list_groups()) == 2
+
+
+_PRE_PROTOCOL_SCHEMA = """
+CREATE TABLE upstreams(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, base_url TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1, header_override TEXT NOT NULL DEFAULT '',
+  protocols TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
+CREATE TABLE upstream_groups(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  upstream_id INTEGER NOT NULL REFERENCES upstreams(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  UNIQUE(upstream_id, name));
+CREATE TABLE model_routes(
+  model_name TEXT NOT NULL,
+  group_id INTEGER NOT NULL REFERENCES upstream_groups(id) ON DELETE CASCADE,
+  remote_model TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(model_name, group_id));
+CREATE TABLE model_meta(model_name TEXT PRIMARY KEY, side TEXT NOT NULL DEFAULT '');
+CREATE TABLE request_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, client TEXT NOT NULL, model TEXT NOT NULL,
+  remote_model TEXT NOT NULL DEFAULT '', protocol TEXT NOT NULL DEFAULT '',
+  upstream TEXT NOT NULL, group_name TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL,
+  stream INTEGER NOT NULL, req_bytes INTEGER NOT NULL, resp_bytes INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
+  cached_tokens INTEGER, note TEXT NOT NULL DEFAULT '');
+INSERT INTO upstreams(name, base_url, protocols) VALUES
+  ('gpt-site', 'https://a.example/v1', 'openai'),
+  ('claude-site', 'https://b.example', 'anthropic'),
+  ('both', 'https://c.example/v1', 'openai,anthropic');
+INSERT INTO upstream_groups(upstream_id, name, api_key) VALUES
+  (1, '默认', 'sk-aaa'), (1, 'luna', 'sk-luna'), (2, '默认', 'sk-bbb'), (3, '默认', 'sk-ccc');
+INSERT INTO model_routes(model_name, group_id, remote_model, is_active) VALUES
+  ('m1', 1, 'remote-1', 1), ('m1', 2, 'remote-1b', 0), ('m2', 4, 'remote-2', 1);
+INSERT INTO model_meta(model_name, side) VALUES ('m1', 'openai'), ('m2', 'openai');
+INSERT INTO request_log(client, model, upstream, status, stream, req_bytes, resp_bytes, duration_ms, note)
+  VALUES ('codex', 'm1', 'gpt-site', 200, 0, 10, 20, 30, 'ok');
+"""
+
+
+def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
+    """上一版结构：接口标记挂在 upstreams.protocols 上、base_url 填到 /v1。
+    迁移要把接口搬到分组上、把 base_url 收成站根，候选和历史记录一条不少。"""
+    import sqlite3
+
+    from gateway import config, db
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "gateway.db"
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(config, "DB_PATH", db_path)
+
+    old = sqlite3.connect(db_path)
+    old.executescript(_PRE_PROTOCOL_SCHEMA)
+    old.commit()
+    old.close()
+
+    assert db._is_pre_protocol_shape(db_path)
+    db.init_db()
+    assert not db._is_pre_protocol_shape(db_path)
+    assert list(data_dir.glob("gateway.db.bak-*")), "迁移前必须留一份备份"
+
+    assert {u.name: u.base_url for u in db.list_upstreams()} == {
+        "gpt-site": "https://a.example",
+        "claude-site": "https://b.example",
+        "both": "https://c.example",
+    }
+    assert "protocols" not in db._columns(db_path, "upstreams"), "接口标记已经挪到分组上了"
+    assert not db._columns(db_path, "model_meta"), "模型的接口由候选推出来，不再单独存"
+
+    by_upstream = {u.id: u.name for u in db.list_upstreams()}
+    got = {(by_upstream[g.upstream_id], g.name, g.protocol, g.api_key) for g in db.list_groups()}
+    assert got == {
+        ("gpt-site", "默认", "openai", "sk-aaa"),
+        ("gpt-site", "luna", "openai", "sk-luna"),
+        ("claude-site", "默认", "anthropic", "sk-bbb"),
+        # 两种格式都标了的站：候选留在 openai 那个分组上（历史流量就是 /v1/responses），
+        # 另一种接口留一个同 key 的空分组，别把填过的信息弄丢
+        ("both", "默认", "openai", "sk-ccc"),
+        ("both", "默认", "anthropic", "sk-ccc"),
+    }
+
+    rows = db.list_routes()
+    assert {(r["model_name"], r["group_name"], r["remote_model"], r["protocol"]) for r in rows} == {
+        ("m1", "默认", "remote-1", "openai"),
+        ("m1", "luna", "remote-1b", "openai"),
+        ("m2", "默认", "remote-2", "openai"),
+    }
+    route = db.resolve_route("m1", "openai")
+    assert (route.upstream.name, route.group_name, route.upstream.api_key) == ("gpt-site", "默认", "sk-aaa")
+    assert db.request_stats()["requests"] == 1
+    assert db.recent_requests(1)[0]["protocol"] == "openai", "老记录的协议列要回填"
+
+    db.init_db()   # 幂等
+    assert len(db.list_groups()) == 5
+    assert len(list(data_dir.glob("gateway.db.bak-*"))) == 1
 
 
 

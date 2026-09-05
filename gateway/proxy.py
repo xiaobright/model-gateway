@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import config, db, naming, protocols, stats
 from .reqlog import log
-from .upstream import parse_override
+from .upstream import endpoint as upstream_endpoint, parse_override
 
 PROXY_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=600.0)
 PROXY_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
@@ -165,10 +165,17 @@ async def forward(
 
     requested = str(payload.get("model", ""))
     asked, flag = naming.split_model(requested)
-    route = db.resolve_route(asked)
+    route = db.resolve_route(asked, proto.name)
     if route is None:
-        log(f"POST {endpoint} model={requested!r} -> 404 (no active route) req={len(body)}B")
-        return _error(proto, 404, f"模型 {requested!r} 未配置或当前上游已停用")
+        # 模型录在另一个接口下时说清楚：这种 404 光看「未配置」会以为是没导入
+        elsewhere = db.protocol_of_model(asked)
+        why = (
+            f"模型 {requested!r} 是在 {elsewhere} 接口下暴露的，不能从 {endpoint} 调用"
+            if elsewhere and elsewhere != proto.name
+            else f"模型 {requested!r} 未配置或当前上游已停用"
+        )
+        log(f"POST {endpoint} model={requested!r} -> 404 ({why}) req={len(body)}B")
+        return _error(proto, 404, why)
     if route.model_name != asked:
         log(f"POST {endpoint} model={asked!r} 没配过，按档位关键字落到 {route.model_name!r}")
 
@@ -182,7 +189,8 @@ async def forward(
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
     _maybe_capture_headers(request)
-    url = route.upstream.base_url.rstrip("/") + path
+    # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
+    url = upstream_endpoint(route.upstream.base_url, path)
     headers = _build_headers(request, route.upstream, proto, want_1m)
     started = time.monotonic()
     client = get_client()
@@ -337,13 +345,18 @@ async def count_tokens_proxy(request: Request) -> StreamingResponse | JSONRespon
 
 @router.get("/v1/models")
 @router.get("/models")
-async def models_list() -> JSONResponse:
+async def models_list(request: Request) -> JSONResponse:
     """一份清单同时满足两种形状。
 
     OpenAI 要 `object`/`owned_by`，Anthropic 要 `type`/`display_name`/`created_at` 和外层的
     `has_more`。两边都会忽略自己不认识的字段，所以不必为 Anthropic 另开一个路径。
+
+    带了 `anthropic-version` 的客户端（Claude Code 就带）只给 Anthropic 接口下的模型，
+    省得它在 `/model` 里列出一堆自己调不了的名字。认不出客户端时给全部，宁可多给。
     """
-    names = db.exposed_models()
+    names = db.exposed_models(
+        protocols.ANTHROPIC.name if request.headers.get("anthropic-version") else ""
+    )
     data = [
         {
             "id": name,

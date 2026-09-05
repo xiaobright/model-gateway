@@ -1,8 +1,9 @@
 """按协议不同的那几处细节，集中在这里。
 
-网关本身不做格式转换：下游打哪个路径，就原样转发到上游对应的路径。所以「协议」是
-请求的属性，不是站点的属性 —— 公益站基本都在同一个 base_url、同一个 key 下同时挂着
-两种接口，给上游表加 protocol 列只会逼人把同一个站注册两遍。
+网关本身不做格式转换：下游打哪个路径，就原样转发到上游对应的路径。所以一条请求
+走哪种协议，是由**它打进来的路径**决定的，跟站点无关。站点那一侧的对应物是分组
+（`upstream_groups.protocol`）：那把 key 走哪种接口。两者在 `db.resolve_route()`
+里汇合 —— 模型名 + 请求协议，找出该用哪个分组。
 
 真正随协议变的只有四件事，全在下面的描述符里：结束标记、usage 字段位置、鉴权头、
 以及网关自己产生错误时的错误体形状。要再加一种协议（比如 chat-completions），
@@ -127,3 +128,11 @@ ANTHROPIC = Protocol(
     defaults={"anthropic-version": "2023-06-01"},
     beta_header="anthropic-beta",
 )
+
+ALL: dict[str, Protocol] = {p.name: p for p in (ANTHROPIC, OPENAI)}
+
+
+def by_name(name: str) -> Protocol:
+    """按名字取描述符。认不出来时退回 OPENAI，调用方全都是「拿它拼个头」的场景，
+    没有哪个值得为此抛异常。"""
+    return ALL.get(name, OPENAI)
