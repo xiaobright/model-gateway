@@ -433,12 +433,14 @@ def post_order(payload: OrderIn) -> dict[str, Any]:
 def get_inflight() -> dict[str, Any]:
     """「实时」那一页要的全部东西，一次拿完 —— 这页 1 秒一刷，不该开三个连接。
 
-    纯内存，不碰数据库。分组名由前端用它手上的供应商列表翻（它本来就有）。
+    登记表和断路器都是纯内存的。只有 tokens 那份标尺来自数据库（从转发记录里量
+    「多少字节摊一个 token」），它在 stats 里按分钟缓存，扫不到每次刷新头上。
     """
     return {
         **inflight.snapshot(),
         "breakers": failover.snapshot(),
         "failover": failover.all_enabled(),
+        "tokens": stats_mod.token_ratio(),
     }
 
 

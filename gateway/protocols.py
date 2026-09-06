@@ -60,6 +60,17 @@ def anthropic_usage(head: bytes, tail: bytes) -> Usage:
     )
 
 
+def openai_context(usage: Usage) -> int:
+    """整个上下文有多少 token。Responses API 的 input_tokens 已经含了 cached_tokens。"""
+    return usage[0] or 0
+
+
+def anthropic_context(usage: Usage) -> int:
+    """Messages API 的 input_tokens **不含**缓存读取（cache_read 是另一个字段），
+    所以上下文得两个加起来 —— 少加一边，少掉的正好是缓存那一大半。"""
+    return (usage[0] or 0) + (usage[2] or 0)
+
+
 def openai_error(status: int, message: str) -> dict:
     return {"error": {"message": message, "type": "gateway_error", "code": status}}
 
@@ -101,6 +112,8 @@ class Protocol:
     # 流结束的标记。少一个就会把正常结束的流误判成「被截断」
     end_markers: tuple[bytes, ...]
     extract_usage: Callable[[bytes, bytes], Usage]
+    # usage -> 整个上下文的 token 数。两种接口的 input_tokens 含不含缓存不一样
+    context_tokens: Callable[[Usage], int]
     error_body: Callable[[int, str], dict]
     auth_headers: Callable[[str], dict[str, str]]
     # 客户端没带时补上的头
@@ -113,6 +126,7 @@ OPENAI = Protocol(
     name="openai",
     end_markers=(b"response.completed", b"[DONE]"),
     extract_usage=openai_usage,
+    context_tokens=openai_context,
     error_body=openai_error,
     auth_headers=openai_auth,
 )
@@ -123,6 +137,7 @@ ANTHROPIC = Protocol(
     # 那类中转站留的，它们有时会在末尾多发一行
     end_markers=(b"message_stop", b"[DONE]"),
     extract_usage=anthropic_usage,
+    context_tokens=anthropic_context,
     error_body=anthropic_error,
     auth_headers=anthropic_auth,
     defaults={"anthropic-version": "2023-06-01"},

@@ -56,6 +56,7 @@ async function refreshLog() {
 async function refreshInflight() {
   const data = await api('GET', '/admin/api/inflight');
   state.failover = { enabled: data.failover || {}, breakers: data.breakers || [] };
+  state.tokens = data.tokens || {};
   // 侧栏那个胶囊平时走 3 秒的快轮，在这页上就跟着 1 秒的数走 ——
   // 同一屏上「2 个进行中」和「4 进行中」对不上会让人以为哪个是坏的
   state.stats = { ...(state.stats || {}), live: data.counts };

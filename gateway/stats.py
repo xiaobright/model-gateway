@@ -14,9 +14,9 @@ import math
 import time
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
-from . import db, inflight
+from . import db, inflight, protocols
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -51,7 +51,7 @@ def _epoch(ts: str) -> int | None:
         return None
 
 
-def _pct(values: list[int], q: float) -> int:
+def _pct(values: Sequence[float], q: float) -> float:
     """最近秩分位数：q=0.5 是中位数，q=0.95 是 P95。空列表返回 0。"""
     if not values:
         return 0
@@ -212,4 +212,86 @@ def overview(window: str = DEFAULT_WINDOW, top: int = 8) -> dict[str, Any]:
 
 
 def p95_overall(rows: Iterable[dict]) -> int:
-    return _pct([r["duration_ms"] for r in rows], 0.95)
+    return int(_pct([r["duration_ms"] for r in rows], 0.95))
+
+
+# ---------------------------------------------------------------- 按包大小估 token
+#
+# 「实时」页上那个 `≈ N tok` 的标尺。转发记录里每一行都现成地放着「这条请求多少字节」
+# 和「上游报了多少 token」，所以这个比值是真的从过往经验里量出来的，不是拍的常数。
+#
+# 两个方向差两个数量级，必须分开量：上行是 JSON 正文（六七个字节一个 token），
+# 下行是 SSE 帧（每个 delta 事件一百多字节只带几个字，五十多个字节才摊到一个 token）。
+
+RATIO_MIN_ROWS = 20        # 样本少于这个数就用兜底常数，别拿三条记录去定标尺
+RATIO_MAX_SPREAD = 6.0     # p90/p10 超过这个就是「字节数压根预测不了 token」，不给估值
+RATIO_TTL = 60.0           # 学出来的标尺缓存这么久：那个接口 1 秒一刷，不该每次全表扫
+
+# 兜底值取自真库两千条记录的中位数。openai 的下行是 0 = 不估：Responses API 的流里
+# 光事件框架就几十 KB，跟输出长度基本无关（实测 p90/p10 差十倍），给数字比不给更糟
+RATIO_FALLBACK: dict[str, tuple[float, float]] = {
+    "anthropic": (6.7, 55.8),
+    "openai": (4.9, 0.0),
+}
+
+_ratio_cache: tuple[float, dict[str, dict[str, float]]] = (0.0, {})
+
+
+def context_tokens(row: dict) -> int:
+    """这条记录的上下文有多大。两种接口的 input_tokens 含不含缓存读取不一样，
+    规则只在 protocols 里写一份。"""
+    proto = protocols.by_name(row.get("protocol") or "")
+    return proto.context_tokens(
+        (row["input_tokens"], row["output_tokens"], row["cached_tokens"])
+    )
+
+
+def _ratio_of(samples: list[float], fallback: float) -> float:
+    """一堆「多少字节摊一个 token」的样本 -> 一个能用的标尺，不可信则返回 0。
+
+    取中位数而不是总量比：总量比会被几条巨大的请求整个带走。
+    张幅（p90/p10）太大说明这个方向不是等比的 —— 有个跟 token 数无关的大常数项，
+    再乘一个系数也救不回来，这时界面上少一段比多一个差十倍的数好。
+    """
+    if len(samples) < RATIO_MIN_ROWS:
+        return fallback
+    lo, hi = _pct(samples, 0.1), _pct(samples, 0.9)
+    if lo <= 0 or hi / lo > RATIO_MAX_SPREAD:
+        return 0.0
+    return round(_pct(samples, 0.5), 2)
+
+
+def token_ratio() -> dict[str, dict[str, float]]:
+    """每种接口、每个方向「多少字节摊一个 token」。0 表示估不出来，界面上就不显示。"""
+    global _ratio_cache
+    at, cached = _ratio_cache
+    now = time.monotonic()
+    if cached and now - at < RATIO_TTL:
+        return cached
+
+    up: dict[str, list[float]] = defaultdict(list)
+    down: dict[str, list[float]] = defaultdict(list)
+    for row in _all_rows():
+        name = row.get("protocol") or ""
+        if name not in RATIO_FALLBACK or row["status"] >= 300:
+            continue
+        # 门槛甩掉小请求：那种请求里固定开销占大头，摊出来的比值和真正想看的大请求不是一回事
+        ctx = context_tokens(row)
+        if ctx > 200 and row["req_bytes"]:
+            up[name].append(row["req_bytes"] / ctx)
+        got_out = row["output_tokens"] or 0
+        if got_out > 20 and row["resp_bytes"]:
+            down[name].append(row["resp_bytes"] / got_out)
+
+    result = {
+        name: {"up": _ratio_of(up[name], fb[0]), "down": _ratio_of(down[name], fb[1])}
+        for name, fb in RATIO_FALLBACK.items()
+    }
+    _ratio_cache = (now, result)
+    return result
+
+
+def reset() -> None:
+    """清掉标尺缓存。给测试用 —— 库是每个用例一个临时文件，而缓存是进程级的。"""
+    global _ratio_cache
+    _ratio_cache = (0.0, {})

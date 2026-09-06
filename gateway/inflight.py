@@ -63,6 +63,10 @@ class Call:
     phase: str = CONNECT
     status: int = 0
     sent: int = 0                   # 已经转给下游多少字节
+    # 上游自己报的 token 数（0 = 还没报）。有真数就不用按字节估了 —— Anthropic 把输入
+    # token 放在流开头的 message_start 里，所以它往往在第一块字节里就到手了
+    tokens_in: int = 0
+    tokens_out: int = 0
     trail: list[dict[str, Any]] = field(default_factory=list)   # 前面失败掉的那几次
     note: str = ""
     done_at: float = 0.0
@@ -119,6 +123,9 @@ def set_route(
     call.req_bytes = req_bytes
     call.phase = CONNECT
     call.status = 0
+    # 换了候选就是换了一个站在算账，上一个报的数不作数
+    call.tokens_in = 0
+    call.tokens_out = 0
 
 
 def phase(call: Call | None, name: str, *, status: int = 0) -> None:
@@ -127,6 +134,19 @@ def phase(call: Call | None, name: str, *, status: int = 0) -> None:
     call.phase = name
     if status:
         call.status = status
+
+
+def usage(call: Call | None, *, tokens_in: int = 0, tokens_out: int = 0) -> None:
+    """上游自己报的 token 数。
+
+    取大的那个：Anthropic 在流开头的 message_start 里就报了输入 token，而那串数字
+    可能正好被切在两块字节之间，先读到的是残缺的前几位。头填满之前会反复来试，
+    完整的那个一定更大。
+    """
+    if call is None:
+        return
+    call.tokens_in = max(call.tokens_in, tokens_in)
+    call.tokens_out = max(call.tokens_out, tokens_out)
 
 
 def progress(call: Call | None, sent: int) -> None:
@@ -152,7 +172,15 @@ def failed(call: Call | None, *, status: int, note: str, ms: int) -> None:
     )
 
 
-def finish(call: Call | None, *, status: int = 0, note: str = "", sent: int = 0) -> None:
+def finish(
+    call: Call | None,
+    *,
+    status: int = 0,
+    note: str = "",
+    sent: int = 0,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+) -> None:
     if call is None:
         return
     call.done_at = time.monotonic()
@@ -161,6 +189,7 @@ def finish(call: Call | None, *, status: int = 0, note: str = "", sent: int = 0)
     call.sent = sent or call.sent
     if status:
         call.status = status
+    usage(call, tokens_in=tokens_in, tokens_out=tokens_out)
     _trim()
 
 
@@ -223,6 +252,8 @@ def _as_dict(call: Call) -> dict[str, Any]:
         "status": call.status,
         "req_bytes": call.req_bytes,
         "sent": call.sent,
+        "tokens_in": call.tokens_in,
+        "tokens_out": call.tokens_out,
         "elapsed_ms": call.elapsed_ms,
         "trail": list(call.trail),
         "note": call.note,

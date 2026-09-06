@@ -381,6 +381,33 @@ function trailRow(t) {
     </div>`;
 }
 
+/* 包大小 -> token 数的估值。标尺是后端从转发记录里量出来的（stats.token_ratio）：
+   上行六七个字节一个 token，下行的 SSE 帧要五十多个字节才摊一个。
+
+   量不出来的方向后端给 0，这里就什么都不显示 —— Codex 那种流光事件框架就几十 KB，
+   跟输出长度基本无关，给一个差十倍的数比不给更糟。 */
+function estTok(bytes, dir, proto) {
+  const ratio = ((state.tokens || {})[proto] || {})[dir] || 0;
+  if (!bytes || !ratio) return '';
+  const tip = `按过往记录 ${ratio} 字节摊一个 token 估的，不是上游报的数`;
+  return ` <span title="${esc(tip)}">≈ ${fmtTokens(Math.round(bytes / ratio))} tok</span>`;
+}
+
+/** 上游自己报的数（加粗）优先，没报就按字节估 */
+function upText(c) {
+  const real = c.tokens_in
+    ? ` · 上下文 <b title="上游自己报的数">${fmtTokens(c.tokens_in)}</b> tok`
+    : estTok(c.req_bytes, 'up', c.protocol);
+  return `上行 ${fmtBytes(c.req_bytes)}${real}`;
+}
+
+function downText(c, label) {
+  const real = c.tokens_out
+    ? ` · 输出 <b title="上游自己报的数">${fmtTokens(c.tokens_out)}</b> tok`
+    : estTok(c.sent, 'down', c.protocol);
+  return `<span class="dim">${label} ${fmtBytes(c.sent)}${real}</span>`;
+}
+
 function callHtml(c) {
   const done = c.phase === 'done';
   const { bare, onem } = splitOneM(c.remote_model);
@@ -400,7 +427,7 @@ function callHtml(c) {
     esc(c.client || 'unknown'),
     PROTO_LABEL[c.protocol] || esc(c.protocol),
     c.stream ? '流式' : '非流式',
-    `上行 ${fmtBytes(c.req_bytes)}`,
+    upText(c),
   ];
   // count_tokens 也登记：它会走降级、会踩断路器，「这个站为什么在被打」的答案有时就是它
   if (c.meta) bits.push('<b>count_tokens</b>');
@@ -409,11 +436,11 @@ function callHtml(c) {
   if (done) {
     statePart = `${statusTag(c.status)}`
       + (c.note && c.note !== 'ok' ? ' ' + noteTag(c.note) : '')
-      + `<span class="dim">收 ${fmtBytes(c.sent)}</span>`;
+      + downText(c, '收');
   } else {
     const [label, why] = PHASE[c.phase] || [c.phase, ''];
     statePart = `<span class="tone-${callDot(c)}-ink" title="${esc(why)}">${esc(label)}</span>`
-      + (c.phase === 'stream' ? `<span class="dim">已收 ${fmtBytes(c.sent)}</span>` : '')
+      + (c.phase === 'stream' ? downText(c, '已收') : '')
       + (c.status >= 400 ? ' ' + statusTag(c.status) : '');
   }
 

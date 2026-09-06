@@ -38,6 +38,9 @@ REDACT_ON_CAPTURE = {"authorization", "cookie", "proxy-authorization", "x-api-ke
 HEAD_KEEP = 8192   # 开头留这么多：Anthropic 的输入 token 只在流开头的 message_start 里报一次
 TAIL_KEEP = 65536  # 末尾留这么多，用来抓 usage 和完成标记
 
+# 连上游都没连上时的 usage：一个数都没有
+NO_USAGE: protocols.Usage = (None, None, None)
+
 # /v1/models 的 Anthropic 形状要求每项带 created_at，值本身没有客户端会用
 MODEL_CREATED_AT = "2025-01-01T00:00:00Z"
 
@@ -270,7 +273,7 @@ async def forward(
                     request=request, route=route, proto=proto, model=asked,
                     remote_model=remote, status=502, stream_flag=stream_flag,
                     req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
-                    head=b"", tail=b"", note="connect_failed", attempt=attempt,
+                    usage=NO_USAGE, note="connect_failed", attempt=attempt,
                 )
             index = advance()
             if index < 0:
@@ -313,7 +316,7 @@ async def forward(
                 request=request, route=route, proto=proto, model=asked,
                 remote_model=remote, status=resp.status_code, stream_flag=stream_flag,
                 req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
-                head=b"", tail=b"", note="failed_over", attempt=attempt,
+                usage=NO_USAGE, note="failed_over", attempt=attempt,
             )
         with contextlib.suppress(Exception):
             await resp.aclose()
@@ -350,6 +353,13 @@ async def forward(
                 sent += len(chunk)
                 if len(head) < HEAD_KEEP:
                     head.extend(chunk[: HEAD_KEEP - len(head)])
+                    # Anthropic 把输入 token 放在流开头的 message_start 里，也就是说这个数
+                    # 往往在第一块字节里就到手了 —— 比按包大小估准得多，「实时」页上直接用它。
+                    # 头填满之前每来一块都试一次：数字可能正好被切成两半，extract_usage
+                    # 取最大值，所以多试几次一定会读到完整的那个
+                    if b"input_tokens" in head:
+                        got = proto.extract_usage(bytes(head), b"")
+                        inflight.usage(call, tokens_in=proto.context_tokens(got))
                 tail.extend(chunk)
                 if not seen_end and has_end_marker(tail, len(chunk), proto.end_markers):
                     seen_end = True
@@ -375,15 +385,20 @@ async def forward(
             else:
                 log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
+            # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
+            usage = proto.extract_usage(bytes(head), bytes(tail))
             # 先落库（纯同步，即使外层在取消也能跑完），再还连接
-            inflight.finish(call, status=upstream_resp.status_code, note=note, sent=sent)
+            inflight.finish(
+                call, status=upstream_resp.status_code, note=note, sent=sent,
+                tokens_in=proto.context_tokens(usage), tokens_out=usage[1] or 0,
+            )
             if record:
                 _record(
                     request=request, route=won, proto=proto, model=asked,
                     remote_model=won_remote, status=upstream_resp.status_code,
                     stream_flag=stream_flag, req_bytes=won_bytes,
                     resp_bytes=sent, elapsed=time.monotonic() - started,
-                    head=bytes(head), tail=bytes(tail), note=note, attempt=won_attempt,
+                    usage=usage, note=note, attempt=won_attempt,
                 )
             with contextlib.suppress(Exception):
                 await upstream_resp.aclose()
@@ -408,12 +423,11 @@ def _record(
     req_bytes: int,
     resp_bytes: int,
     elapsed: float,
-    head: bytes,
-    tail: bytes,
+    usage: protocols.Usage,
     note: str,
     attempt: int = 1,
 ) -> None:
-    input_tokens, output_tokens, cached_tokens = proto.extract_usage(head, tail)
+    input_tokens, output_tokens, cached_tokens = usage
     try:
         db.insert_request(
             client=_client_label(request.headers.get("user-agent", "")),

@@ -142,6 +142,9 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             )
         if body.get("stream"):
             mode = body.get("mode", "")
+            # bulk：撑爆 64KB 尾部窗口；slow：每块之间歇一下，
+            # 好让「这条流还在跑」这件事在测试里抓得住
+            deltas, pause = {"bulk": (BULK_DELTAS, 0.0), "slow": (6, 0.05)}.get(mode, (2, 0.0))
 
             async def gen():
                 yield sse("message_start", {
@@ -152,8 +155,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                                   "cache_read_input_tokens": 900, "output_tokens": 1},
                     },
                 })
-                for _ in range(BULK_DELTAS if mode == "bulk" else 2):
-                    await asyncio.sleep(0)
+                for _ in range(deltas):
+                    await asyncio.sleep(pause)
                     yield sse("content_block_delta", {
                         "type": "content_block_delta", "index": 0,
                         "delta": {"type": "text_delta", "text": DELTA_TEXT},
@@ -232,14 +235,17 @@ class MockUpstream:
 @pytest.fixture()
 def gateway(tmp_path, monkeypatch):
     from gateway import config, failover, inflight
+    from gateway import stats as stats_mod
     from gateway.server import start_server_thread
 
     data_dir = tmp_path / "data"
     monkeypatch.setattr(config, "DATA_DIR", data_dir)
     monkeypatch.setattr(config, "DB_PATH", data_dir / "gateway.db")
-    # 断路器和「进行中」登记表都是进程内的内存状态，测试跑在同一个进程里 —— 不清会串到下一个用例
+    # 断路器和「进行中」登记表都是进程内的内存状态，测试跑在同一个进程里 —— 不清会串到下一个用例。
+    # 按字节估 token 的那把标尺也一样：它是从库里量的，而每个用例一个临时库
     failover.reset()
     inflight.reset()
+    stats_mod.reset()
 
     port = free_port()
     server, thread = start_server_thread(port)
@@ -1755,6 +1761,63 @@ def test_inflight_registers_nothing_for_an_unconfigured_model(gateway):
     assert gateway.post("/v1/responses", json={"model": "nope"}).status_code == 404
     data = gateway.get("/admin/api/inflight").json()
     assert (data["calls"], data["recent"]) == ([], [])
+
+
+# ================================================================ 按包大小估 token
+
+
+def test_inflight_uses_the_token_counts_upstream_reported(gateway):
+    """Anthropic 把输入 token 放在流开头的 message_start 里，所以第一块字节到手时
+    就已经有真数了，不用再按包大小估。输出 token 要等末尾的 message_delta。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+
+        seen = None
+        with gateway.stream(
+            "POST", "/v1/messages", json=msg("opus", stream=True, mode="slow")
+        ) as stream:
+            for chunk in stream.iter_text():
+                if chunk.strip() and seen is None:
+                    seen = gateway.get("/admin/api/inflight").json()
+
+        assert seen is not None and len(seen["calls"]) == 1, seen
+        # 1234 是 input_tokens，900 是 cache_read —— Anthropic 的 input 不含缓存，得加起来
+        assert seen["calls"][0]["tokens_in"] == 2134, "流还在跑就该有上游报的上下文大小"
+        assert seen["calls"][0]["tokens_out"] == 0, "输出 token 这会儿还没报"
+
+        done = wait_inflight(gateway, lambda d: d["recent"] and not d["calls"])["recent"][0]
+        assert (done["tokens_in"], done["tokens_out"]) == (2134, 777)
+
+
+def test_token_ratio_is_learned_from_the_log(gateway):
+    """`≈ N tok` 的标尺是从转发记录里量出来的，不是拍的常数。"""
+    from gateway import db, stats as stats_mod
+
+    def logged(protocol: str, req: int, resp: int, it: int, ot: int, ct: int) -> None:
+        db.insert_request(
+            client="Claude Code", model="m", upstream="siteA", status=200, stream=True,
+            req_bytes=req, resp_bytes=resp, duration_ms=100,
+            input_tokens=it, output_tokens=ot, cached_tokens=ct, note="ok", protocol=protocol,
+        )
+
+    # 25 条整整齐齐的：上行 10 字节一个 token（上下文 = 800 + 200 缓存），下行 100 字节一个
+    for _ in range(25):
+        logged("anthropic", req=10_000, resp=50_000, it=800, ot=500, ct=200)
+    stats_mod.reset()
+    assert stats_mod.token_ratio()["anthropic"] == {"up": 10.0, "down": 100.0}
+
+    # 下行忽大忽小（差 10 倍）时不给估值：那说明字节数里有个跟 token 数无关的大常数项，
+    # 再乘一个系数也救不回来，界面上宁可少一段
+    for i in range(25):
+        logged("openai", req=5_000, resp=20_000 if i % 2 else 200_000, it=1000, ot=200, ct=0)
+    stats_mod.reset()
+    ratio = stats_mod.token_ratio()["openai"]
+    assert ratio["up"] == 5.0, "上行照旧量得出来"
+    assert ratio["down"] == 0.0, "下行张幅太大 = 估不出来"
+
+    # 前端拿到的就是这份标尺
+    assert gateway.get("/admin/api/inflight").json()["tokens"]["openai"]["down"] == 0.0
 
 
 

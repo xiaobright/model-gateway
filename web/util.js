@@ -14,6 +14,9 @@ export const state = {
   // /admin/api/failover：{enabled:{anthropic,openai}, breakers:[{group_id,cooling_ms,...}]}
   // 开关按接口分开：Claude 侧全是坏得勤的中转站，GPT 侧要花钱的站得手动确认
   failover: { enabled: {}, breakers: [] },
+  // /admin/api/inflight 的 tokens：每种接口每个方向「多少字节摊一个 token」，
+  // 后端从转发记录里量的。0 = 量不出来，「实时」页上那一段就不显示
+  tokens: {},
   filter: '',
   iface: '',         // 模型路由按接口筛选：'' | 'anthropic' | 'openai'
   proto: '',         // 转发记录的协议筛选：'' | 'anthropic' | 'openai'
