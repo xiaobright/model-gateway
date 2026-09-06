@@ -12,7 +12,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Sequence
 
 from . import db
 from .reqlog import log
@@ -26,7 +27,7 @@ COOL_SECONDS = 90.0     # 首次冷却时长
 COOL_MAX = 600.0        # 每多失败一次翻倍，封顶。60 连击那种会稳定在 10 分钟
 
 # 可重试 = 「换一个站有希望拿到不同结果」。
-# 400 / 404 / 422 不在里面：请求本身有问题，换谁都是同样的答案。
+# 400 / 422 不在里面：请求本身有问题，换谁都是同样的答案。
 RETRY_STATUS = frozenset(
     {
         408, 425, 429,                          # 超时 / 太早 / 限流
@@ -36,6 +37,11 @@ RETRY_STATUS = frozenset(
         413,                                    # 体积上限每个站不一样
     }
 )
+
+# 模型级失败：这个站没有这个模型名。中转站下掉模型 id 是常事（带日期后缀的尤其），
+# 换一条候选有希望 —— 可以是同一个分组里的另一个真名。但这**不算这个分组的锅**：
+# key 是好的、站是通的，所以不记失败、不进冷却，见 note_fail 的调用点。
+MODEL_STATUS = frozenset({404})
 
 # 开关按接口分开存：Claude 侧全是中转站、坏得勤，值得自动降级；
 # GPT 侧只有 站A 是公益站，其余要花钱的站「花钱图稳定」，得手动确认。
@@ -152,3 +158,17 @@ def order_chain(chain: tuple[db.Route, ...]) -> list[db.Route]:
     warm = [r for r in chain if not cooling(r.group_id)]
     cold = [r for r in chain if cooling(r.group_id)]
     return warm + cold
+
+
+def next_index(candidates: Sequence[db.Route], start: int, dead_groups: set[int]) -> int:
+    """从 start 往后找下一个「打了还有意义」的候选，返回下标；没有就 -1。
+
+    这个请求里已经站级失败过的分组整个跳掉：同一个站绝不在一次请求里立刻重试
+    （客户端自己已经在重试了，再叠一层只是让每次失败变长）。同分组的兄弟候选
+    一起跳 —— 站都连不上，换个模型名也没用。
+    """
+    for i in range(start, len(candidates)):
+        if candidates[i].group_id not in dead_groups:
+            return i
+    return -1
+

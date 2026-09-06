@@ -229,31 +229,37 @@ function multiGroupIds() {
   return new Set(state.upstreams.filter((u) => (u.groups || []).length > 1).map((u) => u.id));
 }
 
-function chipHtml(model, c, showGroup) {
+/* 一个分组下可以挂同一个模型的好几条候选（各指一个不同的上游真名），这时候光写
+   「供应商 · 分组」两个圆片长得一模一样，所以 showRemote 会强制把真名显示出来。 */
+function chipHtml(model, c, showGroup, showRemote) {
   const live = c.upstream_enabled && c.group_enabled;
   const cool = c.cooling_ms > 0;
   const cls = ['chip', c.is_active ? 'chip-on' : '', live ? '' : 'chip-off',
     cool ? 'chip-cool' : ''].filter(Boolean).join(' ');
   const label = showGroup ? `${c.upstream_name} · ${c.group_name}` : c.upstream_name;
   const { bare, onem } = splitOneM(c.remote_model);
-  const remote = bare && bare !== model ? ` <span class="remote">${esc(bare)}</span>` : '';
+  const named = bare && (showRemote || bare !== model);
+  const remote = named ? ` <span class="remote">${esc(bare)}</span>` : '';
   const wide = onem ? ' <span class="tag tag-accent">1M</span>' : '';
   const off = live ? ''
     : ` <span class="tag">${c.upstream_enabled ? '分组停用' : '停用'}</span>`;
-  // 冷却 = 它连着失败过，自动降级这段时间内会跳过它（手动点它照样能切过去）
+  // 冷却 = 它连着失败过，自动降级这段时间内会跳过它（手动点它照样能切过去）。
+  // 断路器按分组记，所以同分组的几条候选会一起显示冷却
   const cd = cool
     ? ` <span class="tag tag-warn" title="连续失败 ${c.fails} 次，冷却期内自动降级会跳过它">`
       + `冷却 ${fmtLeft(c.cooling_ms)}</span>` : '';
-  const tip = c.is_active ? '当前生效的分组' : `切到 ${label}`;
-  return `<span class="${cls}" data-gid="${c.group_id}">
+  const full = named ? `${label} · ${bare}` : label;
+  const tip = c.is_active ? '当前生效的候选' : `切到 ${full}`;
+  return `<span class="${cls}" data-rid="${c.route_id}">
     <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"
-            data-gid="${c.group_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
+            data-rid="${c.route_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
     <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"
-            data-gid="${c.group_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
+            data-rid="${c.route_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
     <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"
-            data-gid="${c.group_id}" title="从这个分组移除该模型">✕</button>
+            data-rid="${c.route_id}" title="移除这一条候选">✕</button>
   </span>`;
 }
+
 
 /* 自动降级开关。按接口分开，所以跟着当前的接口筛选走：筛了哪个就只显示那个的开关，
    「全部」时两个都显示 —— 一个开关代表两种接口会让人以为 GPT 侧也在自动换站。
@@ -306,7 +312,7 @@ export function renderRoutes() {
   const multi = multiGroupIds();
 
   $('route-list').innerHTML = list.map((g) => {
-    const dead = g.active_group_id === null
+    const dead = g.active_route_id === null
       ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>无可用上游</span>' : '';
     // 「全部」视图里两种接口混在一起，得标出来谁是谁
     const ifaceTag = !iface && g.protocol
@@ -316,8 +322,12 @@ export function renderRoutes() {
     const usage = stat
       ? `<span class="route-usage" title="最近 2000 条里的请求数 · P95 ${fmtSec(stat.p95)}">${fmtInt(stat.n)} 次</span>`
       : '';
-    const chips = g.candidates
-      .map((c) => chipHtml(g.model_name, c, multi.has(c.upstream_id))).join('');
+    // 同一个分组下挂了这个模型的好几条候选时，圆片必须把真名写出来才分得清
+    const sibs = new Map();
+    for (const c of g.candidates) sibs.set(c.group_id, (sibs.get(c.group_id) || 0) + 1);
+    const chips = g.candidates.map((c) =>
+      chipHtml(g.model_name, c, multi.has(c.upstream_id), sibs.get(c.group_id) > 1)).join('');
+
     return `<div class="route" data-model="${esc(g.model_name)}">
       <div class="route-name">${esc(g.model_name)}${ifaceTag}${dead}</div>
       <div class="route-cands">${chips}</div>
@@ -702,11 +712,11 @@ export function updateKpiLive() {
   if (dot) dot.classList.toggle('is-live', live.requests > 0);
 }
 
-/* 切换分组后：把"流量改道"这件事演出来 */
-export function afterSwitch(model, fromGid, toGid) {
+/* 切换候选后：把"流量改道"这件事演出来 */
+export function afterSwitch(model, fromRid, toRid) {
   const row = $('route-list').querySelector(`.route[data-model="${CSS.escape(model)}"]`);
   if (!row) return;
-  flow(row.querySelector(`.chip[data-gid="${fromGid}"]`), row.querySelector(`.chip[data-gid="${toGid}"]`));
+  flow(row.querySelector(`.chip[data-rid="${fromRid}"]`), row.querySelector(`.chip[data-rid="${toRid}"]`));
 }
 
 /**

@@ -43,13 +43,22 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
     app = FastAPI()
     # sick["status"] 一被设上，两个转发端点就一律回那个状态码 —— 用来演「这个站坏了」。
     # 放在字典里是为了能在运行中翻转（测冷却期满之后自己恢复）
-    sick = sick if sick is not None else {"status": None}
+    sick = sick if sick is not None else {"status": None, "missing": set()}
 
     def sick_now() -> JSONResponse | None:
         code = sick.get("status")
         if not code:
             return None
         return JSONResponse({"error": {"message": f"{name} is sick", "code": code}}, status_code=code)
+
+    def unknown(model: str) -> JSONResponse | None:
+        """这个站没有这个模型 id。站级故障是 5xx，这个是模型级的 404，两回事。"""
+        if not model or model not in sick.get("missing", ()):
+            return None
+        return JSONResponse(
+            {"type": "error", "error": {"type": "not_found_error", "message": f"no model {model}"}},
+            status_code=404,
+        )
 
     @app.get("/v1/models")
     def models(request: Request) -> dict:
@@ -68,6 +77,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         if (bad := sick_now()) is not None:
             return bad
         body = json.loads((await request.body()) or b"{}")
+        if (gone := unknown(body.get("model", ""))) is not None:
+            return gone
         if body.get("stream"):
             mode = body.get("mode", "")
 
@@ -112,6 +123,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             return bad
         raw = await request.body()
         body = json.loads(raw or b"{}")
+        if (gone := unknown(body.get("model", ""))) is not None:
+            return gone
         echo = {
             "upstream": name,
             "model": body.get("model", ""),
@@ -185,8 +198,9 @@ class MockUpstream:
         self.port = free_port()
         # 站根：/v1 由网关按接口自己补，两种接口的路径都在它底下
         self.base_url = f"http://127.0.0.1:{self.port}"
-        # 运行中可翻转的「病历」：设了 status 就一律回那个码，用来演故障与恢复
-        self.sick: dict = {"status": None}
+        # 运行中可翻转的「病历」：设了 status 就一律回那个码，用来演故障与恢复；
+        # missing 里的模型名一律回 404，用来演「这个站把某个模型 id 下掉了」
+        self.sick: dict = {"status": None, "missing": set()}
         self._server = uvicorn.Server(
             uvicorn.Config(
                 build_upstream_app(name, self.sick), host="127.0.0.1", port=self.port, log_level="error"
@@ -197,8 +211,13 @@ class MockUpstream:
     def fail_with(self, status: int) -> None:
         self.sick["status"] = status
 
+    def drop_model(self, *names: str) -> None:
+        """这个站不再认这几个模型 id（带日期后缀的那种最常被下掉）。"""
+        self.sick["missing"].update(names)
+
     def heal(self) -> None:
         self.sick["status"] = None
+        self.sick["missing"] = set()
 
     def __enter__(self) -> "MockUpstream":
         self._thread.start()
@@ -279,12 +298,29 @@ def provider_id(client: httpx.Client, name: str) -> int:
     return int(row["id"])
 
 
-def add_route(client: httpx.Client, model_name: str, group_id: int, remote_model: str = "") -> None:
+def add_route(client: httpx.Client, model_name: str, group_id: int, remote_model: str = "") -> int:
+    """加一个候选，返回它的 route_id —— 切换 / 改 / 删单条都按这个 id 指。"""
     resp = client.post(
         "/admin/api/models",
         json={"model_name": model_name, "group_id": group_id, "remote_model": remote_model},
     )
     assert resp.status_code == 200, resp.text
+    return int(resp.json()["route_id"])
+
+
+def cands(client: httpx.Client, model_name: str) -> list[dict]:
+    """某个模型的候选，按链上的顺序。"""
+    row = next(
+        (r for r in client.get("/admin/api/models").json() if r["model_name"] == model_name), None
+    )
+    return list(row["candidates"]) if row else []
+
+
+def route_id(client: httpx.Client, model_name: str, group_id: int) -> int:
+    """这个模型在某个分组下的候选 id（bulk-add 建出来的拿不到返回值，从列表里找）。"""
+    hit = [c for c in cands(client, model_name) if c["group_id"] == group_id]
+    assert len(hit) == 1, f"{model_name} 在 g{group_id} 下有 {len(hit)} 条候选"
+    return int(hit[0]["route_id"])
 
 
 def msg(model: str, **extra) -> dict:
@@ -331,7 +367,7 @@ def test_import_models_and_switch_without_interrupting_stream(gateway):
         ).json()
         assert added == {"added": 2, "skipped": []}
 
-        add_route(gateway, "gpt-test", g_b, "gpt-test")
+        r_b = add_route(gateway, "gpt-test", g_b, "gpt-test")
 
         exposed = gateway.get("/v1/models").json()
         assert {m["id"] for m in exposed["data"]} == {"gpt-test", "claude-test"}
@@ -342,7 +378,7 @@ def test_import_models_and_switch_without_interrupting_stream(gateway):
             for chunk in stream.iter_text():
                 if len(chunks) == 0 and chunk.strip():
                     switched = gateway.post(
-                        "/admin/api/models/switch", json={"model_name": "gpt-test", "group_id": g_b}
+                        "/admin/api/models/switch", json={"route_id": r_b}
                     )
                     assert switched.json() == {"ok": True}
                 chunks.append(chunk)
@@ -375,19 +411,18 @@ def test_delete_active_candidate_reattaches_remaining(gateway):
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA")
         g_b = add_upstream(gateway, b, "siteB")
-        for gid in (g_a, g_b):
-            add_route(gateway, "shared", gid, "gpt-test")
+        rids = {gid: add_route(gateway, "shared", gid, "gpt-test") for gid in (g_a, g_b)}
 
         routes = gateway.get("/admin/api/models").json()
         shared = next(g for g in routes if g["model_name"] == "shared")
-        assert shared["active_group_id"] == g_a
+        assert shared["active_route_id"] == rids[g_a]
 
         assert gateway.delete(
             "/admin/api/models", params={"model_name": "shared", "group_id": g_a}
         ).status_code == 200
         routes = gateway.get("/admin/api/models").json()
         shared = next(g for g in routes if g["model_name"] == "shared")
-        assert shared["active_group_id"] == g_b
+        assert shared["active_route_id"] == rids[g_b]
 
         follow_up = gateway.post("/v1/responses", json={"model": "shared"}).json()
         assert follow_up["upstream"] == "siteB"
@@ -397,8 +432,7 @@ def test_client_headers_pass_through_and_auth_override(gateway):
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA")
         g_b = add_upstream(gateway, b, "nokey", api_key="")
-        for gid in (g_a, g_b):
-            add_route(gateway, "hdr-test", gid, "gpt-test")
+        rids = {gid: add_route(gateway, "hdr-test", gid, "gpt-test") for gid in (g_a, g_b)}
 
         client_headers = {"User-Agent": "codex_cli_rs/1.0", "X-Probe": "abc", "Authorization": "Bearer client-token"}
         resp = gateway.post("/v1/responses", json={"model": "hdr-test"}, headers=client_headers).json()
@@ -406,7 +440,7 @@ def test_client_headers_pass_through_and_auth_override(gateway):
         assert resp["x_probe"] == "abc", "自定义头必须原样到达上游"
         assert resp["auth"] == "Bearer key-siteA", "分组存有 key 时覆盖客户端 Authorization"
 
-        gateway.post("/admin/api/models/switch", json={"model_name": "hdr-test", "group_id": g_b})
+        gateway.post("/admin/api/models/switch", json={"route_id": rids[g_b]})
         resp = gateway.post("/v1/responses", json={"model": "hdr-test"}, headers=client_headers).json()
         assert resp["auth"] == "Bearer client-token", "分组 key 为空时必须透传客户端 Authorization"
 
@@ -855,10 +889,10 @@ def test_anthropic_switch_and_disable_reuse_the_same_routing(gateway):
         g_a = add_upstream(gateway, a, "siteA", "anthropic")
         g_b = add_upstream(gateway, b, "siteB", "anthropic")
         add_route(gateway, "opus", g_a, "on-a")
-        add_route(gateway, "opus", g_b, "on-b")
+        r_b = add_route(gateway, "opus", g_b, "on-b")
 
         assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteA"
-        gateway.post("/admin/api/models/switch", json={"model_name": "opus", "group_id": g_b})
+        gateway.post("/admin/api/models/switch", json={"route_id": r_b})
         seen = gateway.post("/v1/messages", json=msg("opus")).json()
         assert (seen["upstream"], seen["model"]) == ("siteB", "on-b")
 
@@ -953,14 +987,14 @@ def test_switching_between_two_groups_of_one_provider(gateway):
         uid = provider_id(gateway, "siteA")
         g_vip = add_group(gateway, uid, "openai", name="vip", api_key="key-siteA-vip")
         add_route(gateway, "shared", g_default, "gpt-test")
-        add_route(gateway, "shared", g_vip, "gpt-test")
+        r_vip = add_route(gateway, "shared", g_vip, "gpt-test")
 
         assert gateway.post("/v1/responses", json={"model": "shared"}).json()["auth"] == "Bearer key-siteA"
-        gateway.post("/admin/api/models/switch", json={"model_name": "shared", "group_id": g_vip})
+        gateway.post("/admin/api/models/switch", json={"route_id": r_vip})
         assert gateway.post("/v1/responses", json={"model": "shared"}).json()["auth"] == "Bearer key-siteA-vip"
 
         group = next(g for g in gateway.get("/admin/api/models").json() if g["model_name"] == "shared")
-        assert group["active_group_id"] == g_vip
+        assert group["active_route_id"] == r_vip
         assert {c["group_name"] for c in group["candidates"]} == {"默认", "vip"}
 
 
@@ -1104,12 +1138,12 @@ def test_candidate_remote_name_and_1m_can_be_edited(gateway):
     """1M 开关就是 remote_model 上的 [1m] 后缀，改候选走 PUT（原来只有档位弹窗能设）。"""
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA", "anthropic")
-        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+        rid = add_route(gateway, "opus", g_a, "claude-opus-4-1")
         assert "context-1m" not in gateway.post("/v1/messages", json=msg("opus")).json()["beta"]
 
         r = gateway.put(
             "/admin/api/models",
-            json={"model_name": "opus", "group_id": g_a, "remote_model": "claude-opus-4-5[1m]"},
+            json={"route_id": rid, "remote_model": "claude-opus-4-5[1m]"},
         )
         assert r.status_code == 200, r.text
 
@@ -1118,7 +1152,7 @@ def test_candidate_remote_name_and_1m_can_be_edited(gateway):
         assert "context-1m-2025-08-07" in seen["beta"]
 
         assert gateway.put(
-            "/admin/api/models", json={"model_name": "nope", "group_id": g_a}
+            "/admin/api/models", json={"route_id": 9999, "remote_model": "x"}
         ).status_code == 404
 
 
@@ -1335,6 +1369,13 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
     assert db.request_stats()["requests"] == 1
     assert db.recent_requests(1)[0]["protocol"] == "openai", "老记录的协议列要回填"
 
+    # 老库的候选是复合主键，顺带升级成自增 id：一个分组下才塞得下第二条映射
+    assert not db._is_pre_routeid_shape(db_path)
+    assert all(r["route_id"] for r in rows), "每条候选都该有自己的 id"
+    first = next(r for r in rows if r["remote_model"] == "remote-1")
+    assert db.add_model_route("m1", first["group_id"], "remote-1-alt"), "同分组换个真名能再加一条"
+    assert db.add_model_route("m1", first["group_id"], "remote-1") == 0, "一模一样的还是重复"
+
     db.init_db()   # 幂等
     assert len(db.list_groups()) == 5
     assert len(list(data_dir.glob("gateway.db.bak-*"))) == 1
@@ -1475,7 +1516,7 @@ def test_manual_switch_clears_the_cooldown(gateway):
         assert gateway.get("/admin/api/failover").json()["breakers"], "先让它进冷却"
 
         assert gateway.post(
-            "/admin/api/models/switch", json={"model_name": "opus", "group_id": g_a}
+            "/admin/api/models/switch", json={"route_id": route_id(gateway, "opus", g_a)}
         ).json() == {"ok": True}
         assert gateway.get("/admin/api/failover").json()["breakers"] == []
 
@@ -1490,8 +1531,9 @@ def test_route_order_decides_who_is_tried_next(gateway):
         g_c = add_upstream(gateway, c, "siteC", "anthropic")
         add_route(gateway, "opus", g_c, "claude-opus-4-9")
 
+        order = [route_id(gateway, "opus", gid) for gid in (g_a, g_c, g_b)]
         ordered = gateway.post(
-            "/admin/api/models/order", json={"model_name": "opus", "order": [g_a, g_c, g_b]}
+            "/admin/api/models/order", json={"model_name": "opus", "order": order}
         )
         assert ordered.json() == {"ok": True, "ordered": 3}
         row = next(r for r in gateway.get("/admin/api/models").json() if r["model_name"] == "opus")
@@ -1519,6 +1561,111 @@ def test_stateful_openai_request_is_not_failed_over(gateway):
         assert resp.status_code == 503
         rows = wait_rows(gateway, 1)
         assert len(rows) == 1 and rows[0]["upstream"] == "siteA"
+
+
+# ================================================================ 同一分组下的多条映射
+#
+# 一个分组 = 一个站的一把 key，它下面常常有好几个能用的模型 id。以前候选的主键是
+# (模型名, 分组)，一个分组只塞得下一条；现在按 route_id 指，同分组可以挂好几条，
+# 各指一个不同的上游真名。
+
+
+def test_one_group_can_host_several_remote_names(gateway):
+    """同一把 key 下的两个模型 id 是两条平级候选，只有「连真名都一样」才算重复。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        r1 = add_route(gateway, "opus", g_a, "claude-opus-4-1")
+        r2 = add_route(gateway, "opus", g_a, "claude-opus-4-5")
+        assert r1 != r2
+
+        row = next(r for r in gateway.get("/admin/api/models").json() if r["model_name"] == "opus")
+        assert [(c["group_id"], c["remote_model"]) for c in row["candidates"]] == [
+            (g_a, "claude-opus-4-1"), (g_a, "claude-opus-4-5"),
+        ]
+        assert row["active_route_id"] == r1
+
+        dup = gateway.post(
+            "/admin/api/models",
+            json={"model_name": "opus", "group_id": g_a, "remote_model": "claude-opus-4-1"},
+        )
+        assert dup.status_code == 409
+        assert "claude-opus-4-1" in dup.json()["detail"], "得说清是跟哪条重复了"
+
+        # 手动切到同分组的第二条：这是以前根本表达不出来的操作
+        gateway.post("/admin/api/models/switch", json={"route_id": r2})
+        assert gateway.post("/v1/messages", json=msg("opus")).json()["model"] == "claude-opus-4-5"
+
+
+def test_model_level_404_tries_the_sibling_in_the_same_group(gateway):
+    """上游把某个模型 id 下掉了（404）时，同一把 key 的另一个真名还有机会。
+
+    404 不算这个分组的锅：站是通的、key 是好的，只是这个名字没了，所以不进冷却。
+    """
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1-20250805")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+        a.drop_model("claude-opus-4-1-20250805")
+
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["model"] == "claude-opus-4-1"
+
+        rows = wait_rows(gateway, 2)
+        assert [(r["remote_model"], r["status"], r["attempt"]) for r in rows] == [
+            ("claude-opus-4-1-20250805", 404, 1),
+            ("claude-opus-4-1", 200, 2),
+        ]
+        assert gateway.get("/admin/api/failover").json()["breakers"] == [], \
+            "模型名没了不该让整把 key 进冷却"
+
+
+def test_site_level_failure_skips_the_rest_of_that_group(gateway):
+    """站级失败（503）时同分组的兄弟候选一起跳掉 —— 站都连不上，换个模型名没用。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_a, "opus-a1")
+        add_route(gateway, "opus", g_a, "opus-a2")
+        add_route(gateway, "opus", g_b, "opus-b")
+        a.fail_with(503)
+
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        assert resp.status_code == 200 and resp.json()["upstream"] == "siteB"
+        rows = wait_rows(gateway, 2)
+        assert [(r["upstream"], r["attempt"]) for r in rows] == [("siteA", 1), ("siteB", 2)]
+        assert rows_on(gateway, "siteA") == 1, "同一个站不该在一次请求里被打两遍"
+
+
+def test_editing_a_candidate_into_a_duplicate_is_409(gateway):
+    """改真名改成同分组里另一条已经用着的名字，那两条就完全一样了。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+        r2 = add_route(gateway, "opus", g_a, "claude-opus-4-5")
+
+        clash = gateway.put(
+            "/admin/api/models", json={"route_id": r2, "remote_model": "claude-opus-4-1"}
+        )
+        assert clash.status_code == 409 and "claude-opus-4-1" in clash.json()["detail"]
+        assert len(cands(gateway, "opus")) == 2, "冲突的改动不能落库"
+
+
+def test_unchecking_a_model_removes_every_mapping_in_that_group(gateway):
+    """分组弹窗里的勾选框答的是「这个模型在这个分组里有没有」，所以取消勾选
+    （group_id 那种删法）要把同分组的几条映射一起去掉。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_a, "opus-a1")
+        add_route(gateway, "opus", g_a, "opus-a2")
+        r_b = add_route(gateway, "opus", g_b, "opus-b")
+
+        resp = gateway.delete("/admin/api/models", params={"model_name": "opus", "group_id": g_a})
+        assert resp.json() == {"ok": True, "removed": 2}
+        assert [c["route_id"] for c in cands(gateway, "opus")] == [r_b]
+        # 活跃的那条被删了，流量自动落到剩下的候选上
+        assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
 
 
 

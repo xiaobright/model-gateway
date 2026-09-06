@@ -33,8 +33,19 @@ class GroupIn(BaseModel):
 
 
 class ModelRouteIn(BaseModel):
+    """新增候选：把某个模型挂到某个分组上。
+
+    同一个分组下可以挂同一个模型名的多条候选，只要各指一个不同的上游真名，
+    所以「哪一条」在别的接口里用 route_id 指，不能再用 group_id。
+    """
+
     model_name: str = Field(min_length=1)
     group_id: int
+    remote_model: str = ""
+
+
+class RouteEditIn(BaseModel):
+    route_id: int
     remote_model: str = ""
 
 
@@ -44,13 +55,12 @@ class BulkAddIn(BaseModel):
 
 
 class SwitchIn(BaseModel):
-    model_name: str = Field(min_length=1)
-    group_id: int
+    route_id: int
 
 
 class OrderIn(BaseModel):
     model_name: str = Field(min_length=1)
-    # 自动降级依次尝试的顺序，从先到后
+    # 自动降级依次尝试的顺序，从先到后。元素是候选 id
     order: tuple[int, ...] = Field(min_length=1)
 
 
@@ -292,7 +302,7 @@ def get_model_routes() -> list[dict[str, Any]]:
                 # （add_model_route 守着），活跃的那条优先，免得手改过的老库看起来乱跳
                 "protocol": row["protocol"],
                 "candidates": [],
-                "active_group_id": None,
+                "active_route_id": None,
             },
         )
         is_active = bool(row["is_active"])
@@ -301,6 +311,7 @@ def get_model_routes() -> list[dict[str, Any]]:
         breaker = cooling.get(row["group_id"])
         group["candidates"].append(
             {
+                "route_id": row["route_id"],
                 "group_id": row["group_id"],
                 "group_name": row["group_name"],
                 "group_enabled": group_on,
@@ -312,6 +323,8 @@ def get_model_routes() -> list[dict[str, Any]]:
                 "is_active": is_active,
                 # 候选按 priority 排好了；圆片从左到右就是自动降级的尝试顺序
                 "priority": row["priority"],
+                # 断路器是按**分组**记的（坏的是那个站和那把 key），所以同分组的
+                # 几条候选会显示同一个冷却
                 "cooling_ms": breaker["cooling_ms"] if breaker else 0,
                 "fails": breaker["fails"] if breaker else 0,
             }
@@ -320,7 +333,7 @@ def get_model_routes() -> list[dict[str, Any]]:
             group["protocol"] = row["protocol"]
             # 供应商和分组都启用才算真的在生效
             if upstream_on and group_on:
-                group["active_group_id"] = row["group_id"]
+                group["active_route_id"] = row["route_id"]
     return sorted(grouped.values(), key=lambda g: g["model_name"])
 
 
@@ -339,12 +352,17 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
     model_name = payload.model_name.strip()
     remote_model = payload.remote_model.strip() or model_name
     try:
-        added = db.add_model_route(model_name, payload.group_id, remote_model)
+        route_id = db.add_model_route(model_name, payload.group_id, remote_model)
     except db.ProtocolMismatch as exc:
         raise _mismatch(model_name, exc) from exc
-    if not added:
-        raise HTTPException(409, f"「{model_name}」在这个分组下已存在")
+    if not route_id:
+        raise HTTPException(
+            409,
+            f"这个分组下已经有一条「{model_name}」→「{remote_model}」的候选了 —— "
+            "换个上游真名可以再加一条",
+        )
     return {
+        "route_id": route_id,
         "model_name": model_name,
         "group_id": payload.group_id,
         "remote_model": remote_model,
@@ -353,14 +371,27 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
 
 
 @router.put("/models")
-def put_model_route(payload: ModelRouteIn) -> dict[str, Any]:
+def put_model_route(payload: RouteEditIn) -> dict[str, Any]:
     """改一个已有候选的「上游那边的真实模型名」。1M 开关也走这里（存成 `名字[1m]`）。"""
-    _require_group(payload.group_id)
-    model_name = payload.model_name.strip()
-    remote_model = payload.remote_model.strip() or model_name
-    if not db.update_model_route(model_name, payload.group_id, remote_model):
+    route = db.get_route(payload.route_id)
+    if route is None:
         raise HTTPException(404, "该候选不存在")
-    return {"model_name": model_name, "group_id": payload.group_id, "remote_model": remote_model}
+    remote_model = payload.remote_model.strip() or route["model_name"]
+    try:
+        ok = db.update_model_route(payload.route_id, remote_model)
+    except db.DuplicateRemote as exc:
+        raise HTTPException(
+            409,
+            f"这个分组下已经有一条映射到「{exc.args[0]}」的候选了 —— 改成它就跟那条重复了",
+        ) from exc
+    if not ok:
+        raise HTTPException(404, "该候选不存在")
+    return {
+        "route_id": payload.route_id,
+        "model_name": route["model_name"],
+        "group_id": route["group_id"],
+        "remote_model": remote_model,
+    }
 
 
 @router.post("/models/bulk-add")
@@ -373,14 +404,15 @@ def post_bulk_add(payload: BulkAddIn) -> dict[str, Any]:
 
 @router.post("/models/switch")
 def post_switch(payload: SwitchIn) -> dict[str, bool]:
-    if not db.switch_route(payload.model_name, payload.group_id):
+    route = db.get_route(payload.route_id)
+    if route is None or not db.switch_route(payload.route_id):
         raise HTTPException(404, "切换目标不存在")
-    group = db.get_group(payload.group_id)
-    target = db.get_upstream(group.upstream_id) if group else None
-    label = f"{target.name}/{group.name}" if target and group else str(payload.group_id)
     # 手动指定了就立刻给它机会：之前的连续失败不该继续把它挡在外面
-    failover.clear(payload.group_id)
-    log(f"SWITCH model={payload.model_name!r} -> {label}")
+    failover.clear(route["group_id"])
+    log(
+        f"SWITCH model={route['model_name']!r} -> {route['upstream_name']}/{route['group_name']}"
+        f" remote={route['remote_model']!r}"
+    )
     return {"ok": True}
 
 
@@ -411,18 +443,29 @@ def post_failover(payload: FailoverIn) -> dict[str, Any]:
 
 @router.delete("/models")
 def remove_model_route(
-    model_name: str = Query(min_length=1, description="模型名"),
-    group_id: int | None = Query(default=None, description="只删这个分组下的候选；不传则删掉该模型的全部候选"),
+    model_name: str = Query(default="", description="模型名"),
+    group_id: int | None = Query(default=None, description="只删这个模型在该分组下的候选（可能有多条）"),
+    route_id: int | None = Query(default=None, description="只删这一条候选；给了它就不看前两个参数"),
 ) -> dict[str, Any]:
     # 走 query 而不是路径参数：模型名常带 '/'（如 deepseek-ai/DeepSeek-V3），放路径里会被当成多段
+    if route_id is not None:
+        name = db.delete_model_route(route_id)
+        if not name:
+            raise HTTPException(404, "该候选不存在")
+        return {"ok": True, "removed": 1, "model_name": name}
+    if not model_name:
+        raise HTTPException(400, "要么给 route_id，要么给 model_name")
     if group_id is None:
         removed = db.delete_model(model_name)
         if removed == 0:
             raise HTTPException(404, f"模型「{model_name}」不存在")
         return {"ok": True, "removed": removed}
-    if not db.delete_model_route(model_name, group_id):
+    # 分组级：同一个分组下可能挂了这个模型的好几条真名，一起去掉 ——
+    # 分组弹窗里那个勾选框答的就是「这个模型在这个分组里有没有」
+    removed = db.delete_routes_in_group(model_name, group_id)
+    if removed == 0:
         raise HTTPException(404, "该候选不存在")
-    return {"ok": True, "removed": 1}
+    return {"ok": True, "removed": removed}
 
 
 # ---------------------------------------------------------------- 转发记录 / 运维

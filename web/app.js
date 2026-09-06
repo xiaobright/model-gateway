@@ -529,15 +529,30 @@ async function addModels(names) {
   toast(names.length === 1 ? `已加上 ${names[0]}` : `加上了 ${r.added} 个`, 'ok');
 }
 
-/** 取消勾选就是删候选。删到某个模型一个候选都不剩时先问一句 —— 那等于把模型下线了 */
+/** 取消勾选就是把这个模型在这个分组下的候选全去掉（可能有好几条真名）。
+    去掉之后它一个候选都不剩时先问一句 —— 那等于把模型下线了 */
 async function removeModel(name) {
   const row = state.routes.find((r) => r.model_name === name);
-  if (row && row.candidates.length === 1) {
+  const mine = row ? row.candidates.filter((c) => c.group_id === state.editingGroup) : [];
+  const elsewhere = row ? row.candidates.length - mine.length : 0;
+  const many = mine.length > 1
+    ? `这个分组下挂了它 <b>${mine.length}</b> 条映射（${mine.map((c) => esc(c.remote_model)).join('、')}），会一起去掉。<br><br>`
+    : '';
+  if (row && elsewhere === 0) {
     const okay = await confirmBox({
-      title: '这是它唯一的候选',
-      body: `<b>${esc(name)}</b> 只在这个分组里有候选，取消勾选等于把这个模型下线，`
+      title: '这是它最后的候选',
+      body: many
+        + `<b>${esc(name)}</b> 只在这个分组里有候选，取消勾选等于把这个模型下线，`
         + '下游再调它就是 404。<br><br>只是想换个站的话，先在「模型路由」里给它加一个别的候选。',
       ok: '下线它',
+    });
+    if (!okay) return false;
+  } else if (mine.length > 1) {
+    const okay = await confirmBox({
+      title: '一起去掉这几条',
+      body: many + '它在别的分组还有候选，流量会自动落到那边。',
+      ok: '去掉',
+      danger: false,
     });
     if (!okay) return false;
   }
@@ -551,17 +566,18 @@ async function removeModel(name) {
 /* ---------------------------------------------------------------- 路由弹窗 */
 
 /* 一个弹窗三种用法：新增模型 / 给已有模型加候选 / 改某个候选（上游真名 + 1M）。
-   「接口」在这里只是个过滤器 —— 真正决定模型走哪种接口的是它候选所在分组的接口。 */
-function openRoute(model, gid) {
+   「接口」在这里只是个过滤器 —— 真正决定模型走哪种接口的是它候选所在分组的接口。
+   候选用它自己的 route_id 指：同一个分组下可以挂同一个模型的好几条真名。 */
+function openRoute(model, rid) {
   const row = model ? state.routes.find((r) => r.model_name === model) : null;
-  const cand = row && gid ? row.candidates.find((c) => c.group_id === gid) : null;
+  const cand = row && rid ? row.candidates.find((c) => c.route_id === rid) : null;
   // 已有模型的接口已经定了；新增时跟当前分段（分段在「全部」就默认 OpenAI）
   const iface = row ? row.protocol : (state.iface || 'openai');
   const pool = upstreamsFor(iface);
   if (!pool.length) {
     return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
   }
-  state.editingCand = cand ? { model, gid } : null;
+  state.editingCand = cand ? { model, rid } : null;
 
   $('route-title').textContent = cand ? `改候选：${model}` : (model ? `给「${model}」加候选` : '新增模型');
   $('rt-save').textContent = cand ? '保存' : '添加';
@@ -576,22 +592,9 @@ function openRoute(model, gid) {
   if (cand) {
     $('rt-upstream').value = String(cand.upstream_id);
     fillGroupSelect('rt-group', cand.upstream_id, iface);
-    $('rt-group').value = String(gid);
+    $('rt-group').value = String(cand.group_id);
   } else {
-    // 加候选时先落在「还有空分组」的供应商上：默认给第一个的话，遇到它唯一的分组
-    // 已经是候选（很常见），弹窗一开就是个死局，点保存只能换来一句 409
-    const taken = new Set(row ? row.candidates.map((c) => c.group_id) : []);
-    const free = pool.find((u) => groupsOfIface(u, iface).some((g) => !taken.has(g.id)));
-    if (!free && row) {
-      return toast(
-        `${model} 在每个 ${PROTO_LABEL[iface]} 分组下都已经是候选了 —— `
-        + '要再加就先去「上游站点」建一个新分组',
-        'err',
-      );
-    }
-    if (free) $('rt-upstream').value = String(free.id);
     fillGroupSelect('rt-group', $('rt-upstream').value, iface);
-    markTakenGroups(model);
   }
 
   const { bare, onem } = splitOneM(cand ? cand.remote_model : '');
@@ -611,8 +614,8 @@ function orderHint() {
   const cand = state.editingCand;
   if (!cand) return;
   const row = state.routes.find((r) => r.model_name === cand.model);
-  const ids = row ? row.candidates.map((c) => c.group_id) : [];
-  const at = ids.indexOf(cand.gid);
+  const ids = row ? row.candidates.map((c) => c.route_id) : [];
+  const at = ids.indexOf(cand.rid);
   $('rt-order-hint').textContent = at < 0 ? '' : `第 ${at + 1} / ${ids.length} 位`;
   for (const btn of $('rt-order-wrap').querySelectorAll('[data-act="move-cand"]')) {
     const to = at + Number(btn.dataset.dir);
@@ -634,6 +637,13 @@ function fillRemoteList(gid) {
   const names = [...new Set([...(pulledNames || []), ...remotesOfGroup(gid)])];
   $('rt-remote-list').innerHTML = names.map((n) => `<option value="${esc(n)}"></option>`).join('');
 
+  // 加候选时，同一个分组下已经挂着的那几条真名不能再重复（后端会 409），先说清楚
+  const dup = state.editingCand ? [] : takenRemotes($('rt-model').value.trim(), gid);
+  if (dup.length) {
+    hint.innerHTML = `这个分组下已经有 <b>${dup.length}</b> 条这个模型的候选`
+      + `（${dup.map(esc).join('、')}），再加一条得换个真名`;
+    return;
+  }
   if (pulledNames) hint.textContent = `这个分组能拉到 ${pulledNames.length} 个模型，点输入框下拉选`;
   else if (remoteBusy.has(gid)) hint.textContent = '正在拉这个分组的模型列表…';
   else if (remoteDead.has(gid)) hint.textContent = names.length
@@ -642,6 +652,13 @@ function fillRemoteList(gid) {
   else hint.textContent = '';
 
   if (!pulledNames && !remoteBusy.has(gid) && !remoteDead.has(gid)) pullRemoteList(gid);
+}
+
+/** 这个模型在这个分组下已经占用的上游真名 */
+function takenRemotes(model, gid) {
+  const row = model ? state.routes.find((r) => r.model_name === model) : null;
+  if (!row) return [];
+  return row.candidates.filter((c) => c.group_id === gid).map((c) => c.remote_model);
 }
 
 async function pullRemoteList(gid) {
@@ -659,36 +676,35 @@ async function pullRemoteList(gid) {
   }
 }
 
-/** 已经是候选的分组在下拉里禁掉，比提交后再报 409 友好 */
-function markTakenGroups(model) {
-  const group = model ? state.routes.find((r) => r.model_name === model) : null;
-  const taken = new Set(group ? group.candidates.map((c) => c.group_id) : []);
-  for (const opt of $('rt-group').options) {
-    if (!taken.has(Number(opt.value))) continue;
-    opt.disabled = true;
-    opt.textContent += '（已是候选）';
-  }
-  const first = [...$('rt-group').options].find((o) => !o.disabled);
-  if (first) $('rt-group').value = first.value;
-}
-
 async function saveRoute() {
-  const editing = Boolean(state.editingCand);
+  const cand = state.editingCand;
   const model = $('rt-model').value.trim();
   if (!model) return toast('模型名不能为空', 'err');
-  const gid = Number($('rt-group').value);
-  if (!gid) return toast('这个供应商没有对应接口的分组', 'err');
   // 勾了 1M 就把后缀写进真实模型名：网关转发时摘掉它、换成 anthropic-beta 头
   const remote = withOneM(
     $('rt-remote').value.trim() || model,
     $('rt-onem').checked && !$('rt-onem-wrap').hidden,
   );
-  await api(editing ? 'PUT' : 'POST', '/admin/api/models', {
-    model_name: model, group_id: gid, remote_model: remote,
-  });
+  if (cand) {
+    await api('PUT', '/admin/api/models', { route_id: cand.rid, remote_model: remote });
+  } else {
+    const gid = Number($('rt-group').value);
+    if (!gid) return toast('这个供应商没有对应接口的分组', 'err');
+    await api('POST', '/admin/api/models', {
+      model_name: model, group_id: gid, remote_model: remote,
+    });
+  }
   $('route-dialog').close();
   await refreshConfig();
-  toast(editing ? '已保存' : '已添加', 'ok');
+  toast(cand ? '已保存' : '已添加', 'ok');
+}
+
+/** 候选的显示名：「供应商 · 分组」，真名和模型名不一样时补上真名 ——
+    同一个分组挂了好几条时，全靠真名区分是哪一条 */
+function candLabel(model, cand) {
+  const base = groupLabel(cand.group_id);
+  const { bare } = splitOneM(cand.remote_model);
+  return bare && bare !== model ? `${base} · ${bare}` : base;
 }
 
 /* ---------------------------------------------------------------- 动作表 */
@@ -859,10 +875,10 @@ const ACTIONS = {
   'pick-none': async () => {
     const names = visibleRows(true);
     if (!names.length) return toast('本来就一个都没勾', 'ok');
-    // 只在这个分组有候选的模型会直接下线，这个后果得先说清楚
+    // 在别的分组没有候选的模型会直接下线，这个后果得先说清楚
     const orphan = names.filter((n) => {
       const row = state.routes.find((r) => r.model_name === n);
-      return row && row.candidates.length === 1;
+      return row && row.candidates.every((c) => c.group_id === state.editingGroup);
     });
     const okay = await confirmBox({
       title: '清空这个分组的模型',
@@ -897,7 +913,7 @@ const ACTIONS = {
 
   'new-route': () => openRoute('', null),
   'add-candidate': ({ model }) => openRoute(model, null),
-  'edit-candidate': ({ model, gid }) => openRoute(model, Number(gid)),
+  'edit-candidate': ({ model, rid }) => openRoute(model, Number(rid)),
 
   /* 自动降级开关。按接口分开：Claude 侧的中转站坏得勤、值得自动换；
      GPT 侧除了 站A 都是要花钱的站，花钱图稳定，得手动确认。
@@ -922,8 +938,8 @@ const ACTIONS = {
     if (!cand) return;
     const row = state.routes.find((r) => r.model_name === cand.model);
     if (!row) return;
-    const ids = row.candidates.map((c) => c.group_id);
-    const at = ids.indexOf(cand.gid);
+    const ids = row.candidates.map((c) => c.route_id);
+    const at = ids.indexOf(cand.rid);
     const to = at + Number(dir);
     if (at < 0 || to < 0 || to >= ids.length) return;
     ids.splice(to, 0, ids.splice(at, 1)[0]);
@@ -933,34 +949,35 @@ const ACTIONS = {
     requestAnimationFrame(orderHint);
   },
 
-  'switch': async ({ model, gid }) => {
-    const id = Number(gid);
+  'switch': async ({ model, rid }) => {
+    const id = Number(rid);
     const group = state.routes.find((r) => r.model_name === model);
-    const cand = group && group.candidates.find((c) => c.group_id === id);
+    const cand = group && group.candidates.find((c) => c.route_id === id);
     if (!cand || cand.is_active) return;
     if (!cand.upstream_enabled) return toast('这个供应商是停用状态，先在「上游站点」里启用它', 'err');
     if (!cand.group_enabled) return toast('这个分组是停用状态，展开那一行把它打开', 'err');
-    const fromGid = group.active_group_id;
-    await api('POST', '/admin/api/models/switch', { model_name: model, group_id: id });
+    const from = group.active_route_id;
+    await api('POST', '/admin/api/models/switch', { route_id: id });
     await refreshConfig();
-    views.afterSwitch(model, fromGid, id);
-    toast(`${model} → ${groupLabel(id)}`, 'ok');
+    views.afterSwitch(model, from, id);
+    toast(`${model} → ${candLabel(model, cand)}`, 'ok');
   },
 
-  'del-candidate': async ({ model, gid }) => {
-    const id = Number(gid);
+  'del-candidate': async ({ model, rid }) => {
+    const id = Number(rid);
     const group = state.routes.find((r) => r.model_name === model);
+    const cand = group && group.candidates.find((c) => c.route_id === id);
     const last = group && group.candidates.length === 1;
     const okay = await confirmBox({
       title: last ? '移除最后一个候选' : '移除候选',
       body: last
         ? `<b>${esc(model)}</b> 只剩这一个候选，移除后它就不再对下游暴露了。`
-        : `把 <b>${esc(model)}</b> 从 <b>${esc(groupLabel(id))}</b> 的候选里去掉？`
+        : `把 <b>${esc(model)}</b> 的候选 <b>${esc(cand ? candLabel(model, cand) : id)}</b> 去掉？`
           + '<br><br>如果它正好是当前生效的，流量会自动落到剩下的候选之一。',
       ok: '移除',
     });
     if (!okay) return;
-    await api('DELETE', `/admin/api/models?model_name=${encodeURIComponent(model)}&group_id=${id}`);
+    await api('DELETE', `/admin/api/models?route_id=${id}`);
     await refreshConfig();
     toast('已移除', 'ok');
   },
@@ -1060,7 +1077,6 @@ $('route-form').addEventListener('submit', (ev) => {
 // 供应商换了就把分组下拉重填一遍；接口换了连供应商池一起换
 $('rt-upstream').addEventListener('change', () => {
   fillGroupSelect('rt-group', $('rt-upstream').value, $('rt-iface').value);
-  markTakenGroups($('rt-model').value.trim());
   fillRemoteList(Number($('rt-group').value));
 });
 
@@ -1073,7 +1089,6 @@ $('rt-iface').addEventListener('change', () => {
   if (!pool.length) toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」加一个`, 'err');
   fillUpstreamSelect('rt-upstream', pool);
   fillGroupSelect('rt-group', $('rt-upstream').value, iface);
-  markTakenGroups($('rt-model').value.trim());
   fillRemoteList(Number($('rt-group').value));
   $('rt-onem-wrap').hidden = iface !== 'anthropic';
 });

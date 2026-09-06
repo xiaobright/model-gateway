@@ -186,26 +186,39 @@ async def forward(
     # 有副作用的 OpenAI 请求不降级：上游可能已经把它存下来了才失败，重试会留下两条
     stateful = payload.get("store") is not None or payload.get("previous_response_id") is not None
     can_failover = failover.enabled(proto.name) and len(chain) > 1 and not stateful
-    candidates = failover.order_chain(chain)[: failover.MAX_ATTEMPTS] if can_failover else [chain[0]]
+    candidates = failover.order_chain(chain) if can_failover else [chain[0]]
 
     started = time.monotonic()
     client = get_client()
     resp: httpx.Response | None = None
     route = candidates[0]
     remote = ""
+    sent_body = body
     attempt = 0
+    index = 0
     fail: Exception | None = None
+    # 这个请求里站级失败过的分组。整个跳掉（含它下面同模型的其它候选）：同一个站
+    # 绝不在一次请求里立刻重试。模型级的 404 不进这里 —— 那是名字的问题不是站的问题
+    dead_groups: set[int] = set()
+
+    def advance() -> int:
+        """还该不该再打一个？返回下一个候选的下标，-1 = 到此为止。"""
+        if attempt >= failover.MAX_ATTEMPTS:
+            return -1
+        return failover.next_index(candidates, index + 1, dead_groups)
 
     # 这里是「自动降级」唯一安全的落点：状态码已经拿到手，但还没往下游发过任何字节，
     # 换个上游重试客户端完全无感。第一个字节一旦发出去就不能再换了。
-    for index, route in enumerate(candidates, start=1):
-        attempt = index
-        last_one = index == len(candidates)
-        if index > 1:
+    while True:
+        route = candidates[index]
+        attempt += 1
+        if attempt > 1:
             if await request.is_disconnected():
-                log(f"  客户端已经走了，不再降级（试过 {index - 1} 个）")
+                attempt -= 1
+                log(f"  客户端已经走了，不再降级（试过 {attempt} 个）")
                 break
             if time.monotonic() - started > failover.START_DEADLINE:
+                attempt -= 1
                 log(f"  已经耗了 {time.monotonic() - started:.0f}s，不再开新尝试")
                 break
 
@@ -223,6 +236,7 @@ async def forward(
         # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
+        label = f"{route.upstream.name}/{route.group_name}"
         began = time.monotonic()
         try:
             resp = await client.send(
@@ -236,7 +250,8 @@ async def forward(
                 f"({exc.__class__.__name__}: {exc}) after {elapsed:.1f}s req={len(sent_body)}B"
                 f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
             )
-            failover.note_fail(route.group_id, 502, f"{route.upstream.name}/{route.group_name}")
+            failover.note_fail(route.group_id, 502, label)
+            dead_groups.add(route.group_id)
             if record:
                 _record(
                     request=request, route=route, proto=proto, model=asked,
@@ -244,7 +259,8 @@ async def forward(
                     req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
                     head=b"", tail=b"", note="connect_failed", attempt=attempt,
                 )
-            if last_one:
+            index = advance()
+            if index < 0:
                 break
             continue
 
@@ -258,12 +274,18 @@ async def forward(
             f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
         )
 
-        retryable = resp.status_code in failover.RETRY_STATUS
-        if not retryable:
+        site_bad = resp.status_code in failover.RETRY_STATUS
+        model_bad = resp.status_code in failover.MODEL_STATUS
+        if not site_bad and not model_bad:
             failover.note_ok(route.group_id)
             break
-        failover.note_fail(route.group_id, resp.status_code, f"{route.upstream.name}/{route.group_name}")
-        if last_one:
+        if site_bad:
+            failover.note_fail(route.group_id, resp.status_code, label)
+            dead_groups.add(route.group_id)
+        # 模型级的 404 既不算失败也不算成功：站是通的、key 是好的，只是这个名字没了。
+        # 所以不碰断路器，让同一个分组里的下一条真名还有机会
+        nxt = advance()
+        if nxt < 0:
             # 没有退路了就把上游的响应原样透传下去，和没有降级时的行为一字不差
             break
         # 还有候选可试：把这次的错误体读出来记一行（错误体都很小），然后换下一个
@@ -281,6 +303,7 @@ async def forward(
         with contextlib.suppress(Exception):
             await resp.aclose()
         resp = None
+        index = nxt
 
     if resp is None:
         if fail is not None:

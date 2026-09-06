@@ -24,7 +24,7 @@ export const state = {
   // 会改这个值 —— 要是和 editing 共用，一搬就把底下那个弹窗的目标也换掉了
   editingUp: null,
   editingGroup: null, // 正在编辑的分组 id，null = 新建
-  editingCand: null,  // 正在改的候选 {model, gid}，null = 新增
+  editingCand: null,  // 正在改的候选 {model, rid}，null = 新增
   openUpstreams: new Set(),  // 「上游站点」里展开了分组的那几行
   view: 'overview',
   // 默认 24 小时：1 小时窗口在空闲时段是空的，一进来看到空图会以为坏了

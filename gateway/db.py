@@ -19,7 +19,20 @@ from .upstream import normalize_base
 # 接口（protocol）挂在**分组**上而不是供应商上：现实里同一个站的 Claude key 和 GPT key
 # 是两把不同的 key，额度和能拉到的模型都不一样。「模型属于哪个接口」不再单独存一份，
 # 它等于自己候选所在分组的接口 —— 代价是同一个模型名的所有候选必须同接口，见 add_model_route。
-_SCHEMA = """
+
+# 候选的列定义单独拎出来：建库和迁移里重建这张表都用它。以前两处各写一份，
+# 迁移那份漏了 priority，启动之后到处报 no such column。
+_ROUTE_COLUMNS = """
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_name TEXT NOT NULL,
+  group_id INTEGER NOT NULL REFERENCES upstream_groups(id) ON DELETE CASCADE,
+  remote_model TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 0,
+  priority INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(model_name, group_id, remote_model)
+"""
+
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS upstreams(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
@@ -38,14 +51,7 @@ CREATE TABLE IF NOT EXISTS upstream_groups(
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
   UNIQUE(upstream_id, protocol, name)
 );
-CREATE TABLE IF NOT EXISTS model_routes(
-  model_name TEXT NOT NULL,
-  group_id INTEGER NOT NULL REFERENCES upstream_groups(id) ON DELETE CASCADE,
-  remote_model TEXT NOT NULL,
-  is_active INTEGER NOT NULL DEFAULT 0,
-  priority INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY(model_name, group_id)
-);
+CREATE TABLE IF NOT EXISTS model_routes({_ROUTE_COLUMNS});
 CREATE TABLE IF NOT EXISTS request_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL DEFAULT (datetime('now','localtime')),
@@ -93,6 +99,10 @@ class ProtocolMismatch(Exception):
     """候选和模型的接口不一致。args = (模型已在的接口, 这个分组的接口)。"""
 
 
+class DuplicateRemote(Exception):
+    """同一个分组下已经有一条映射到这个上游真名的候选了。args = (上游真名,)。"""
+
+
 class ProtocolLocked(Exception):
     """分组下已经有候选了，不能再改它的接口。args = (候选数,)。"""
 
@@ -124,6 +134,9 @@ class Route:
     remote_model: str
     group_id: int = 0
     group_name: str = ""
+    # 候选自己的主键。一个分组下同一个模型名可以有多条（各指一个不同的上游真名），
+    # 所以「哪一条」只能用它指，不能再用 group_id
+    route_id: int = 0
 
 
 @contextmanager
@@ -189,6 +202,12 @@ def _is_pre_protocol_shape(path) -> bool:
     return bool(cols) and "protocol" not in cols
 
 
+def _is_pre_routeid_shape(path) -> bool:
+    """候选还是复合主键 (model_name, group_id) 的结构，一个分组下塞不下第二条映射。"""
+    cols = _columns(path, "model_routes")
+    return bool(cols) and "id" not in cols
+
+
 def _legacy_protocols(raw: str) -> tuple[str, ...]:
     """老的 'openai,anthropic' 逗号标记。openai 排在前面：迁移时第一个接口会分给
     已经存着候选的那个分组，而今天之前的候选全是 /v1/responses 那一侧的。"""
@@ -224,18 +243,10 @@ def _migrate_to_groups(conn: sqlite3.Connection) -> None:
         )
 
     # model_routes 的主键要从 upstream_id 换成 group_id，只能重建。此刻每个供应商
-    # 恰好一个分组，所以下面这个 join 是一对一的。
-    # 建表语句要和 _SCHEMA 保持一致（漏了 priority 的话后面 list_routes 直接报没这列）
+    # 恰好一个分组，所以下面这个 join 是一对一的。列定义共用 _ROUTE_COLUMNS，
+    # 免得两处各写一份、漏字段（以前漏过 priority）
     conn.execute("ALTER TABLE model_routes RENAME TO model_routes_pre_group")
-    conn.execute("""
-        CREATE TABLE model_routes(
-          model_name TEXT NOT NULL,
-          group_id INTEGER NOT NULL REFERENCES upstream_groups(id) ON DELETE CASCADE,
-          remote_model TEXT NOT NULL,
-          is_active INTEGER NOT NULL DEFAULT 0,
-          priority INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY(model_name, group_id)
-        )""")
+    conn.execute(f"CREATE TABLE model_routes({_ROUTE_COLUMNS})")
     conn.execute("""
         INSERT INTO model_routes(model_name, group_id, remote_model, is_active)
         SELECT o.model_name, g.id, o.remote_model, o.is_active
@@ -243,6 +254,25 @@ def _migrate_to_groups(conn: sqlite3.Connection) -> None:
         JOIN upstream_groups g ON g.upstream_id = o.upstream_id""")
     conn.execute("DROP TABLE model_routes_pre_group")
     conn.execute("ALTER TABLE upstreams DROP COLUMN api_key")
+
+
+def _migrate_route_ids(conn: sqlite3.Connection) -> None:
+    """候选加一个自增主键，唯一约束顺延到「模型 + 分组 + 上游真名」。
+
+    为什么：主键是 (model_name, group_id) 时，一个分组下只塞得下一条映射。可现实里
+    同一个站常常有好几个能用的模型 id（带日期后缀的那种尤其容易被上游下掉），
+    想把它们排成一条降级链就得允许同分组多条。完全相同的映射仍然算重复。
+
+    改主键只能重建整张表。没有别的表引用 model_routes，所以不必关外键。
+    按原来的链顺序搬，新 id 就是递增的，`ORDER BY priority, id` 的兜底次序还和以前一样。
+    """
+    conn.execute("ALTER TABLE model_routes RENAME TO model_routes_pre_id")
+    conn.execute(f"CREATE TABLE model_routes({_ROUTE_COLUMNS})")
+    conn.execute("""
+        INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)
+        SELECT model_name, group_id, remote_model, is_active, priority
+        FROM model_routes_pre_id ORDER BY model_name, priority, group_id""")
+    conn.execute("DROP TABLE model_routes_pre_id")
 
 
 _GROUPS_REBUILD = """
@@ -368,7 +398,11 @@ def init_db() -> None:
     # 判断和备份都得在自己开连接之前做完
     old_v1 = _is_pre_group_shape(path)
     old_v2 = not old_v1 and _is_pre_protocol_shape(path)
-    backup = _backup_db(path) if (old_v1 or old_v2) else ""
+    # v1 的库由 _migrate_to_groups 直接建成新形状，不用再走一遍候选主键的迁移；
+    # v2 的库有分组但候选还是复合主键，两件事都要做
+    old_v3 = not old_v1 and _is_pre_routeid_shape(path)
+    stale = old_v1 or old_v2 or old_v3
+    backup = _backup_db(path) if stale else ""
     # 重建 upstream_groups 要自己管事务和外键开关，而且得在 CREATE TABLE IF NOT EXISTS 之前
     if old_v2:
         _migrate_group_protocols(path)
@@ -378,7 +412,9 @@ def init_db() -> None:
         _add_missing_columns(conn)
         if old_v1:
             _migrate_to_groups(conn)
-        if old_v1 or old_v2:
+        elif old_v3:
+            _migrate_route_ids(conn)
+        if stale:
             _drop_legacy_bits(conn)
             _normalize_base_urls(conn)
             _backfill_log_protocol(conn)
@@ -387,7 +423,7 @@ def init_db() -> None:
             # 「no such column」，而这个检查是幂等的、几乎不花时间
             _add_missing_columns(conn)
     if backup:
-        log(f"db migrated to per-group protocol schema, backup at data/{backup}")
+        log(f"db migrated to latest schema, backup at data/{backup}")
 
 
 # ---------------------------------------------------------------- 供应商
@@ -555,38 +591,50 @@ def delete_group(group_id: int) -> bool:
 
 def list_routes() -> tuple[dict, ...]:
     query = """
-        SELECT m.model_name, m.group_id, m.remote_model, m.is_active, m.priority,
+        SELECT m.id AS route_id, m.model_name, m.group_id, m.remote_model, m.is_active, m.priority,
                g.name AS group_name, g.protocol, g.enabled AS group_enabled,
                u.id AS upstream_id, u.name AS upstream_name, u.enabled AS upstream_enabled
         FROM model_routes m
         JOIN upstream_groups g ON g.id = m.group_id
         JOIN upstreams u ON u.id = g.upstream_id
-        ORDER BY m.model_name, m.priority, m.group_id
+        ORDER BY m.model_name, m.priority, m.id
     """
     with _conn() as conn:
         return tuple(dict(r) for r in conn.execute(query))
 
 
-def set_route_order(model_name: str, group_ids: Iterable[int]) -> int:
+def get_route(route_id: int) -> dict | None:
+    """一条候选的全貌（连分组名和供应商名）。给管理接口写日志、报错用。"""
+    query = """
+        SELECT m.id AS route_id, m.model_name, m.group_id, m.remote_model, m.is_active, m.priority,
+               g.name AS group_name, g.protocol, u.id AS upstream_id, u.name AS upstream_name
+        FROM model_routes m
+        JOIN upstream_groups g ON g.id = m.group_id
+        JOIN upstreams u ON u.id = g.upstream_id
+        WHERE m.id=?
+    """
+    with _conn() as conn:
+        row = conn.execute(query, (route_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def set_route_order(model_name: str, route_ids: Iterable[int]) -> int:
     """按给定顺序重排这个模型的候选（自动降级依次尝试的顺序）。返回排到的条数。
 
     只认真的存在的候选，没提到的留在后面（priority 从 len(order) 起排，保持它们原来的相对次序）。
     """
     with _conn() as conn:
         have = [
-            r["group_id"]
+            r["id"]
             for r in conn.execute(
-                "SELECT group_id FROM model_routes WHERE model_name=? ORDER BY priority, group_id",
+                "SELECT id FROM model_routes WHERE model_name=? ORDER BY priority, id",
                 (model_name,),
             )
         ]
-        wanted = [gid for gid in group_ids if gid in have]
-        rest = [gid for gid in have if gid not in wanted]
-        for i, gid in enumerate(wanted + rest):
-            conn.execute(
-                "UPDATE model_routes SET priority=? WHERE model_name=? AND group_id=?",
-                (i, model_name, gid),
-            )
+        wanted = [rid for rid in route_ids if rid in have]
+        rest = [rid for rid in have if rid not in wanted]
+        for i, rid in enumerate(wanted + rest):
+            conn.execute("UPDATE model_routes SET priority=? WHERE id=?", (i, rid))
         return len(wanted)
 
 
@@ -600,23 +648,28 @@ def _model_protocol(conn: sqlite3.Connection, model_name: str) -> str:
     没有候选就返回空串 —— 这个模型名还不存在。"""
     row = conn.execute(
         "SELECT g.protocol FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
-        " WHERE m.model_name=? ORDER BY m.is_active DESC, m.group_id LIMIT 1",
+        " WHERE m.model_name=? ORDER BY m.is_active DESC, m.id LIMIT 1",
         (model_name,),
     ).fetchone()
     return row["protocol"] if row is not None else ""
 
 
-def add_model_route(model_name: str, group_id: int, remote_model: str) -> bool:
-    """新增一个候选；该模型的第一个候选自动成为活跃候选。已存在则返回 False。
+def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
+    """新增一个候选，返回它的 id；该模型的第一个候选自动成为活跃候选。已存在则返回 0。
+
+    「已存在」是「同一个分组下已经有一条映射到同一个上游真名的候选」。同一个分组下
+    **允许**同一个模型名的多条候选，只要各指一个不同的上游真名 —— 一个站常有好几个
+    能用的模型 id，把它们排成一条链比只能挑一个有用。
 
     模型的接口就是候选所在分组的接口，所以同一个模型名的候选必须全在同一种接口上，
     否则「这个名字在哪个接口下暴露」就没有答案了。"""
     with _conn() as conn:
         exists = conn.execute(
-            "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=?", (model_name, group_id)
+            "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
+            (model_name, group_id, remote_model),
         ).fetchone()
         if exists:
-            return False
+            return 0
         mine = _group_protocol(conn, group_id)
         theirs = _model_protocol(conn, model_name)
         if theirs and theirs != mine:
@@ -629,21 +682,24 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> bool:
             "SELECT COALESCE(MAX(priority), -1) + 1 AS p FROM model_routes WHERE model_name=?",
             (model_name,),
         ).fetchone()["p"]
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
             " VALUES(?,?,?,?,?)",
             (model_name, group_id, remote_model, 1 if count == 0 else 0, nxt),
         )
-    return True
+    return int(cur.lastrowid)
 
 
-def update_model_route(model_name: str, group_id: int, remote_model: str) -> bool:
+def update_model_route(route_id: int, remote_model: str) -> bool:
     """只改「上游那边的真实模型名」。1M 开关也是它 —— 存成 `名字[1m]` 后缀。"""
     with _conn() as conn:
-        cur = conn.execute(
-            "UPDATE model_routes SET remote_model=? WHERE model_name=? AND group_id=?",
-            (remote_model, model_name, group_id),
-        )
+        try:
+            cur = conn.execute(
+                "UPDATE model_routes SET remote_model=? WHERE id=?", (remote_model, route_id)
+            )
+        except sqlite3.IntegrityError as exc:
+            # 改成了同分组里另一条候选已经用着的真名，那两条就完全一样了
+            raise DuplicateRemote(remote_model) from exc
         return cur.rowcount > 0
 
 
@@ -666,15 +722,30 @@ def add_routes_for_group(group_id: int, model_names: Iterable[str]) -> tuple[int
             skipped.append(name)
     return added, tuple(skipped)
 
-def delete_model_route(model_name: str, group_id: int) -> bool:
+
+def delete_model_route(route_id: int) -> str:
+    """删掉一条候选，返回它的模型名（找不到返回空串）。"""
     with _conn() as conn:
-        cur = conn.execute(
+        row = conn.execute("SELECT model_name FROM model_routes WHERE id=?", (route_id,)).fetchone()
+        if row is None:
+            return ""
+        conn.execute("DELETE FROM model_routes WHERE id=?", (route_id,))
+        _reattach_active(conn, row["model_name"])
+        return row["model_name"]
+
+
+def delete_routes_in_group(model_name: str, group_id: int) -> int:
+    """把这个模型在某个分组下的候选全删掉，返回删除条数。
+
+    分组弹窗里那个勾选框就是这个语义：它答的是「这个模型在这个分组里有没有」，
+    同分组挂了好几个真名时，取消勾选自然是一起去掉。"""
+    with _conn() as conn:
+        removed = conn.execute(
             "DELETE FROM model_routes WHERE model_name=? AND group_id=?", (model_name, group_id)
-        )
-        if cur.rowcount == 0:
-            return False
-        _reattach_active(conn, model_name)
-        return True
+        ).rowcount
+        if removed:
+            _reattach_active(conn, model_name)
+        return removed
 
 
 def delete_model(model_name: str) -> int:
@@ -683,19 +754,19 @@ def delete_model(model_name: str) -> int:
         return conn.execute("DELETE FROM model_routes WHERE model_name=?", (model_name,)).rowcount
 
 
-def switch_route(model_name: str, group_id: int) -> bool:
+def switch_route(route_id: int) -> str:
+    """把流量切到这一条候选，返回它的模型名（找不到返回空串）。"""
     with _conn() as conn:
-        target = conn.execute(
-            "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=?", (model_name, group_id)
-        ).fetchone()
-        if target is None:
-            return False
-        conn.execute("UPDATE model_routes SET is_active=0 WHERE model_name=? AND is_active=1", (model_name,))
+        row = conn.execute("SELECT model_name FROM model_routes WHERE id=?", (route_id,)).fetchone()
+        if row is None:
+            return ""
+        name = row["model_name"]
         conn.execute(
-            "UPDATE model_routes SET is_active=1 WHERE model_name=? AND group_id=?",
-            (model_name, group_id),
+            "UPDATE model_routes SET is_active=0 WHERE model_name=? AND is_active=1", (name,)
         )
-    return True
+        conn.execute("UPDATE model_routes SET is_active=1 WHERE id=?", (route_id,))
+    return name
+
 
 
 def _tier_match(conn: sqlite3.Connection, model_name: str, protocol: str) -> str:
@@ -736,12 +807,12 @@ def resolve_route(model_name: str, protocol: str) -> Route | None:
 
 
 _CHAIN_QUERY = """
-    SELECT u.*, g.id AS group_id, g.name AS group_name, g.api_key, m.remote_model
+    SELECT u.*, m.id AS route_id, g.id AS group_id, g.name AS group_name, g.api_key, m.remote_model
     FROM model_routes m
     JOIN upstream_groups g ON g.id = m.group_id
     JOIN upstreams u ON u.id = g.upstream_id
     WHERE m.model_name=? AND g.protocol=? AND u.enabled=1 AND g.enabled=1
-    ORDER BY m.is_active DESC, m.priority, m.group_id
+    ORDER BY m.is_active DESC, m.priority, m.id
 """
 
 
@@ -750,6 +821,9 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
 
     第一个就是 resolve_route 的答案（生效的那个候选排最前），后面是自动降级的退路，
     顺序由 priority 决定（小的先试）。停用的供应商 / 分组不在里面。
+
+    同一个分组可以出现多次（各指一个不同的上游真名）。站级失败时 proxy 会把整个分组
+    跳掉，只有模型级的 404 才会去试同分组的下一条 —— 见 proxy.forward。
 
     档位关键字兜底和 resolve_route 是同一套：先定下实际命中的模型名，再取它的整条链。
     """
@@ -766,6 +840,7 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
             remote_model=row["remote_model"],
             group_id=row["group_id"],
             group_name=row["group_name"],
+            route_id=row["route_id"],
         )
         for row in rows
     )
@@ -792,21 +867,18 @@ def exposed_models(protocol: str = "") -> tuple[str, ...]:
 
 
 def _reattach_active(conn: sqlite3.Connection, model_name: str) -> None:
-    """删除候选后如果没有活跃候选了，把流量落到剩下的第一个候选上。"""
+    """删除候选后如果没有活跃候选了，把流量落到链上第一个候选（priority 最小的那条）。"""
     still_active = conn.execute(
         "SELECT 1 FROM model_routes WHERE model_name=? AND is_active=1", (model_name,)
     ).fetchone()
     if still_active is not None:
         return
     remaining = conn.execute(
-        "SELECT group_id FROM model_routes WHERE model_name=? ORDER BY group_id LIMIT 1",
+        "SELECT id FROM model_routes WHERE model_name=? ORDER BY priority, id LIMIT 1",
         (model_name,),
     ).fetchone()
     if remaining is not None:
-        conn.execute(
-            "UPDATE model_routes SET is_active=1 WHERE model_name=? AND group_id=?",
-            (model_name, remaining["group_id"]),
-        )
+        conn.execute("UPDATE model_routes SET is_active=1 WHERE id=?", (remaining["id"],))
 
 # ---------------------------------------------------------------- 转发记录
 
