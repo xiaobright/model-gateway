@@ -217,21 +217,30 @@ def p95_overall(rows: Iterable[dict]) -> int:
 
 # ---------------------------------------------------------------- 按包大小估 token
 #
-# 「实时」页上那个 `≈ N tok` 的标尺。转发记录里每一行都现成地放着「这条请求多少字节」
-# 和「上游报了多少 token」，所以这个比值是真的从过往经验里量出来的，不是拍的常数。
+# 「实时」页上那个 `≈ N tok` 的标尺。转发记录里每一行都现成地放着字节数和上游报的
+# token 数，所以这个比值是真的从过往经验里量出来的，不是拍的常数。
 #
-# 两个方向差两个数量级，必须分开量：上行是 JSON 正文（六七个字节一个 token），
-# 下行是 SSE 帧（每个 delta 事件一百多字节只带几个字，五十多个字节才摊到一个 token）。
+# 两个方向量的**不是同一件事**，这一点必须写清楚：
+#
+# - 上行量的是「计费口径」，而且它是准的：请求体每个字符都算进输入，字节数和 token 数
+#   一一对应，所以上行的 `≈` 可以当计费量看
+# - 下行量的是「**收到手的内容**」。计费口径这边估不出来 —— 思维链发下来的是总结过的，
+#   而计费按完整的算，思维链越多差得越远。所以下行的标尺只认没有思维链的那些记录
+#   （正文是完整的，那种记录里收到的和计费的对得上），而计费的输出量只从流末尾
+#   上游自己报的那个数读，不猜
+#
+# 另外下行只数**内容**字节，不数整条响应：SSE 帧和 JSON 结构占了大头，
+# 拿整条响应的字节数去折 token 差十倍（见 protocols.count_content）。
 
 RATIO_MIN_ROWS = 20        # 样本少于这个数就用兜底常数，别拿三条记录去定标尺
 RATIO_MAX_SPREAD = 6.0     # p90/p10 超过这个就是「字节数压根预测不了 token」，不给估值
 RATIO_TTL = 60.0           # 学出来的标尺缓存这么久：那个接口 1 秒一刷，不该每次全表扫
 
-# 兜底值取自真库两千条记录的中位数。openai 的下行是 0 = 不估：Responses API 的流里
-# 光事件框架就几十 KB，跟输出长度基本无关（实测 p90/p10 差十倍），给数字比不给更糟
+# 兜底值。上行取自真库两千条记录的中位数；下行是中英混排正文的经验值（一个 token
+# 三个字节上下），等攒够没有思维链的记录就会被真实测量顶掉
 RATIO_FALLBACK: dict[str, tuple[float, float]] = {
-    "anthropic": (6.7, 55.8),
-    "openai": (4.9, 0.0),
+    "anthropic": (6.7, 3.0),
+    "openai": (4.9, 3.0),
 }
 
 _ratio_cache: tuple[float, dict[str, dict[str, float]]] = (0.0, {})
@@ -279,9 +288,11 @@ def token_ratio() -> dict[str, dict[str, float]]:
         ctx = context_tokens(row)
         if ctx > 200 and row["req_bytes"]:
             up[name].append(row["req_bytes"] / ctx)
+        # 下行只认没有思维链的记录，而且只数内容字节，理由见本节开头
         got_out = row["output_tokens"] or 0
-        if got_out > 20 and row["resp_bytes"]:
-            down[name].append(row["resp_bytes"] / got_out)
+        content = row.get("resp_text_bytes") or 0
+        if got_out > 20 and content and not row.get("thinking"):
+            down[name].append(content / got_out)
 
     result = {
         name: {"up": _ratio_of(up[name], fb[0]), "down": _ratio_of(down[name], fb[1])}

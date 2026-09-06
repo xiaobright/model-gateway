@@ -23,10 +23,37 @@ PROXY_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 # 于是连本机上游都会绕一趟代理。回环地址一律直连。
 LOOPBACK = ("127.0.0.1", "localhost", "[::1]")
 
+# 「出口」的两个特殊值，其余一律当代理 URL（http:// 或 socks5://）
+EGRESS_SYSTEM = ""        # 跟随系统代理：httpx 自己去读环境变量和注册表
+EGRESS_DIRECT = "direct"  # 直连：把系统代理也关掉
+
 
 def loopback_mounts() -> dict[str, httpx.AsyncHTTPTransport]:
     # 每个 client 要有自己的 transport（transport 自带连接池，会随 client 一起关闭）
     return {f"all://{host}": httpx.AsyncHTTPTransport() for host in LOOPBACK}
+
+
+def client_args(egress: str) -> dict:
+    """按「出口」拼出建 client 要的那几个参数。
+
+    这是整件事唯一的开关：网关自己就是发请求的那个客户端，socket 是它自己开的，
+    所以按站换出口不需要任何代理内核 —— 内核的存在意义是替「不知道有代理」的进程
+    做拦截。
+
+    注意 `trust_env=False` 才是真的「直连」：httpx 不只看环境变量，在 Windows 上
+    还会读注册表里的系统代理。
+
+    回环 mounts 只在没指定代理时挂：它是用来抵消**隐式**的系统代理的（否则连本机
+    上游都要绕一趟 Clash）。明确给某个站指了代理，就按说的走 —— 真实场景里没人会给
+    127.0.0.1 的站配代理，而测试要的正是「字节真的从那扇门出去了」。
+    """
+    egress = (egress or "").strip()
+    proxy = None if egress in (EGRESS_SYSTEM, EGRESS_DIRECT) else egress
+    return {
+        "mounts": {} if proxy else loopback_mounts(),
+        "trust_env": egress == EGRESS_SYSTEM,
+        "proxy": proxy,
+    }
 
 
 REQ_DROP = {"host", "content-length", "transfer-encoding", "connection", "keep-alive"}
@@ -63,26 +90,38 @@ def has_end_marker(
 
 router = APIRouter()
 
-_client: httpx.AsyncClient | None = None
+_clients: dict[str, httpx.AsyncClient] = {}
 _client_loop: asyncio.AbstractEventLoop | None = None
 
 
-def get_client() -> httpx.AsyncClient:
-    """全局复用一个 AsyncClient，省掉每个请求一次 TLS 握手（对远端公益站是几百 ms 的差别）。"""
-    global _client, _client_loop
+def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
+    """按「出口」复用 client，省掉每个请求一次 TLS 握手（对远端公益站是几百 ms 的差别）。
+
+    一个出口一个 client：代理是建 client 时定的，没法按请求换。出口最多也就三五种，
+    池子小得可以忽略。
+    """
+    global _client_loop
     loop = asyncio.get_running_loop()
-    if _client is None or _client.is_closed or _client_loop is not loop:
-        _client = httpx.AsyncClient(timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS, mounts=loopback_mounts())
+    if _client_loop is not loop:
+        _clients.clear()
         _client_loop = loop
-    return _client
+    client = _clients.get(egress)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS, **client_args(egress)
+        )
+        _clients[egress] = client
+    return client
 
 
 async def aclose_client() -> None:
-    global _client, _client_loop
-    if _client is not None and not _client.is_closed:
-        with contextlib.suppress(Exception):
-            await _client.aclose()
-    _client, _client_loop = None, None
+    global _client_loop
+    for client in list(_clients.values()):
+        if not client.is_closed:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+    _clients.clear()
+    _client_loop = None
 
 
 def _error(proto: protocols.Protocol, status: int, message: str) -> JSONResponse:
@@ -192,7 +231,6 @@ async def forward(
     candidates = failover.order_chain(chain) if can_failover else [chain[0]]
 
     started = time.monotonic()
-    client = get_client()
     resp: httpx.Response | None = None
     route = candidates[0]
     remote = ""
@@ -248,6 +286,8 @@ async def forward(
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
         label = f"{route.upstream.name}/{route.group_name}"
+        # 出口是**供应商**的属性，而每个候选可能属于不同的供应商，所以 client 在循环里取
+        client = get_client(route.upstream.egress)
         inflight.set_route(
             call, attempt=attempt, upstream=route.upstream.name, group_name=route.group_name,
             group_id=route.group_id, remote_model=remote, req_bytes=len(sent_body),
@@ -341,6 +381,8 @@ async def forward(
 
     async def relay() -> AsyncIterator[bytes]:
         sent = 0
+        text_bytes = 0
+        thinking = False
         seen_end = False
         head = bytearray()
         tail = bytearray()
@@ -361,11 +403,17 @@ async def forward(
                         got = proto.extract_usage(bytes(head), b"")
                         inflight.usage(call, tokens_in=proto.context_tokens(got))
                 tail.extend(chunk)
+                # 这一块里有多少字节是真内容、有没有思维链。整条响应的字节数里 SSE 帧
+                # 占了大头，拿它折 token 会差十倍；而思维链发来的是总结、计费按完整的算，
+                # 所以这两件事都得单独记，见 protocols.count_content
+                got, think = proto.count_content(chunk)
+                text_bytes += got
+                thinking = thinking or think
                 if not seen_end and has_end_marker(tail, len(chunk), proto.end_markers):
                     seen_end = True
                 if len(tail) > TAIL_KEEP:
                     del tail[: len(tail) - TAIL_KEEP]
-                inflight.progress(call, sent)
+                inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
                 yield chunk
         except httpx.HTTPError as exc:
             note = "upstream_abort"
@@ -399,6 +447,7 @@ async def forward(
                     stream_flag=stream_flag, req_bytes=won_bytes,
                     resp_bytes=sent, elapsed=time.monotonic() - started,
                     usage=usage, note=note, attempt=won_attempt,
+                    text_bytes=text_bytes, thinking=thinking,
                 )
             with contextlib.suppress(Exception):
                 await upstream_resp.aclose()
@@ -426,6 +475,8 @@ def _record(
     usage: protocols.Usage,
     note: str,
     attempt: int = 1,
+    text_bytes: int = 0,
+    thinking: bool = False,
 ) -> None:
     input_tokens, output_tokens, cached_tokens = usage
     try:
@@ -440,6 +491,8 @@ def _record(
             stream=stream_flag,
             req_bytes=req_bytes,
             resp_bytes=resp_bytes,
+            resp_text_bytes=text_bytes,
+            thinking=thinking,
             duration_ms=int(elapsed * 1000),
             input_tokens=input_tokens,
             output_tokens=output_tokens,

@@ -63,6 +63,10 @@ class Call:
     phase: str = CONNECT
     status: int = 0
     sent: int = 0                   # 已经转给下游多少字节
+    # 这些字节里有多少是**内容**（SSE 帧和 JSON 结构不算），以及里面有没有思维链。
+    # 思维链发来的是总结、计费按完整的算，所以「收到多少」和「计费多少」是两个数
+    text_bytes: int = 0
+    thinking: bool = False
     # 上游自己报的 token 数（0 = 还没报）。有真数就不用按字节估了 —— Anthropic 把输入
     # token 放在流开头的 message_start 里，所以它往往在第一块字节里就到手了
     tokens_in: int = 0
@@ -126,6 +130,8 @@ def set_route(
     # 换了候选就是换了一个站在算账，上一个报的数不作数
     call.tokens_in = 0
     call.tokens_out = 0
+    call.text_bytes = 0
+    call.thinking = False
 
 
 def phase(call: Call | None, name: str, *, status: int = 0) -> None:
@@ -149,10 +155,12 @@ def usage(call: Call | None, *, tokens_in: int = 0, tokens_out: int = 0) -> None
     call.tokens_out = max(call.tokens_out, tokens_out)
 
 
-def progress(call: Call | None, sent: int) -> None:
+def progress(call: Call | None, sent: int, *, text_bytes: int = 0, thinking: bool = False) -> None:
     if call is None:
         return
     call.sent = sent
+    call.text_bytes = text_bytes
+    call.thinking = call.thinking or thinking
 
 
 def failed(call: Call | None, *, status: int, note: str, ms: int) -> None:
@@ -252,6 +260,8 @@ def _as_dict(call: Call) -> dict[str, Any]:
         "status": call.status,
         "req_bytes": call.req_bytes,
         "sent": call.sent,
+        "text_bytes": call.text_bytes,
+        "thinking": call.thinking,
         "tokens_in": call.tokens_in,
         "tokens_out": call.tokens_out,
         "elapsed_ms": call.elapsed_ms,

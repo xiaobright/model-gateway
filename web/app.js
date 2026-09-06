@@ -302,6 +302,51 @@ function baseHint() {
     : '填到域名（或站点路径）为止，末尾的 /v1 会被自动去掉';
 }
 
+/* 出口：'' 跟随系统 / 'direct' 直连 / 一个代理 URL。界面上拆成「三选一 + URL」两个控件，
+   因为前两个是选择、第三个才要打字。 */
+const EGRESS_TIP = {
+  '': '默认。httpx 会读环境变量和 Windows 注册表里的系统代理（Clash 那种），所以这个站跟着你的代理走',
+  direct: '不走任何代理，从本机自己的出口出去。被机房 IP 拉黑的站要用这个',
+  proxy: '只有这个站走这个代理。填 http:// 或 socks5://（vless/ss 得先由本机内核落成一个这样的端口）',
+};
+
+function egressKind() {
+  return $('up-egress-kind').value;
+}
+
+function egressValue() {
+  const kind = egressKind();
+  return kind === 'proxy' ? $('up-egress-url').value.trim() : kind;
+}
+
+function egressHint() {
+  const kind = egressKind();
+  $('up-egress-url').hidden = kind !== 'proxy';
+  $('up-egress-hint').textContent = EGRESS_TIP[kind] || '';
+}
+
+function fillEgress(value) {
+  const raw = (value || '').trim();
+  const kind = raw === '' || raw === 'direct' ? raw : 'proxy';
+  $('up-egress-kind').value = kind;
+  $('up-egress-url').value = kind === 'proxy' ? raw : '';
+  egressHint();
+}
+
+/* 「测一下」：同一个站从每扇门各打一次。公益站按 IP 屏蔽，而校园网 IP 和机房 IP
+   各自被不同的站拉黑 —— 这个问题只能实测，猜不出来。 */
+async function probeUpstream() {
+  if (state.editing === null) return toast('先保存这个供应商，再测出口', 'err');
+  const host = $('up-egress-hint');
+  host.textContent = '正在从每扇门各打一次…';
+  const data = await api('POST', `/admin/api/upstreams/${state.editing}/probe`);
+  host.innerHTML = data.results.map((r) => {
+    const dot = r.ok ? (r.status < 400 ? 'good' : 'warn') : 'crit';
+    const what = r.ok ? `${r.status}` : esc(r.error.slice(0, 60));
+    return `<span class="dot dot-${dot}"></span>${esc(r.label)} ${what} <span class="dim">${r.ms}ms</span>`;
+  }).join(' &nbsp; ') + '<br><span class="dim">拿到状态码就算这扇门能到站（401 也算 —— 问的是网络，不是 key）</span>';
+}
+
 function openUpstream(id) {
   state.editing = id;
   const u = id === null ? null : state.upstreams.find((x) => x.id === id);
@@ -310,6 +355,7 @@ function openUpstream(id) {
   $('up-base').value = u ? u.base_url : '';
   $('up-override').value = u ? (u.header_override || '') : '';
   $('up-enabled').checked = u ? u.enabled : true;
+  fillEgress(u ? u.egress : '');
   baseHint();
   markOverride();
 
@@ -342,6 +388,7 @@ function upstreamPayload() {
     base_url: $('up-base').value.trim(),
     enabled: $('up-enabled').checked,
     header_override: $('up-override').value.trim(),
+    egress: egressValue(),
   };
 }
 
@@ -745,6 +792,7 @@ const ACTIONS = {
 
   'new-upstream': () => openUpstream(null),
   'edit-upstream': ({ uid }) => openUpstream(Number(uid)),
+  'probe-upstream': () => probeUpstream(),
 
   // 整行都是展开开关，所以要放过「我只是想选中那段 base_url」
   'toggle-groups': ({ uid }) => {
@@ -1112,6 +1160,7 @@ $('rt-iface').addEventListener('change', () => {
 // 站根填/改的时候把补出来的两个地址实时显示出来，免得又把 /v1 带上
 $('up-base').addEventListener('input', baseHint);
 $('up-override').addEventListener('input', markOverride);
+$('up-egress-kind').addEventListener('change', egressHint);
 
 /* 手填模型名：回车直接加，别提交整个表单（那是保存分组的按钮）。
    过滤框也一样 —— 它是 type=search，回车默认会提交表单。 */

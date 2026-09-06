@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS upstreams(
   base_url TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   header_override TEXT NOT NULL DEFAULT '',
+  egress TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS upstream_groups(
@@ -65,6 +66,8 @@ CREATE TABLE IF NOT EXISTS request_log(
   stream INTEGER NOT NULL,
   req_bytes INTEGER NOT NULL,
   resp_bytes INTEGER NOT NULL,
+  resp_text_bytes INTEGER NOT NULL DEFAULT 0,
+  thinking INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL,
   input_tokens INTEGER,
   output_tokens INTEGER,
@@ -115,6 +118,8 @@ class Upstream:
     api_key: str            # 转发时由命中的分组填进来；列表接口里一律是空串
     enabled: bool
     header_override: str = ""
+    # 从哪扇门出去：'' 跟随系统代理（今天的默认）/ 'direct' 直连 / 一个代理 URL
+    egress: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +167,7 @@ def _to_upstream(row: sqlite3.Row, api_key: str = "") -> Upstream:
         api_key=api_key,
         enabled=bool(row["enabled"]),
         header_override=row["header_override"],
+        egress=row["egress"],
     )
 
 
@@ -372,6 +378,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     wanted = {
         "upstreams": [
             ("header_override", "TEXT NOT NULL DEFAULT ''"),
+            # 这个站从哪扇门出去：'' 跟随系统代理 / 'direct' 直连 / 一个代理 URL。
+            # 现实里同一台机器上「有的站必须走代理、有的站必须别走代理」是常态 ——
+            # 公益站按 IP 屏蔽，校园网 IP 和机房 IP 各自被不同的站拉黑
+            ("egress", "TEXT NOT NULL DEFAULT ''"),
         ],
         "model_routes": [
             # 自动降级的尝试顺序：小的先试。0 = 还没排过，按 group_id 兜底
@@ -383,6 +393,11 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             ("group_name", "TEXT NOT NULL DEFAULT ''"),
             # 这条记录是这个请求的第几次尝试；> 1 就是被自动降级救回来的
             ("attempt", "INTEGER NOT NULL DEFAULT 1"),
+            # 整条响应里有多少字节是**内容**（SSE 帧不算），以及里面有没有思维链。
+            # 「多少字节摊一个 token」这把标尺只认没有思维链的记录：思维链发来的是
+            # 总结、计费按完整的算，那种记录的字节数和 token 数不是一回事
+            ("resp_text_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ("thinking", "INTEGER NOT NULL DEFAULT 0"),
         ],
     }
     for table, columns in wanted.items():
@@ -454,6 +469,7 @@ def create_upstream(
     base_url: str,
     header_override: str = "",
     enabled: bool = True,
+    egress: str = "",
 ) -> Upstream:
     """只建供应商本身。分组（key + 接口）由调用方紧接着建 —— 接口得选，猜不出来。"""
     base = normalize_base(base_url)
@@ -461,8 +477,9 @@ def create_upstream(
         _check_base_url(conn, base)
         try:
             cur = conn.execute(
-                "INSERT INTO upstreams(name, base_url, header_override, enabled) VALUES(?,?,?,?)",
-                (name, base, header_override, int(enabled)),
+                "INSERT INTO upstreams(name, base_url, header_override, enabled, egress)"
+                " VALUES(?,?,?,?,?)",
+                (name, base, header_override, int(enabled), egress),
             )
         except sqlite3.IntegrityError as exc:
             raise DuplicateName(name) from exc
@@ -476,14 +493,16 @@ def update_upstream(
     base_url: str,
     enabled: bool,
     header_override: str = "",
+    egress: str = "",
 ) -> bool:
     base = normalize_base(base_url)
     with _conn() as conn:
         _check_base_url(conn, base, upstream_id)
         try:
             cur = conn.execute(
-                "UPDATE upstreams SET name=?, base_url=?, enabled=?, header_override=? WHERE id=?",
-                (name, base, int(enabled), header_override, upstream_id),
+                "UPDATE upstreams SET name=?, base_url=?, enabled=?, header_override=?, egress=?"
+                " WHERE id=?",
+                (name, base, int(enabled), header_override, egress, upstream_id),
             )
         except sqlite3.IntegrityError as exc:
             raise DuplicateName(name) from exc
@@ -900,15 +919,18 @@ def insert_request(
     protocol: str = "",
     group_name: str = "",
     attempt: int = 1,
+    resp_text_bytes: int = 0,
+    thinking: bool = False,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             "INSERT INTO request_log(client, model, remote_model, protocol, upstream, group_name,"
             " status, stream, req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens,"
-            " cached_tokens, note, attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " cached_tokens, note, attempt, resp_text_bytes, thinking)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (client, model, remote_model, protocol, upstream, group_name, status, int(stream),
              req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens, note,
-             attempt),
+             attempt, resp_text_bytes, int(thinking)),
         )
         conn.execute(
             "DELETE FROM request_log WHERE id <= (SELECT MAX(id) - ? FROM request_log)", (LOG_KEEP_ROWS,)

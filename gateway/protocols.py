@@ -25,6 +25,19 @@ _OUT = re.compile(rb'"output_tokens":\s*(\d+)')
 _CACHED = re.compile(rb'"cached_tokens":\s*(\d+)')
 _CACHE_READ = re.compile(rb'"cache_read_input_tokens":\s*(\d+)')
 
+# 「真正拿到手的内容有多少字节」。SSE 帧和 JSON 结构不算 —— 那些字节不是内容，
+# Responses API 的流里光事件框架就几十 KB，按整条响应的字节数去折 token 会差十倍。
+# 冒号后面允许空格：紧凑的 SSE 里没有，但 json.dumps 的默认输出有。
+def _string_field(name: str) -> re.Pattern[bytes]:
+    return re.compile(rb'"' + name.encode() + rb'":\s*"((?:[^"\\]|\\.)*)"')
+
+
+_ANTHROPIC_TEXT = _string_field("text")
+_ANTHROPIC_THINK = _string_field("thinking")
+# Responses API 的正文、推理摘要、工具参数都走 "delta":"…"（对象形式的 delta 不匹配）
+_OPENAI_TEXT = _string_field("delta")
+_OPENAI_THINK = re.compile(rb"reasoning_summary")
+
 
 def _last(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
     """最后一次出现的值：流式 usage 会被多次改写，最后那次才是终值。"""
@@ -71,6 +84,26 @@ def anthropic_context(usage: Usage) -> int:
     return (usage[0] or 0) + (usage[2] or 0)
 
 
+def _total(pattern: re.Pattern[bytes], chunk: bytes) -> int:
+    return sum(len(m) for m in pattern.findall(chunk))
+
+
+def anthropic_content(chunk: bytes) -> tuple[int, bool]:
+    """这一块里有多少字节是内容，以及里面有没有思维链。
+
+    思维链要单独认出来是因为**它是总结过的，而计费按完整的算** —— 有思维链的那些流，
+    「收到多少」和「被计多少 token」根本不是一回事，不能拿来定标尺。正文（`text_delta`）
+    是完整的，所以没有思维链的流就是干净样本。
+    """
+    think = _total(_ANTHROPIC_THINK, chunk)
+    return _total(_ANTHROPIC_TEXT, chunk) + think, think > 0
+
+
+def openai_content(chunk: bytes) -> tuple[int, bool]:
+    """Responses API 同理。推理摘要也是「发来的是摘要、计费按完整的算」。"""
+    return _total(_OPENAI_TEXT, chunk), bool(_OPENAI_THINK.search(chunk))
+
+
 def openai_error(status: int, message: str) -> dict:
     return {"error": {"message": message, "type": "gateway_error", "code": status}}
 
@@ -114,6 +147,8 @@ class Protocol:
     extract_usage: Callable[[bytes, bytes], Usage]
     # usage -> 整个上下文的 token 数。两种接口的 input_tokens 含不含缓存不一样
     context_tokens: Callable[[Usage], int]
+    # 一块字节 -> (里面有多少字节是内容, 有没有思维链)
+    count_content: Callable[[bytes], tuple[int, bool]]
     error_body: Callable[[int, str], dict]
     auth_headers: Callable[[str], dict[str, str]]
     # 客户端没带时补上的头
@@ -127,6 +162,7 @@ OPENAI = Protocol(
     end_markers=(b"response.completed", b"[DONE]"),
     extract_usage=openai_usage,
     context_tokens=openai_context,
+    count_content=openai_content,
     error_body=openai_error,
     auth_headers=openai_auth,
 )
@@ -138,6 +174,7 @@ ANTHROPIC = Protocol(
     end_markers=(b"message_stop", b"[DONE]"),
     extract_usage=anthropic_usage,
     context_tokens=anthropic_context,
+    count_content=anthropic_content,
     error_body=anthropic_error,
     auth_headers=anthropic_auth,
     defaults={"anthropic-version": "2023-06-01"},

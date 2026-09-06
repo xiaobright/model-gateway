@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 import threading
@@ -161,6 +162,12 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                         "type": "content_block_delta", "index": 0,
                         "delta": {"type": "text_delta", "text": DELTA_TEXT},
                     })
+                if mode == "thinking":
+                    # 思维链：发来的是总结过的，但计费按完整的算
+                    yield sse("content_block_delta", {
+                        "type": "content_block_delta", "index": 1,
+                        "delta": {"type": "thinking_delta", "thinking": "想了很久" * 20},
+                    })
                 if mode == "no_end":
                     return          # 劣质上游：一句结束事件都不发
                 yield sse("message_delta", {
@@ -193,6 +200,78 @@ def wait_for_row(client: httpx.Client, timeout: float = 6.0) -> dict:
             return rows[0]
         time.sleep(0.05)
     raise AssertionError("等不到转发记录")
+
+
+class MockProxy:
+    """一个最小的 HTTP 代理：读请求行里的绝对 URL，连过去，然后双向对拷。
+
+    为什么要真写一个：「出口」这件事只有「字节真的从那扇门出去了」才算验过 ——
+    光测「填个死端口会失败」证明不了流量走的是代理而不是直连。
+    只支持明文 HTTP（mock 上游都是 http://），所以不用管 CONNECT。
+    """
+
+    def __init__(self) -> None:
+        self.port = free_port()
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.seen: list[str] = []           # 经过它的那些绝对 URL
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop: asyncio.Event | None = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    async def _pump(self, reader, writer) -> None:
+        with contextlib.suppress(Exception):
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        with contextlib.suppress(Exception):
+            writer.close()
+
+    async def _handle(self, reader, writer) -> None:
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            line, rest = head.split(b"\r\n", 1)
+            method, target, version = line.split(b" ")
+            self.seen.append(target.decode())
+            url = httpx.URL(target.decode())
+            up_r, up_w = await asyncio.open_connection(url.host, url.port or 80)
+            # 绝对形式改回起始行形式，其余头原样带过去
+            up_w.write(b" ".join([method, url.raw_path or b"/", version]) + b"\r\n" + rest)
+            await up_w.drain()
+        except Exception:
+            with contextlib.suppress(Exception):
+                writer.close()
+            return
+        # 剩下的（请求体、响应、流）两边对拷就行，不用自己解 Content-Length
+        await asyncio.gather(self._pump(reader, up_w), self._pump(up_r, writer))
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._stop = asyncio.Event()
+
+        async def serve() -> None:
+            server = await asyncio.start_server(self._handle, "127.0.0.1", self.port)
+            self._ready.set()
+            await self._stop.wait()
+            server.close()
+            with contextlib.suppress(Exception):
+                await server.wait_closed()
+
+        try:
+            self._loop.run_until_complete(serve())
+        finally:
+            self._loop.close()
+
+    def __enter__(self) -> "MockProxy":
+        self._thread.start()
+        assert self._ready.wait(5), "代理没起来"
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._loop is not None and self._stop is not None:
+            self._loop.call_soon_threadsafe(self._stop.set)
+        self._thread.join(timeout=3)
 
 
 class MockUpstream:
@@ -1794,30 +1873,154 @@ def test_token_ratio_is_learned_from_the_log(gateway):
     """`≈ N tok` 的标尺是从转发记录里量出来的，不是拍的常数。"""
     from gateway import db, stats as stats_mod
 
-    def logged(protocol: str, req: int, resp: int, it: int, ot: int, ct: int) -> None:
+    def logged(protocol: str, req: int, text: int, it: int, ot: int, ct: int,
+               thinking: bool = False) -> None:
         db.insert_request(
             client="Claude Code", model="m", upstream="siteA", status=200, stream=True,
-            req_bytes=req, resp_bytes=resp, duration_ms=100,
-            input_tokens=it, output_tokens=ot, cached_tokens=ct, note="ok", protocol=protocol,
+            req_bytes=req, resp_bytes=text * 20, resp_text_bytes=text, thinking=thinking,
+            duration_ms=100, input_tokens=it, output_tokens=ot, cached_tokens=ct,
+            note="ok", protocol=protocol,
         )
 
-    # 25 条整整齐齐的：上行 10 字节一个 token（上下文 = 800 + 200 缓存），下行 100 字节一个
+    # 25 条整整齐齐的：上行 10 字节一个 token（上下文 = 800 + 200 缓存），
+    # 下行 4 字节一个（只数内容字节，不数整条响应 —— 上面故意让 resp_bytes 是它的 20 倍）
     for _ in range(25):
-        logged("anthropic", req=10_000, resp=50_000, it=800, ot=500, ct=200)
+        logged("anthropic", req=10_000, text=2_000, it=800, ot=500, ct=200)
     stats_mod.reset()
-    assert stats_mod.token_ratio()["anthropic"] == {"up": 10.0, "down": 100.0}
+    assert stats_mod.token_ratio()["anthropic"] == {"up": 10.0, "down": 4.0}
 
-    # 下行忽大忽小（差 10 倍）时不给估值：那说明字节数里有个跟 token 数无关的大常数项，
-    # 再乘一个系数也救不回来，界面上宁可少一段
-    for i in range(25):
-        logged("openai", req=5_000, resp=20_000 if i % 2 else 200_000, it=1000, ot=200, ct=0)
+    # 有思维链的记录不能进下行的标尺：发下来的是总结、计费按完整的算，
+    # 这种记录里「收到多少字节」和「被计多少 token」不是一回事
+    for _ in range(200):
+        logged("openai", req=5_000, text=200, it=1000, ot=5_000, ct=0, thinking=True)
     stats_mod.reset()
     ratio = stats_mod.token_ratio()["openai"]
     assert ratio["up"] == 5.0, "上行照旧量得出来"
-    assert ratio["down"] == 0.0, "下行张幅太大 = 估不出来"
+    assert ratio["down"] == stats_mod.RATIO_FALLBACK["openai"][1], "全是带思维链的 -> 退回兜底"
+
+    # 忽大忽小时干脆不给估值：那说明字节数里有个跟 token 数无关的大常数项
+    for i in range(25):
+        logged("anthropic", req=10_000, text=100 if i % 2 else 4_000, it=800, ot=100, ct=200)
+    stats_mod.reset()
+    assert stats_mod.token_ratio()["anthropic"]["down"] == 0.0, "张幅太大 = 估不出来"
 
     # 前端拿到的就是这份标尺
-    assert gateway.get("/admin/api/inflight").json()["tokens"]["openai"]["down"] == 0.0
+    assert gateway.get("/admin/api/inflight").json()["tokens"]["anthropic"]["down"] == 0.0
+
+
+def test_thinking_is_counted_apart_from_the_text(gateway):
+    """思维链要单独认出来：发下来的是总结，计费按完整的算，所以「收到的」明显小于「计费的」。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+
+        resp = gateway.post("/v1/messages", json=msg("opus", stream=True, mode="thinking"))
+        assert resp.status_code == 200
+        call = wait_inflight(gateway, lambda d: d["recent"] and not d["calls"])["recent"][0]
+        assert call["thinking"] is True
+        # 只数内容字节：整条响应里 SSE 帧占了大头，两者差着量级
+        assert 0 < call["text_bytes"] < call["sent"]
+
+        row = wait_for_row(gateway)
+        assert (row["thinking"], row["resp_text_bytes"]) == (1, call["text_bytes"])
+
+        # 没有思维链的那条：标一个 0，可以进标尺
+        resp = gateway.post("/v1/messages", json=msg("opus", stream=True))
+        assert resp.status_code == 200
+        clean = wait_rows(gateway, 2)[-1]
+        assert clean["thinking"] == 0 and clean["resp_text_bytes"] > 0
+
+
+# ================================================================ 出口（每个站从哪扇门出去）
+#
+# 现实里同一台机器上「有的站必须走代理、有的站必须别走代理」是常态：公益站按 IP 屏蔽，
+# 而校园网 IP 和机房 IP 各自被不同的站拉黑。出口是**供应商**的属性，和 base_url 同一层。
+
+
+def set_egress(client: httpx.Client, name: str, egress: str) -> None:
+    row = next(u for u in client.get("/admin/api/upstreams").json() if u["name"] == name)
+    resp = client.put(
+        f"/admin/api/upstreams/{row['id']}",
+        json={"name": row["name"], "base_url": row["base_url"], "enabled": True, "egress": egress},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["egress"] == egress
+
+
+def test_egress_sends_that_site_through_the_proxy(gateway):
+    """填了代理的站，字节真的从那扇门出去；没填的站照旧不走。"""
+    with MockProxy() as px, MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA")
+        g_b = add_upstream(gateway, b, "siteB")
+        add_route(gateway, "via-proxy", g_a, "gpt-remote")
+        add_route(gateway, "direct-one", g_b, "gpt-remote")
+        set_egress(gateway, "siteA", px.url)
+
+        assert gateway.post("/v1/responses", json={"model": "via-proxy"}).json()["upstream"] == "siteA"
+        assert [u for u in px.seen if str(a.port) in u], f"代理没看到这个请求: {px.seen}"
+
+        before = len(px.seen)
+        assert gateway.post("/v1/responses", json={"model": "direct-one"}).json()["upstream"] == "siteB"
+        assert len(px.seen) == before, "没配出口的站不该从代理走"
+
+        # 拉模型列表也得按出口走，否则「转发好的、拉列表失败」会被当成 key 填错
+        assert gateway.get(f"/admin/api/groups/{g_a}/remote-models").status_code == 200
+        assert len([u for u in px.seen if "/v1/models" in u]) == 1
+        assert gateway.get(f"/admin/api/groups/{g_b}/remote-models").status_code == 200
+        assert len([u for u in px.seen if "/v1/models" in u]) == 1
+
+
+def test_direct_really_turns_the_system_proxy_off():
+    """「直连」必须连 trust_env 一起关掉。
+
+    httpx 不只看 HTTP_PROXY 这类环境变量，在 Windows 上还会读注册表里的系统代理
+    （Clash 那种），而注册表的 bypass 列表通常是空的。只把 proxy 设成 None 的话，
+    「让这个站绕过代理」这件事根本没做到 —— 而这正是被机房 IP 拉黑的站唯一的出路。
+    """
+    from gateway import proxy as proxy_mod
+
+    follow = proxy_mod.client_args("")
+    direct = proxy_mod.client_args("direct")
+    via = proxy_mod.client_args("http://127.0.0.1:7890")
+
+    assert follow["trust_env"] is True and follow["proxy"] is None
+    assert direct["trust_env"] is False and direct["proxy"] is None
+    assert via["trust_env"] is False and via["proxy"] == "http://127.0.0.1:7890"
+    # 回环 mounts 是用来抵消**隐式**的系统代理的，所以只在没指定代理时挂
+    assert follow["mounts"] and direct["mounts"] and not via["mounts"]
+
+
+def test_egress_only_takes_proxy_urls(gateway):
+    """vless / ss 这类得先由本机内核落成一个 http/socks 端口，直接填进来只会在转发时才炸。"""
+    with MockUpstream("siteA") as a:
+        add_upstream(gateway, a, "siteA")
+        row = next(u for u in gateway.get("/admin/api/upstreams").json() if u["name"] == "siteA")
+        resp = gateway.put(
+            f"/admin/api/upstreams/{row['id']}",
+            json={"name": "siteA", "base_url": row["base_url"], "egress": "vless://whatever"},
+        )
+        assert resp.status_code == 400 and "http://" in resp.text
+
+
+def test_probe_reports_which_door_works(gateway):
+    """「测一下」：同一个站从每扇门各打一次。这个问题只能实测，猜不出来。"""
+    with MockProxy() as px, MockUpstream("siteA") as a:
+        add_upstream(gateway, a, "siteA")
+        row = next(u for u in gateway.get("/admin/api/upstreams").json() if u["name"] == "siteA")
+        set_egress(gateway, "siteA", px.url)
+
+        data = gateway.post(f"/admin/api/upstreams/{row['id']}/probe").json()
+        by_label = {r["label"]: r for r in data["results"]}
+        assert set(by_label) == {"跟随系统", "直连", "这个代理"}
+        assert all(r["ok"] and r["status"] == 200 for r in data["results"]), data
+        assert data["current"] == px.url
+
+        # 换成一个没人听的端口：那扇门报不通，另外两扇照旧通
+        set_egress(gateway, "siteA", f"http://127.0.0.1:{free_port()}")
+        data = gateway.post(f"/admin/api/upstreams/{row['id']}/probe").json()
+        by_label = {r["label"]: r for r in data["results"]}
+        assert by_label["这个代理"]["ok"] is False and by_label["这个代理"]["error"]
+        assert by_label["直连"]["ok"] is True
 
 
 

@@ -381,16 +381,17 @@ function trailRow(t) {
     </div>`;
 }
 
-/* 包大小 -> token 数的估值。标尺是后端从转发记录里量出来的（stats.token_ratio）：
-   上行六七个字节一个 token，下行的 SSE 帧要五十多个字节才摊一个。
+/* 包大小 -> token 数的估值。标尺是后端从转发记录里量出来的（stats.token_ratio）。
 
-   量不出来的方向后端给 0，这里就什么都不显示 —— Codex 那种流光事件框架就几十 KB，
-   跟输出长度基本无关，给一个差十倍的数比不给更糟。 */
+   两个方向量的不是同一件事：上行的 `≈` 可以当**计费量**看（请求体每个字符都算进输入）；
+   下行的 `≈` 是**收到手的内容**有多少 token，跟计费量不等 —— 思维链发下来的是总结过的，
+   计费按完整的算。所以计费的输出量只认流末尾上游报的那个数，不拿字节去猜。 */
 function estTok(bytes, dir, proto) {
   const ratio = ((state.tokens || {})[proto] || {})[dir] || 0;
   if (!bytes || !ratio) return '';
-  const tip = `按过往记录 ${ratio} 字节摊一个 token 估的，不是上游报的数`;
-  return ` <span title="${esc(tip)}">≈ ${fmtTokens(Math.round(bytes / ratio))} tok</span>`;
+  const what = dir === 'up' ? '按过往记录估的计费量' : '按过往记录估的「收到的内容」，不是计费量';
+  return ` <span title="${esc(what)}：${ratio} 字节一个 token">`
+    + `≈ ${fmtTokens(Math.round(bytes / ratio))} tok</span>`;
 }
 
 /** 上游自己报的数（加粗）优先，没报就按字节估 */
@@ -401,11 +402,16 @@ function upText(c) {
   return `上行 ${fmtBytes(c.req_bytes)}${real}`;
 }
 
+/* 「收 386KB · 计费输出 9.9k tok」。流还在跑的时候只有「收到的内容」这一个口径，
+   计费量要等末尾那个 usage —— 有思维链时两者会差不少，所以打个标说清楚为什么。 */
 function downText(c, label) {
+  const think = c.thinking
+    ? ' <span class="tag" title="思维链发下来的是总结过的，但计费按完整的算 —— 所以「收到的」会明显小于「计费的」">思维链</span>'
+    : '';
   const real = c.tokens_out
-    ? ` · 输出 <b title="上游自己报的数">${fmtTokens(c.tokens_out)}</b> tok`
-    : estTok(c.sent, 'down', c.protocol);
-  return `<span class="dim">${label} ${fmtBytes(c.sent)}${real}</span>`;
+    ? ` · 计费输出 <b title="上游自己报的数">${fmtTokens(c.tokens_out)}</b> tok`
+    : estTok(c.text_bytes, 'down', c.protocol);
+  return `<span class="dim">${label} ${fmtBytes(c.sent)}${real}</span>${think}`;
 }
 
 function callHtml(c) {
@@ -646,6 +652,15 @@ export function renderUpGroups() {
   }
 }
 
+/* 出口不是「跟随系统」时在地址后面标一下：一屏上哪个站走的是另一扇门，
+   得能一眼看出来，不然只有点进编辑才知道。 */
+function egressTag(u) {
+  const raw = (u.egress || '').trim();
+  if (!raw) return '';
+  if (raw === 'direct') return ' <span class="tag" title="不走系统代理，从本机自己的出口出去">直连</span>';
+  return ` <span class="tag tag-accent" title="只有这个站走 ${esc(raw)}">走代理</span>`;
+}
+
 export function renderUpstreams() {
   const list = state.upstreams;
   $('upstream-count').textContent = `${list.length} 个`;
@@ -680,7 +695,7 @@ export function renderUpstreams() {
         ${esc(u.name)}${u.enabled ? '' : ' <span class="tag"><span class="dot dot-off"></span>停用</span>'}
         <div class="up-sub">${ifaceTags(u)}<span class="tag">${groups.length} 组</span></div>
       </td>
-      <td class="mono dim truncate" title="${esc(u.base_url)}">${esc(u.base_url)}</td>
+      <td class="mono dim truncate" title="${esc(u.base_url)}">${esc(u.base_url)}${egressTag(u)}</td>
       <td>${modelTags(modelsOfUpstream(u.id))}</td>
       <td class="nowrap">${protoTags(h)}</td>
       <td class="num nowrap">${stat}</td>

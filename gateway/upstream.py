@@ -72,12 +72,16 @@ def parse_override(raw: str) -> dict[str, str | None]:
 
 
 async def fetch_remote_models(
-    base_url: str, api_key: str, header_override: str = "", protocol: str = "openai"
+    base_url: str, api_key: str, header_override: str = "", protocol: str = "openai",
+    egress: str = "",
 ) -> tuple[str, ...]:
-    from .proxy import loopback_mounts  # 回环地址不绕系统代理，理由见 proxy.py
+    # 出口和转发共用一套规则（回环直连、'direct' 连系统代理也关掉），理由见 proxy.py。
+    # 这里必须也按出口走：不然「只能走代理才通」的站转发是好的、拉列表却失败，
+    # 最容易被误判成 key 填错了
+    from .proxy import client_args
 
     url = models_url(base_url)
-    async with httpx.AsyncClient(timeout=MODELS_TIMEOUT, mounts=loopback_mounts()) as client:
+    async with httpx.AsyncClient(timeout=MODELS_TIMEOUT, **client_args(egress)) as client:
         resp = await client.get(url, headers=build_headers(api_key, header_override, protocol))
     if resp.status_code != 200:
         raise RuntimeError(f"{url} 返回 {resp.status_code}: {resp.text[:300]}")

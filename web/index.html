@@ -228,6 +228,20 @@
           <input type="text" id="up-base" placeholder="https://xxx.com" autocomplete="off" required>
           <span class="dim" id="up-base-hint" style="font-size:12px;margin-top:5px"></span>
         </label>
+        <div class="field wide">
+          <label for="up-egress-kind">出口（这个站从哪扇门出去）</label>
+          <div class="field-row">
+            <select id="up-egress-kind" style="max-width:190px">
+              <option value="">跟随系统代理</option>
+              <option value="direct">直连（不走系统代理）</option>
+              <option value="proxy">走指定代理</option>
+            </select>
+            <input type="text" id="up-egress-url" hidden autocomplete="off" aria-label="代理地址"
+                   placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
+            <button type="button" class="btn btn-ghost btn-sm" data-act="probe-upstream">测一下</button>
+          </div>
+          <span class="dim" id="up-egress-hint" style="font-size:12px;margin-top:5px"></span>
+        </div>
       </div>
 
       <!-- 低频：只有被指纹拦的站才要动，默认收起来 -->

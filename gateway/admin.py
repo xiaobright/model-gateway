@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -8,7 +10,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import db, failover, inflight, stats as stats_mod, upstream as upstream_mod
+from . import db, failover, inflight, proxy as proxy_mod, stats as stats_mod, upstream as upstream_mod
 from .reqlog import log
 
 router = APIRouter(prefix="/admin/api")
@@ -21,6 +23,8 @@ class UpstreamIn(BaseModel):
     base_url: str = Field(min_length=1)
     enabled: bool = True
     header_override: str = ""
+    # 从哪扇门出去：'' 跟随系统代理 / 'direct' 直连 / 一个代理 URL
+    egress: str = ""
 
 
 class GroupIn(BaseModel):
@@ -88,6 +92,33 @@ def _validate_override(raw: str) -> str:
     return raw.strip()
 
 
+def _validate_egress(raw: str) -> str:
+    """出口：'' 跟随系统 / 'direct' 直连 / 一个代理 URL。
+
+    只认 http(s) 和 socks5 —— 网关是拿 httpx 直接拨号的，别的协议（vless/ss 那种）
+    得有个内核在中间翻译，填进来只会在转发时才炸。socks5 还要装 socksio，
+    这里就先说清楚，免得攒到第一个请求失败才发现。
+    """
+    egress = (raw or "").strip()
+    if egress in (proxy_mod.EGRESS_SYSTEM, proxy_mod.EGRESS_DIRECT):
+        return egress
+    scheme = egress.split("://", 1)[0].lower() if "://" in egress else ""
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        raise HTTPException(
+            400,
+            f"出口只能填 http:// 或 socks5:// 的代理地址（收到 {egress!r}）。"
+            "vless / shadowsocks 这类得先由本机的代理内核落成一个 http/socks 端口",
+        )
+    if scheme.startswith("socks5"):
+        try:
+            import socksio  # noqa: F401
+        except ImportError as exc:
+            raise HTTPException(
+                400, "要用 socks5 代理得先装 socksio：.venv\\Scripts\\python -m pip install socksio"
+            ) from exc
+    return egress
+
+
 def _serialize_group(g: db.Group) -> dict[str, Any]:
     return {
         "id": g.id,
@@ -108,6 +139,7 @@ def _serialize_upstream(u: db.Upstream, groups: list[db.Group]) -> dict[str, Any
         "base_url": u.base_url,
         "enabled": u.enabled,
         "header_override": u.header_override,
+        "egress": u.egress,
         "supports": [p for p in db.PROTOCOLS if any(g.protocol == p for g in groups)],
         "groups": [_serialize_group(g) for g in groups],
     }
@@ -157,6 +189,7 @@ def post_upstream(payload: UpstreamIn) -> dict[str, Any]:
             payload.base_url.strip(),
             _validate_override(payload.header_override),
             payload.enabled,
+            _validate_egress(payload.egress),
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
@@ -175,6 +208,7 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
             payload.base_url.strip(),
             payload.enabled,
             _validate_override(payload.header_override),
+            _validate_egress(payload.egress),
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
@@ -190,6 +224,62 @@ def remove_upstream(upstream_id: int) -> dict[str, bool]:
     if not db.delete_upstream(upstream_id):
         raise HTTPException(404, f"供应商 {upstream_id} 不存在")
     return {"ok": True}
+
+
+# 「测一下」：同一个站从每扇门各打一次，看哪扇能到。
+# 这正是出口这套东西要回答的问题 —— 公益站按 IP 屏蔽，而校园网 IP 和机房 IP
+# 各自被不同的站拉黑，光靠猜要试很久。它是「实测格式」那一列在网络层的兄弟。
+PROBE_TIMEOUT = httpx.Timeout(connect=6.0, read=8.0, write=6.0, pool=8.0)
+
+
+async def _probe_one(base_url: str, egress: str, label: str, headers: dict[str, str]) -> dict[str, Any]:
+    url = upstream_mod.models_url(base_url)
+    began = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            timeout=PROBE_TIMEOUT, **proxy_mod.client_args(egress)
+        ) as client:
+            resp = await client.get(url, headers=headers)
+    except Exception as exc:  # 探测什么都不该抛：代理地址填错是 ValueError，缺 socksio 是 ImportError
+        return {
+            "egress": egress, "label": label, "ok": False, "status": 0,
+            "ms": int((time.monotonic() - began) * 1000),
+            "error": str(exc) or exc.__class__.__name__,
+        }
+    # 拿到任何状态码都算「这扇门能到这个站」。401 也算通 —— 我们问的是网络，不是 key
+    return {
+        "egress": egress, "label": label, "ok": True, "status": resp.status_code,
+        "ms": int((time.monotonic() - began) * 1000), "error": "",
+    }
+
+
+@router.post("/upstreams/{upstream_id}/probe")
+async def probe_upstream(upstream_id: int) -> dict[str, Any]:
+    up = _require_upstream(upstream_id)
+    groups = list(db.list_groups(upstream_id))
+    # 带上第一个分组的 key 和接口：401 也算通，但带上 key 能顺手看出这把 key 还活着
+    group = groups[0] if groups else None
+    headers = upstream_mod.build_headers(
+        group.api_key if group else "",
+        up.header_override,
+        group.protocol if group else "openai",
+    )
+    doors = [(proxy_mod.EGRESS_SYSTEM, "跟随系统"), (proxy_mod.EGRESS_DIRECT, "直连")]
+    if up.egress not in (proxy_mod.EGRESS_SYSTEM, proxy_mod.EGRESS_DIRECT):
+        doors.append((up.egress, "这个代理"))
+    # 并发打：一扇被挡住的门要磨满 connect 超时，串行的话三扇门要等三倍
+    results = await asyncio.gather(
+        *(_probe_one(up.base_url, door, label, headers) for door, label in doors)
+    )
+    log(
+        f"PROBE {up.name}: "
+        + "; ".join(
+            f"{r['label']}="
+            f"{'通 ' + str(r['status']) if r['ok'] else '不通 ' + r['error'][:48]} {r['ms']}ms"
+            for r in results
+        )
+    )
+    return {"current": up.egress, "results": list(results)}
 
 
 # ---------------------------------------------------------------- 分组
@@ -273,7 +363,7 @@ async def get_remote_models(group_id: int) -> dict[str, Any]:
     parent = _require_upstream(group.upstream_id)
     try:
         models = await upstream_mod.fetch_remote_models(
-            parent.base_url, group.api_key, parent.header_override, group.protocol
+            parent.base_url, group.api_key, parent.header_override, group.protocol, parent.egress
         )
     except httpx.HTTPError as exc:
         # 连不上时 str(exc) 常常是空的（Windows 上 DNS 失败尤其如此），只写「拉取失败:」
