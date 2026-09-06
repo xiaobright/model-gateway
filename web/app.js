@@ -18,6 +18,9 @@ import * as views from './views.js';
 /* ---------------------------------------------------------------- 数据 */
 
 async function refreshConfig() {
+  const presets = await api('GET', '/admin/api/egress-presets').catch(() => null);
+  state.egressVps = presets ? presets.vps : null;
+  syncEgressPreset();
   [state.upstreams, state.routes, state.failover] = await Promise.all([
     api('GET', '/admin/api/upstreams'),
     api('GET', '/admin/api/models'),
@@ -302,11 +305,12 @@ function baseHint() {
     : '填到域名（或站点路径）为止，末尾的 /v1 会被自动去掉';
 }
 
-/* 出口：'' 跟随系统 / 'direct' 直连 / 一个代理 URL。界面上拆成「三选一 + URL」两个控件，
-   因为前两个是选择、第三个才要打字。 */
+/* 出口：'' 跟随系统 / 'direct' 直连 / 'vps' 预设门 / 一个代理 URL。界面上拆成
+   「多选一 + URL」两个控件，因为前两个是选择、最后一个才要打字。 */
 const EGRESS_TIP = {
   '': '默认。httpx 会读环境变量和 Windows 注册表里的系统代理（Clash 那种），所以这个站跟着你的代理走',
   direct: '不走任何代理，从本机自己的出口出去。被机房 IP 拉黑的站要用这个',
+  vps: '走你在 VPS 上部署的那扇门（地址在设置表 egress_vps 里，保存的是同一个 URL）',
   proxy: '只有这个站走这个代理。填 http:// 或 socks5://（vless/ss 得先由本机内核落成一个这样的端口）',
 };
 
@@ -316,6 +320,7 @@ function egressKind() {
 
 function egressValue() {
   const kind = egressKind();
+  if (kind === 'vps') return state.egressVps || '';
   return kind === 'proxy' ? $('up-egress-url').value.trim() : kind;
 }
 
@@ -327,10 +332,17 @@ function egressHint() {
 
 function fillEgress(value) {
   const raw = (value || '').trim();
-  const kind = raw === '' || raw === 'direct' ? raw : 'proxy';
+  const kind = raw === '' || raw === 'direct' ? raw
+    : state.egressVps && raw === state.egressVps ? 'vps' : 'proxy';
   $('up-egress-kind').value = kind;
   $('up-egress-url').value = kind === 'proxy' ? raw : '';
   egressHint();
+}
+
+/* VPS 这扇门是运维事实（VPS 上跑着 gost），不是代码里的常量：部署了（设置表里有
+   egress_vps）下拉里才有这个选项。值本身是完整 URL，存到站上和手填没区别。 */
+function syncEgressPreset() {
+  $('up-egress-vps-opt').hidden = !state.egressVps;
 }
 
 /* 「测一下」：同一个站从每扇门各打一次。公益站按 IP 屏蔽，而校园网 IP 和机房 IP

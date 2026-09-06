@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import ssl
 import time
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
@@ -46,14 +48,36 @@ def client_args(egress: str) -> dict:
     回环 mounts 只在没指定代理时挂：它是用来抵消**隐式**的系统代理的（否则连本机
     上游都要绕一趟 Clash）。明确给某个站指了代理，就按说的走 —— 真实场景里没人会给
     127.0.0.1 的站配代理，而测试要的正是「字节真的从那扇门出去了」。
+
+    代理 URL 允许带 `#ca=<pem 路径>` 的尾巴：自签证书的 https 代理（VPS 上 gost 那扇门）
+    用系统根证书验不过，把签发的那张钉进 client 的信任列表 —— 系统根证书原样保留，
+    不影响别的站。片段传给 httpx 前剥掉，它不认识这东西。相对路径按仓库根解析，
+    网关从哪个目录启动都一样。
     """
     egress = (egress or "").strip()
     proxy = None if egress in (EGRESS_SYSTEM, EGRESS_DIRECT) else egress
-    return {
+    args: dict = {
         "mounts": {} if proxy else loopback_mounts(),
         "trust_env": egress == EGRESS_SYSTEM,
         "proxy": proxy,
     }
+    if proxy:
+        base, _, frag = proxy.partition("#")
+        if frag:
+            args["proxy"] = base
+            if not frag.startswith("ca=") or len(frag) == 3:
+                raise ValueError(f"代理 URL 的 # 片段只认 ca=<证书路径>（收到 {frag!r}）")
+            ca = Path(frag[3:])
+            if not ca.is_absolute():
+                ca = config.PROJECT_ROOT / ca
+            if not ca.is_file():
+                raise ValueError(f"#ca 指的证书文件不存在：{ca}")
+            ctx = ssl.create_default_context()
+            ctx.load_verify_locations(cafile=str(ca))
+            # httpx 连代理这一跳用的是 Proxy 对象上单独的 ssl_context，client 的
+            # verify 管不到它 —— 钉证书必须钉在这里
+            args["proxy"] = httpx.Proxy(httpx.URL(base), ssl_context=ctx)
+    return args
 
 
 REQ_DROP = {"host", "content-length", "transfer-encoding", "connection", "keep-alive"}
@@ -286,18 +310,20 @@ async def forward(
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
         label = f"{route.upstream.name}/{route.group_name}"
-        # 出口是**供应商**的属性，而每个候选可能属于不同的供应商，所以 client 在循环里取
-        client = get_client(route.upstream.egress)
         inflight.set_route(
             call, attempt=attempt, upstream=route.upstream.name, group_name=route.group_name,
             group_id=route.group_id, remote_model=remote, req_bytes=len(sent_body),
         )
         began = time.monotonic()
         try:
+            # 出口是**供应商**的属性，而每个候选可能属于不同的供应商，所以 client 在循环里取。
+            # 放在 try 里：出口配坏了（比如 #ca 指的证书被删了）是「这扇门不通」，
+            # 按连不上处理、降级换下一扇，而不是整个请求 500
+            client = get_client(route.upstream.egress)
             resp = await client.send(
                 client.build_request("POST", url, content=sent_body, headers=headers), stream=True
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             fail, resp = exc, None
             elapsed = time.monotonic() - began
             log(

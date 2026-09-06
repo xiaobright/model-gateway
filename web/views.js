@@ -653,11 +653,15 @@ export function renderUpGroups() {
 }
 
 /* 出口不是「跟随系统」时在地址后面标一下：一屏上哪个站走的是另一扇门，
-   得能一眼看出来，不然只有点进编辑才知道。 */
+   得能一眼看出来，不然只有点进编辑才知道。VPS 预设只标「VPS」——
+   完整 URL 里有密码，不放 tooltip。 */
 function egressTag(u) {
   const raw = (u.egress || '').trim();
   if (!raw) return '';
   if (raw === 'direct') return ' <span class="tag" title="不走系统代理，从本机自己的出口出去">直连</span>';
+  if (state.egressVps && raw === state.egressVps) {
+    return ' <span class="tag tag-accent" title="只有这个站走 VPS 上那扇门">VPS</span>';
+  }
   return ` <span class="tag tag-accent" title="只有这个站走 ${esc(raw)}">走代理</span>`;
 }
 

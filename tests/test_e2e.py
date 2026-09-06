@@ -4,14 +4,21 @@ import asyncio
 import contextlib
 import json
 import socket
+import ssl
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+# 测试专用的自签证书（fixture 里那对，十年都不带过期的）：
+# MockProxy 套上它就是 https 代理，#ca= 钉的就是这张
+PROXY_CERT = str(Path(__file__).parent / "fixture" / "proxy-cert.pem")
+PROXY_KEY = str(Path(__file__).parent / "fixture" / "proxy-key.pem")
 
 
 def free_port() -> int:
@@ -208,12 +215,17 @@ class MockProxy:
     为什么要真写一个：「出口」这件事只有「字节真的从那扇门出去了」才算验过 ——
     光测「填个死端口会失败」证明不了流量走的是代理而不是直连。
     只支持明文 HTTP（mock 上游都是 http://），所以不用管 CONNECT。
+    传入证书就是 https 代理（TLS 在门口，进去之后照旧明文），用来验 #ca 的证书固定。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, certfile: str | None = None, keyfile: str | None = None) -> None:
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
         self.seen: list[str] = []           # 经过它的那些绝对 URL
+        self._tls: ssl.SSLContext | None = None
+        if certfile and keyfile:
+            self._tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self._tls.load_cert_chain(certfile, keyfile)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop: asyncio.Event | None = None
         self._ready = threading.Event()
@@ -251,7 +263,7 @@ class MockProxy:
         self._stop = asyncio.Event()
 
         async def serve() -> None:
-            server = await asyncio.start_server(self._handle, "127.0.0.1", self.port)
+            server = await asyncio.start_server(self._handle, "127.0.0.1", self.port, ssl=self._tls)
             self._ready.set()
             await self._stop.wait()
             server.close()
@@ -2021,6 +2033,80 @@ def test_probe_reports_which_door_works(gateway):
         by_label = {r["label"]: r for r in data["results"]}
         assert by_label["这个代理"]["ok"] is False and by_label["这个代理"]["error"]
         assert by_label["直连"]["ok"] is True
+
+
+def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
+    """#ca= 把自签代理的证书钉进信任列表；不钉就过不了 TLS —— 这正是它的用处。
+
+    自签的 https 代理（VPS 上 gost 那扇门）系统根证书验不了：钉了签发的那张就能过，
+    而且系统根证书原样保留，不影响别的站。
+    """
+    from gateway import proxy as proxy_mod
+
+    with MockProxy(certfile=PROXY_CERT, keyfile=PROXY_KEY) as px, MockUpstream("siteA") as a:
+        egress = f"https://me:pw@127.0.0.1:{px.port}#ca={PROXY_CERT}"
+        args = proxy_mod.client_args(egress)
+        # 片段是给网关看的，httpx 不认识，传之前剥掉；钉的证书挂在 Proxy 对象上
+        # （httpx 连代理那一跳认的是它自己的 ssl_context，不是 client 的 verify）
+        assert isinstance(args["proxy"], httpx.Proxy)
+        assert args["proxy"].url.host == "127.0.0.1" and args["proxy"].url.port == px.port
+        assert not args["proxy"].url.fragment, "片段剥掉了，httpx 不认识"
+        assert args["proxy"].auth == ("me", "pw"), "凭据还在，只是挪进了 auth"
+
+        async def through(via: dict) -> None:
+            async with httpx.AsyncClient(**via) as c:
+                await c.get(f"http://127.0.0.1:{a.port}/v1/models")
+
+        asyncio.run(through(args))
+        assert px.seen, "字节没从 TLS 门过"
+
+        # 同一扇门，不钉证书：TLS 握手就过不去（自签的不在系统信任列表里）
+        bare = proxy_mod.client_args(f"https://me:pw@127.0.0.1:{px.port}")
+        with pytest.raises(httpx.HTTPError) as ei:
+            asyncio.run(through(bare))
+        assert "certificate" in str(ei.value).lower()
+
+
+def test_egress_ca_pin_works_end_to_end(gateway):
+    """保存带 #ca 的出口，转发字节真的从那扇自签 TLS 门过。"""
+    with MockProxy(certfile=PROXY_CERT, keyfile=PROXY_KEY) as px, MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "via-vps", g_a, "gpt-remote")
+        set_egress(gateway, "siteA", f"https://me:pw@127.0.0.1:{px.port}#ca={PROXY_CERT}")
+
+        assert gateway.post("/v1/responses", json={"model": "via-vps"}).json()["upstream"] == "siteA"
+        assert px.seen, f"代理没看到这个请求: {px.seen}"
+
+
+def test_egress_ca_pin_is_checked_at_save_time(gateway):
+    """#ca 的错误当场说清：片段不认识、socks5 没有证书可验、文件不在。"""
+    with MockUpstream("siteA") as a:
+        add_upstream(gateway, a, "siteA")
+        row = next(u for u in gateway.get("/admin/api/upstreams").json() if u["name"] == "siteA")
+
+        def put(egress: str) -> httpx.Response:
+            return gateway.put(
+                f"/admin/api/upstreams/{row['id']}",
+                json={"name": "siteA", "base_url": row["base_url"], "enabled": True, "egress": egress},
+            )
+
+        assert put("https://me:pw@h:8443#foo=1").status_code == 400
+        assert put(f"socks5://127.0.0.1:1080#ca={PROXY_CERT}").status_code == 400
+        assert put("https://me:pw@h:8443#ca=data/no-such-ca.pem").status_code == 400
+
+        ok = put(f"https://me:pw@h:8443#ca={PROXY_CERT}")
+        assert ok.status_code == 200 and ok.json()["egress"].endswith(f"#ca={PROXY_CERT}")
+
+
+def test_egress_vps_preset_comes_from_the_settings_table(gateway):
+    """「走 VPS」这个预设是运维事实不是代码：值在设置表里，没配就没有这个选项。"""
+    from gateway import db
+
+    assert gateway.get("/admin/api/egress-presets").json() == {"vps": None}
+    db.set_setting("egress_vps", "https://u:p@203.0.113.10:8443#ca=data/vps-proxy-ca.pem")
+    assert gateway.get("/admin/api/egress-presets").json()["vps"].endswith(
+        ":8443#ca=data/vps-proxy-ca.pem"
+    )
 
 
 

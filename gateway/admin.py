@@ -4,13 +4,14 @@ import asyncio
 import json
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import db, failover, inflight, proxy as proxy_mod, stats as stats_mod, upstream as upstream_mod
+from . import config, db, failover, inflight, proxy as proxy_mod, stats as stats_mod, upstream as upstream_mod
 from .reqlog import log
 
 router = APIRouter(prefix="/admin/api")
@@ -98,6 +99,10 @@ def _validate_egress(raw: str) -> str:
     只认 http(s) 和 socks5 —— 网关是拿 httpx 直接拨号的，别的协议（vless/ss 那种）
     得有个内核在中间翻译，填进来只会在转发时才炸。socks5 还要装 socksio，
     这里就先说清楚，免得攒到第一个请求失败才发现。
+
+    https 代理还能带 `#ca=<pem 路径>`（自签证书的那扇门，比如 VPS 上的 gost）：
+    片段当场查 —— 语法不对、socks5 没有证书可验、文件不在，都在保存时说清楚，
+    别攒到第一个请求失败才发现。
     """
     egress = (raw or "").strip()
     if egress in (proxy_mod.EGRESS_SYSTEM, proxy_mod.EGRESS_DIRECT):
@@ -116,6 +121,17 @@ def _validate_egress(raw: str) -> str:
             raise HTTPException(
                 400, "要用 socks5 代理得先装 socksio：.venv\\Scripts\\python -m pip install socksio"
             ) from exc
+    _, _, frag = egress.partition("#")
+    if frag:
+        if scheme != "https":
+            raise HTTPException(400, "#ca= 只有 https 代理用得上 —— socks5/http 的门没有要验的证书")
+        if not frag.startswith("ca=") or len(frag) == 3:
+            raise HTTPException(400, f"代理 URL 的 # 片段只认 ca=<证书路径>（收到 {frag!r}）")
+        ca = Path(frag[3:])
+        if not ca.is_absolute():
+            ca = config.PROJECT_ROOT / ca
+        if not ca.is_file():
+            raise HTTPException(400, f"#ca 指的证书文件不存在：{ca}")
     return egress
 
 
@@ -282,6 +298,14 @@ async def probe_upstream(upstream_id: int) -> dict[str, Any]:
     return {"current": up.egress, "results": list(results)}
 
 
+# 「走 VPS」预设。门是部署在 VPS 上的 gost（systemd: gost-proxy.service），对网关来说
+# 就是一个带自签证书的 https 代理 —— 值存设置表（egress_vps），代码里不落任何密钥：
+# 换端口换密码改一遍设置就行，不用动代码。没配时前端不显示这个选项。
+@router.get("/egress-presets")
+def get_egress_presets() -> dict[str, Any]:
+    return {"vps": db.get_setting("egress_vps", "") or None}
+
+
 # ---------------------------------------------------------------- 分组
 
 
@@ -365,9 +389,10 @@ async def get_remote_models(group_id: int) -> dict[str, Any]:
         models = await upstream_mod.fetch_remote_models(
             parent.base_url, group.api_key, parent.header_override, group.protocol, parent.egress
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         # 连不上时 str(exc) 常常是空的（Windows 上 DNS 失败尤其如此），只写「拉取失败:」
-        # 没法排查，所以补上异常类型和实际请求的那个地址
+        # 没法排查，所以补上异常类型和实际请求的那个地址。ValueError 是出口配坏了
+        # （#ca 的文件不在之类）—— 门不通和站不通对用户来说是同一件事：去修门
         why = str(exc) or exc.__class__.__name__
         raise HTTPException(502, f"拉取失败: {why}（{upstream_mod.models_url(parent.base_url)}）") from exc
     except (ValueError, RuntimeError) as exc:

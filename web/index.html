@@ -234,6 +234,8 @@
             <select id="up-egress-kind" style="max-width:190px">
               <option value="">跟随系统代理</option>
               <option value="direct">直连（不走系统代理）</option>
+              <!-- 部署了才出现：值在设置表 egress_vps 里，见 /admin/api/egress-presets -->
+              <option value="vps" id="up-egress-vps-opt" hidden>走 VPS</option>
               <option value="proxy">走指定代理</option>
             </select>
             <input type="text" id="up-egress-url" hidden autocomplete="off" aria-label="代理地址"
