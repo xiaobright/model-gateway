@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import db, failover, stats as stats_mod, upstream as upstream_mod
+from . import db, failover, inflight, stats as stats_mod, upstream as upstream_mod
 from .reqlog import log
 
 router = APIRouter(prefix="/admin/api")
@@ -424,6 +424,22 @@ def post_order(payload: OrderIn) -> dict[str, Any]:
         raise HTTPException(404, f"「{payload.model_name}」没有这些候选")
     log(f"ORDER model={payload.model_name!r} -> {list(payload.order)}")
     return {"ok": True, "ordered": n}
+
+
+# ---------------------------------------------------------------- 实时
+
+
+@router.get("/inflight")
+def get_inflight() -> dict[str, Any]:
+    """「实时」那一页要的全部东西，一次拿完 —— 这页 1 秒一刷，不该开三个连接。
+
+    纯内存，不碰数据库。分组名由前端用它手上的供应商列表翻（它本来就有）。
+    """
+    return {
+        **inflight.snapshot(),
+        "breakers": failover.snapshot(),
+        "failover": failover.all_enabled(),
+    }
 
 
 # ---------------------------------------------------------------- 自动降级

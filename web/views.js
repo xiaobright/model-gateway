@@ -5,7 +5,7 @@
 
 import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft,
-  modelsOfGroup, modelsOfUpstream, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
+  modelsOfGroup, modelsOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -261,20 +261,23 @@ function chipHtml(model, c, showGroup, showRemote) {
 }
 
 
-/* 自动降级开关。按接口分开，所以跟着当前的接口筛选走：筛了哪个就只显示那个的开关，
-   「全部」时两个都显示 —— 一个开关代表两种接口会让人以为 GPT 侧也在自动换站。
+/* 自动降级开关。按接口分开，所以在模型路由卡上跟着当前的接口筛选走：筛了哪个就只显示
+   那个的开关，「全部」时两个都显示 —— 一个开关代表两种接口会让人以为 GPT 侧也在自动换站。
+   实时页那份永远两个都给：那页没有接口筛选。
    不复用 .checkline：它那条 input[type=checkbox]{width:auto} 选择器权重更高，
    会把开关压成 0 宽、只剩个滑块糊在文字上。 */
-function failoverBox() {
-  const box = $('failover-box');
-  if (!box) return;
+function failoverSwitches(list) {
   const on = (state.failover && state.failover.enabled) || {};
-  const list = state.iface ? [state.iface] : PROTOCOLS;
-  box.innerHTML = list.map((p) => `<label class="fo-item" title="打不通就按候选顺序换下一个">
+  return list.map((p) => `<label class="fo-item" title="打不通就按候选顺序换下一个">
       <input type="checkbox" class="switch" ${on[p] ? 'checked' : ''}
              data-act="toggle-failover" data-fo="${p}">
       <span>${list.length > 1 ? PROTO_LABEL[p] + ' ' : '自动'}降级</span>
     </label>`).join('');
+}
+
+function failoverBox() {
+  const box = $('failover-box');
+  if (box) box.innerHTML = failoverSwitches(state.iface ? [state.iface] : PROTOCOLS);
 }
 
 const EMPTY_BY_IFACE = {
@@ -336,6 +339,189 @@ export function renderRoutes() {
         <button class="btn btn-ghost btn-sm" data-act="add-candidate" data-model="${esc(g.model_name)}">+ 候选</button>
         <button class="btn btn-danger btn-sm" data-act="del-model" data-model="${esc(g.model_name)}">删除</button>
       </div>
+    </div>`;
+  }).join('');
+}
+
+/* ================================================================ 实时请求 */
+
+/* 数据来自 /admin/api/inflight（纯内存）。1 秒一刷，秒数由 tickElapsed 在本地走，
+   不为了走字去打服务器。
+
+   前两个阶段分开是这页的核心：同样的「12 秒没动静」，还没拿到状态码是站连不上或者
+   干脆没在回话（也可能是系统代理的问题），已经拿到了就是模型在想 —— 处置完全不同。
+   注意 connect 这一档不只是 TCP 握手：httpx 的 send() 要等到响应头才返回，所以
+   「上游收了请求但迟迟不回话」也落在这一档里，文案不能写成「正在连接」。 */
+const PHASE = {
+  connect: ['等上游回应', '请求已经发出去了，还没拿到状态码 —— 连不上、或者上游收下了但不回话。connect 超时 8 秒'],
+  wait: ['已回应，等内容', '状态码拿到了，响应体还没开始 —— 模型在想'],
+  stream: ['正在返回', '第一块字节已经转给下游了'],
+  done: ['已结束', ''],
+};
+
+function callDot(c) {
+  if (c.phase !== 'done') return c.phase === 'connect' ? 'warn' : 'good';
+  if (c.note && c.note !== 'ok') return 'crit';
+  return c.status >= 400 ? 'crit' : 'good';
+}
+
+/** 「供应商 · 分组」，分组叫「默认」时省掉 —— 每行都拖一条没信息量的尾巴不值得 */
+function whereText(upstream, group) {
+  if (!upstream) return '';
+  return group && group !== '默认' ? `${esc(upstream)} · ${esc(group)}` : esc(upstream);
+}
+
+function trailRow(t) {
+  const name = t.remote_model ? ` <span class="dim mono">${esc(t.remote_model)}</span>` : '';
+  return `<div class="trail-row">
+      <span class="dim">第 ${t.attempt} 次</span>
+      <span>${whereText(t.upstream, t.group_name) || '—'}</span>${name}
+      ${statusTag(t.status)}
+      <span class="grow"></span><span class="dim">${fmtDur(t.ms)}</span>
+    </div>`;
+}
+
+function callHtml(c) {
+  const done = c.phase === 'done';
+  const { bare, onem } = splitOneM(c.remote_model);
+  const wide = onem ? ' <span class="tag tag-accent">1M</span>' : '';
+  // 「下游要的名字 → 它落到了哪、以什么名字」。一条线上只放一个箭头，两个箭头没人读得顺
+  const parts = [];
+  if (c.upstream) parts.push(esc(c.upstream));
+  if (c.group_name && c.group_name !== '默认') parts.push(esc(c.group_name));
+  if (bare && bare !== c.model) parts.push(`<span class="mono">${esc(bare)}</span>`);
+  const where = parts.length
+    ? parts.join('<span class="dim"> · </span>')
+    : '<span class="dim">还没定上游</span>';
+  const nth = c.attempt > 1
+    ? ` <span class="tag tag-accent" title="前 ${c.attempt - 1} 个候选没打通">第 ${c.attempt} 次</span>` : '';
+
+  const bits = [
+    esc(c.client || 'unknown'),
+    PROTO_LABEL[c.protocol] || esc(c.protocol),
+    c.stream ? '流式' : '非流式',
+    `上行 ${fmtBytes(c.req_bytes)}`,
+  ];
+  // count_tokens 也登记：它会走降级、会踩断路器，「这个站为什么在被打」的答案有时就是它
+  if (c.meta) bits.push('<b>count_tokens</b>');
+
+  let statePart;
+  if (done) {
+    statePart = `${statusTag(c.status)}`
+      + (c.note && c.note !== 'ok' ? ' ' + noteTag(c.note) : '')
+      + `<span class="dim">收 ${fmtBytes(c.sent)}</span>`;
+  } else {
+    const [label, why] = PHASE[c.phase] || [c.phase, ''];
+    statePart = `<span class="tone-${callDot(c)}-ink" title="${esc(why)}">${esc(label)}</span>`
+      + (c.phase === 'stream' ? `<span class="dim">已收 ${fmtBytes(c.sent)}</span>` : '')
+      + (c.status >= 400 ? ' ' + statusTag(c.status) : '');
+  }
+
+  const trail = (c.trail || []).length
+    ? `<div class="trail">${c.trail.map(trailRow).join('')}</div>` : '';
+
+  return `<div class="call-top">
+      <span class="dot dot-${callDot(c)}"></span>
+      <span class="mono call-model">${esc(c.model)}</span>${wide}
+      <span class="dim">→</span> <span class="call-up">${where}</span>${nth}
+      <span class="grow"></span>
+      <span class="call-ms" data-ms>${fmtDur(c.elapsed_ms)}</span>
+    </div>
+    <div class="call-sub dim">${bits.join(' · ')}</div>
+    <div class="call-state">${statePart}</div>
+    ${trail}`;
+}
+
+/** 卡片的增量渲染：同一条请求 1 秒重画一次，位置和进场动画都不能跟着抖 */
+function paintCalls(host, list) {
+  const byId = new Map(
+    [...host.children].filter((el) => el.dataset.id).map((el) => [el.dataset.id, el]),
+  );
+  const empty = host.querySelector('.empty');
+  if (empty && list.length) empty.remove();
+
+  let prev = null;
+  for (const c of list) {
+    const key = String(c.id);
+    let el = byId.get(key);
+    const fresh = !el;
+    if (fresh) {
+      el = document.createElement('div');
+      el.dataset.id = key;
+    }
+    byId.delete(key);
+    el.className = 'call' + (c.phase === 'done' ? ' is-done' : '') + (c.meta ? ' is-meta' : '');
+    // 秒数在本地走：记下「这条是什么时候开始的」，tickElapsed 每 200ms 重算一次
+    el.dataset.ticking = c.phase === 'done' ? '0' : '1';
+    el.dataset.t0 = String(performance.now() - c.elapsed_ms);
+    el.innerHTML = callHtml(c);
+    // 已经在该在的位置就别动它 —— after() 会摘下来重插，进场动画会重播
+    const inPlace = prev ? prev.nextElementSibling === el : host.firstElementChild === el;
+    if (!inPlace) {
+      if (prev) prev.after(el);
+      else host.prepend(el);
+    }
+    if (fresh) slideIn(el);
+    prev = el;
+  }
+  for (const el of byId.values()) el.remove();
+}
+
+export function renderInflight(data) {
+  const counts = data.counts || { requests: 0, streams: 0 };
+  $('live-total').textContent = counts.requests
+    ? `${counts.requests} 个进行中${counts.streams ? ` · ${counts.streams} 流式` : ''}`
+    : '空闲';
+  $('badge-live').textContent = counts.requests ? String(counts.requests) : '';
+  $('live-failover').innerHTML = failoverSwitches(PROTOCOLS);
+  renderBreakers(data);
+
+  const live = data.calls || [];
+  const recent = data.recent || [];
+  if (!live.length && !$('live-list').querySelector('.empty')) {
+    $('live-list').innerHTML = '<div class="empty">现在没有请求在跑'
+      + '<br><span class="dim">有请求打进来就会出现在这里</span></div>';
+  }
+  paintCalls($('live-list'), live);
+
+  // 结束的单独一块：不分开的话「正在跑」和「刚跑完」长得一样，一眼看不出现在忙不忙
+  $('recent-sep').hidden = !recent.length;
+  $('recent-sep').textContent = recent.length ? `刚刚结束的 ${recent.length} 条（留 90 秒）` : '';
+  paintCalls($('recent-list'), recent);
+}
+
+/** 秒数本地走字。只动文本，不重排 DOM */
+export function tickElapsed() {
+  const now = performance.now();
+  for (const el of $('live-list').children) {
+    if (el.dataset.ticking !== '1') continue;
+    const span = el.querySelector('[data-ms]');
+    if (span) span.textContent = fmtDur(now - Number(el.dataset.t0));
+  }
+}
+
+export function renderBreakers(data) {
+  const rows = data.breakers || [];
+  const total = state.upstreams.reduce((n, u) => n + (u.groups || []).length, 0);
+  $('brk-count').textContent = rows.length
+    ? `${rows.length} / ${total} 个分组有状态` : `${total} 个分组`;
+
+  const host = $('brk-list');
+  if (!rows.length) {
+    host.innerHTML = '<div class="empty">所有分组都是干净的 —— 没有在冷却的，也没有连着失败的</div>';
+    return;
+  }
+  host.innerHTML = rows.map((b) => {
+    const left = b.cooling_ms > 0
+      ? `<span class="tag tag-warn"><span class="dot dot-warn"></span>冷却 ${fmtLeft(b.cooling_ms)}</span>`
+      // 期满但失败次数还留着：会放它试一次，再失败就直接进更长的冷却
+      : '<span class="tag">冷却期满 · 会放它试一次</span>';
+    return `<div class="brk-row">
+      <span class="brk-name">${esc(groupLabel(b.group_id))}</span>
+      ${left}
+      <span class="dim">连续失败 ${b.fails} 次${b.last_status ? `，最近 ${b.last_status}` : ''}</span>
+      <span class="grow"></span>
+      ${b.cooled > 1 ? `<span class="dim">进过 ${b.cooled} 次冷却</span>` : ''}
     </div>`;
   }).join('');
 }
@@ -690,6 +876,8 @@ export function renderLive() {
     ? `${live.streams} 条流式`
     : (live.requests ? '非流式' : '空闲');
   $('live-dot').classList.toggle('is-live', live.requests > 0);
+  // 侧栏导航上的角标：不在实时页也该看得见「现在有几条在跑」
+  $('badge-live').textContent = live.requests ? String(live.requests) : '';
 }
 
 /** 只更新"进行中"那一格。快轮每 3 秒跑一次，不能把整个 KPI 重新滚一遍。 */

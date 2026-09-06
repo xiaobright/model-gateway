@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Model Gateway 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css?v=7">
+<link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
 <div class="blob blob-1"></div>
@@ -29,6 +29,10 @@
       <button type="button" class="nav-item" data-view="overview" aria-current="page">
         <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">概览</span>
       </button>
+      <button type="button" class="nav-item" data-view="live">
+        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">实时</span>
+        <span class="nav-badge" id="badge-live"></span>
+      </button>
       <button type="button" class="nav-item" data-view="upstreams">
         <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">上游站点</span>
         <span class="nav-badge" id="badge-upstreams"></span>
@@ -38,13 +42,14 @@
       </button>
     </nav>
 
-    <div class="side-live" id="side-live">
+    <button type="button" class="side-live" id="side-live" data-act="go-live"
+            title="打开「实时」看每条请求在打哪个上游">
       <span class="live-dot" id="live-dot"></span>
       <span class="side-live-text">
         <b id="live-count">0</b> 进行中
         <span class="dim" id="live-sub">无活跃流</span>
       </span>
-    </div>
+    </button>
 
     <div class="side-foot">
       <button class="pill" data-act="copy-endpoint" title="点击复制 Codex / OpenAI 兼容客户端要填的 API 地址">
@@ -117,6 +122,32 @@
           <div class="card-body" id="hot-list"></div>
         </section>
       </div>
+    </section>
+
+    <!-- ---------- 实时 ---------- -->
+    <section class="view" data-view="live" hidden>
+      <div class="view-head">
+        <h2>实时请求</h2><span class="count" id="live-total"></span>
+        <span class="grow"></span>
+        <span class="fo-box" id="live-failover"></span>
+      </div>
+      <section class="card" data-flat>
+        <p class="card-hint">每条请求一张卡：现在打的是哪个上游、卡在连接还是在等模型出字、已经等了多久，
+          以及它前面被哪几个候选拒过 —— 那几次失败客户端看不见，但钱是真花了。结束的请求会再留
+          90 秒，不然降级轨迹只在活着的那几秒里存在，最想看的东西最看不到。
+          <code>count_tokens</code>（Claude Code 用它算上下文占用）也列出来，但不计入「进行中」。</p>
+        <div class="card-body scroll-y">
+          <div id="live-list"></div>
+          <div class="call-sep" id="recent-sep" hidden></div>
+          <div id="recent-list"></div>
+        </div>
+      </section>
+      <section class="card" data-flat>
+        <div class="card-head"><h2>分组健康</h2><span class="count" id="brk-count"></span></div>
+        <p class="card-hint">同一个分组连续失败 2 次就冷却 90 秒，再失败翻倍、封顶 10 分钟；冷却期内自动降级
+          跳过它。手动点圆片切过去照样立刻生效，而且会清掉冷却。这些状态只在内存里，重启就清零。</p>
+        <div class="card-body" id="brk-list"></div>
+      </section>
     </section>
 
     <!-- ---------- 上游站点 ---------- -->
@@ -358,6 +389,6 @@
 </dialog>
 
 <div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
-<script type="module" src="/static/app.js?v=7"></script>
+<script type="module" src="/static/app.js?v=8"></script>
 </body>
 </html>

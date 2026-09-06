@@ -231,14 +231,15 @@ class MockUpstream:
 
 @pytest.fixture()
 def gateway(tmp_path, monkeypatch):
-    from gateway import config, failover
+    from gateway import config, failover, inflight
     from gateway.server import start_server_thread
 
     data_dir = tmp_path / "data"
     monkeypatch.setattr(config, "DATA_DIR", data_dir)
     monkeypatch.setattr(config, "DB_PATH", data_dir / "gateway.db")
-    # 断路器是进程内的内存状态，测试跑在同一个进程里 —— 不清会串到下一个用例
+    # 断路器和「进行中」登记表都是进程内的内存状态，测试跑在同一个进程里 —— 不清会串到下一个用例
     failover.reset()
+    inflight.reset()
 
     port = free_port()
     server, thread = start_server_thread(port)
@@ -352,6 +353,18 @@ def wait_rows(client: httpx.Client, n: int, timeout: float = 8.0) -> list[dict]:
 
 def rows_on(client: httpx.Client, upstream: str) -> int:
     return sum(1 for r in client.get("/admin/api/requests?limit=50").json() if r["upstream"] == upstream)
+
+
+def wait_inflight(client: httpx.Client, ready, timeout: float = 6.0) -> dict:
+    """等 /admin/api/inflight 到某个状态。注销发生在流收尾时，所以要等一下。"""
+    deadline = time.monotonic() + timeout
+    data: dict = {}
+    while time.monotonic() < deadline:
+        data = client.get("/admin/api/inflight").json()
+        if ready(data):
+            return data
+        time.sleep(0.05)
+    raise AssertionError(f"inflight 没等到期望的状态: {data}")
 
 
 def test_import_models_and_switch_without_interrupting_stream(gateway):
@@ -1666,6 +1679,82 @@ def test_unchecking_a_model_removes_every_mapping_in_that_group(gateway):
         assert [c["route_id"] for c in cands(gateway, "opus")] == [r_b]
         # 活跃的那条被删了，流量自动落到剩下的候选上
         assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
+
+
+# ================================================================ 实时请求
+#
+# /admin/api/inflight 是「实时」那一页的全部数据来源：谁在跑、打的是哪个上游、
+# 什么阶段、前面被谁拒过。纯内存，不碰数据库。
+
+
+def test_inflight_lists_the_running_request(gateway):
+    """这页要能回答：现在在打哪个上游、什么阶段、等了多久、下游是谁。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "gpt-test", g_a, "gpt-remote")
+
+        seen = None
+        with gateway.stream(
+            "POST", "/v1/responses", json={"model": "gpt-test", "stream": True},
+            headers={"User-Agent": "codex_cli_rs/1.0"},
+        ) as stream:
+            for chunk in stream.iter_text():
+                if chunk.strip() and seen is None:
+                    seen = gateway.get("/admin/api/inflight").json()
+
+        assert seen is not None and len(seen["calls"]) == 1, seen
+        call = seen["calls"][0]
+        assert (call["model"], call["remote_model"]) == ("gpt-test", "gpt-remote")
+        assert (call["upstream"], call["group_name"]) == ("siteA", "默认")
+        assert call["phase"] == "stream", "第一块字节已经在往下游走了"
+        assert call["client"] == "Codex CLI" and call["stream"] is True
+        assert call["meta"] is False and call["trail"] == []
+        assert seen["counts"] == {"requests": 1, "streams": 1}
+        assert seen["failover"] == {"anthropic": True, "openai": False}
+
+        # 流走完就转进「刚结束」，再留 90 秒 —— 不然降级轨迹只在活着的那几秒里存在
+        after = wait_inflight(gateway, lambda d: not d["calls"])
+        assert [c["model"] for c in after["recent"]] == ["gpt-test"]
+        assert after["recent"][0]["note"] == "ok"
+        assert after["counts"] == {"requests": 0, "streams": 0}
+
+
+def test_inflight_keeps_the_failover_trail(gateway):
+    """降级最怕的是把问题藏起来：胜出的那条要带着「前面被谁拒了」。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a, _ = two_anthropic_sites(gateway, a, b)
+        a.fail_with(503)
+
+        assert gateway.post("/v1/messages", json=msg("opus")).status_code == 200
+        data = wait_inflight(gateway, lambda d: d["recent"] and not d["calls"])
+        call = data["recent"][0]
+        assert (call["upstream"], call["attempt"], call["status"]) == ("siteB", 2, 200)
+        assert [(t["upstream"], t["status"], t["note"]) for t in call["trail"]] == [
+            ("siteA", 503, "failed_over")
+        ]
+        # 分组健康板的数据也是这个接口给的
+        assert [(b["group_id"], b["fails"]) for b in data["breakers"]] == [(g_a, 1)]
+
+
+def test_count_tokens_is_listed_but_not_counted(gateway):
+    """count_tokens 会走降级、会踩断路器，所以列出来；但它又多又快，
+    计进「进行中」就没法当忙闲指示看了。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+
+        assert gateway.post("/v1/messages/count_tokens", json=msg("opus")).status_code == 200
+        data = wait_inflight(gateway, lambda d: bool(d["recent"]))
+        assert [c["meta"] for c in data["recent"]] == [True]
+        assert data["counts"]["requests"] == 0
+        assert gateway.get("/admin/api/requests").json() == [], "照旧不进转发记录"
+
+
+def test_inflight_registers_nothing_for_an_unconfigured_model(gateway):
+    """连上游都没碰过的 404 不该出现在这页上 —— 它没在打任何站。"""
+    assert gateway.post("/v1/responses", json={"model": "nope"}).status_code == 404
+    data = gateway.get("/admin/api/inflight").json()
+    assert (data["calls"], data["recent"]) == ([], [])
 
 
 

@@ -4,7 +4,8 @@ request_log 有 2000 行上限（db.LOG_KEEP_ROWS），所以这里直接拉全�
 Python 里聚合。分桶和分位数用 SQL 写会更绕（SQLite 没有 percentile 函数），
 而两千行的代价可以忽略，可读性优先。
 
-这个模块只读，不参与转发；唯一的可变状态是活跃流计数器，由 proxy 调用。
+这个模块只读，不参与转发。「进行中」那两个数来自 inflight 的登记表 ——
+以前是这里的一对计数器，现在那张表是同一件事的唯一来源。
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Iterable
 
-from . import db
+from . import db, inflight
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -32,23 +33,11 @@ BAD_NOTES = frozenset({"connect_failed", "upstream_abort", "truncated"})
 
 # ---------------------------------------------------------------- 活跃流
 
-_live = {"requests": 0, "streams": 0}
-
-
-def live_enter(stream: bool) -> None:
-    _live["requests"] += 1
-    if stream:
-        _live["streams"] += 1
-
-
-def live_exit(stream: bool) -> None:
-    _live["requests"] = max(0, _live["requests"] - 1)
-    if stream:
-        _live["streams"] = max(0, _live["streams"] - 1)
-
 
 def live() -> dict[str, int]:
-    return dict(_live)
+    """几条在跑、其中几条流式。「在跑」现在包括还卡在连接和等首字节的 ——
+    一个连不上的站要磨 8 秒，那 8 秒当然算进行中。"""
+    return inflight.counts()
 
 
 # ---------------------------------------------------------------- 工具

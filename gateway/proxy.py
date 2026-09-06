@@ -10,7 +10,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, db, failover, naming, protocols, stats
+from . import config, db, failover, inflight, naming, protocols
 from .reqlog import log
 from .upstream import endpoint as upstream_endpoint, parse_override
 
@@ -200,6 +200,14 @@ async def forward(
     # 这个请求里站级失败过的分组。整个跳掉（含它下面同模型的其它候选）：同一个站
     # 绝不在一次请求里立刻重试。模型级的 404 不进这里 —— 那是名字的问题不是站的问题
     dead_groups: set[int] = set()
+    # 「实时」那一页的数据来源。record=False 的元数据请求（count_tokens）照样登记 ——
+    # 它也会走降级、也会踩断路器，「这个站为什么在被打」的答案有时就是它 —— 但打个
+    # meta 标，不计入「进行中」的数字
+    call = inflight.begin(
+        client=_client_label(request.headers.get("user-agent", "")),
+        protocol=proto.name, model=asked, stream=stream_flag,
+        req_bytes=len(body), meta=not record,
+    )
 
     def advance() -> int:
         """还该不该再打一个？返回下一个候选的下标，-1 = 到此为止。"""
@@ -237,6 +245,10 @@ async def forward(
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
         label = f"{route.upstream.name}/{route.group_name}"
+        inflight.set_route(
+            call, attempt=attempt, upstream=route.upstream.name, group_name=route.group_name,
+            group_id=route.group_id, remote_model=remote, req_bytes=len(sent_body),
+        )
         began = time.monotonic()
         try:
             resp = await client.send(
@@ -252,6 +264,7 @@ async def forward(
             )
             failover.note_fail(route.group_id, 502, label)
             dead_groups.add(route.group_id)
+            inflight.failed(call, status=502, note="connect_failed", ms=int(elapsed * 1000))
             if record:
                 _record(
                     request=request, route=route, proto=proto, model=asked,
@@ -264,6 +277,7 @@ async def forward(
                 break
             continue
 
+        inflight.phase(call, inflight.WAIT, status=resp.status_code)
         detail = ""
         if payload.get("store") is not None or payload.get("previous_response_id") is not None:
             detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}"
@@ -293,6 +307,7 @@ async def forward(
             raw = await resp.aread()
             log(f"  上游返回 {resp.status_code}，换下一个候选。响应开头: {raw[:180]!r}")
         elapsed = time.monotonic() - began
+        inflight.failed(call, status=resp.status_code, note="failed_over", ms=int(elapsed * 1000))
         if record:
             _record(
                 request=request, route=route, proto=proto, model=asked,
@@ -312,6 +327,7 @@ async def forward(
             why = f"上游 {route.upstream.name} 没能给出可用的响应"
         if attempt > 1:
             why += f"（试过 {attempt} 个候选）"
+        inflight.finish(call, status=502, note="connect_failed")
         return _error(proto, 502, why)
 
     won = route
@@ -326,9 +342,9 @@ async def forward(
         head = bytearray()
         tail = bytearray()
         note = "ok"
-        # 只有上游已经响应、字节开始往下走之后才算"进行中"；连不上的请求没进过这里
-        if record:
-            stats.live_enter(stream_flag)
+        # 第一块字节开始往下走才算「正在返回」：在这之前是「等上游出字」，两件事的
+        # 处置完全不同（卡在等待是模型在想，卡在连接是站连不上）
+        inflight.phase(call, inflight.STREAM)
         try:
             async for chunk in upstream_resp.aiter_bytes():
                 sent += len(chunk)
@@ -339,6 +355,7 @@ async def forward(
                     seen_end = True
                 if len(tail) > TAIL_KEEP:
                     del tail[: len(tail) - TAIL_KEEP]
+                inflight.progress(call, sent)
                 yield chunk
         except httpx.HTTPError as exc:
             note = "upstream_abort"
@@ -359,8 +376,8 @@ async def forward(
                 log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
             # 先落库（纯同步，即使外层在取消也能跑完），再还连接
+            inflight.finish(call, status=upstream_resp.status_code, note=note, sent=sent)
             if record:
-                stats.live_exit(stream_flag)
                 _record(
                     request=request, route=won, proto=proto, model=asked,
                     remote_model=won_remote, status=upstream_resp.status_code,

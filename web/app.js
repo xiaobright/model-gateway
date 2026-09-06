@@ -51,9 +51,21 @@ async function refreshLog() {
   views.renderLog(rows);
 }
 
+/* 「实时」那一页：1 秒一刷。接口是纯内存的，不碰数据库。
+   降级开关和断路器状态也一起回来 —— 那两个开关就在这页上，不能比页面本身旧 15 秒。 */
+async function refreshInflight() {
+  const data = await api('GET', '/admin/api/inflight');
+  state.failover = { enabled: data.failover || {}, breakers: data.breakers || [] };
+  // 侧栏那个胶囊平时走 3 秒的快轮，在这页上就跟着 1 秒的数走 ——
+  // 同一屏上「2 个进行中」和「4 进行中」对不上会让人以为哪个是坏的
+  state.stats = { ...(state.stats || {}), live: data.counts };
+  views.renderLive();
+  views.renderInflight(data);
+}
+
 /* ---------------------------------------------------------------- 视图路由 */
 
-const VIEWS = ['overview', 'upstreams', 'log'];
+const VIEWS = ['overview', 'live', 'upstreams', 'log'];
 let currentView = '';
 
 function paintView(name) {
@@ -83,6 +95,7 @@ function showView(name) {
   withViewTransition(dir, () => paintView(name));
   history.replaceState(null, '', '#' + name);
   if (name === 'log') run(null, refreshLog);
+  if (name === 'live') run(null, refreshInflight);
 }
 
 /* ---------------------------------------------------------------- 时间窗 */
@@ -394,7 +407,7 @@ function openGroup(upstreamId, gid) {
   $('grp-proto').disabled = taken > 0;
   $('grp-proto-hint').hidden = taken === 0;
   if (taken) {
-    $('grp-proto-hint').innerHTML = `这个分组下有 <b>${taken}</b> 个模型候选，接口锁住了 ——`
+    $('grp-proto-hint').innerHTML = `这个分组下有 <b>${taken}</b> 个模型，接口锁住了 ——`
       + ' 要换接口就给另一种接口新建一个分组，别把已录入的模型悄悄换成另一种线格式。';
   }
 
@@ -722,6 +735,8 @@ const ACTIONS = {
   },
 
   'show-access': showAccess,
+
+  'go-live': () => showView('live'),
 
   'toggle-theme': cycleTheme,
 
@@ -1142,6 +1157,17 @@ const ticking = () => document.visibilityState === 'visible' && !document.queryS
 
 // 快轮只取活跃流：3 秒一次，让"进行中的请求"真的是实时的
 setInterval(() => { if (ticking()) run(null, refreshStats); }, 3000);
+
+/* 「实时」页只在自己显示时轮询，1 秒一次 —— 那个接口是纯内存的，不碰数据库。
+   秒数不靠轮询走字：本地每 200ms 按「这条什么时候开始的」重算一遍，
+   否则要么一秒跳一格，要么得把轮询压到 200ms 去。 */
+setInterval(() => {
+  if (ticking() && state.view === 'live') run(null, refreshInflight);
+}, 1000);
+
+setInterval(() => {
+  if (state.view === 'live' && document.visibilityState === 'visible') views.tickElapsed();
+}, 200);
 
 // 慢轮取统计和记录：数据量大一些，15 秒足够。配置也跟着刷 —— 断路器的冷却剩余
 // 在候选圆片上是要走字的，而且从别处（另一个标签页、手动切换）改过的配置也该跟上

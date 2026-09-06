@@ -348,7 +348,10 @@ body::after {
   font-size: 12px;
   box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.04);
   transition: transform .25s, border-color .25s, background-color .25s;
+  /* 它是个按钮（点了去「实时」页），把浏览器给按钮的默认字体和居中撤掉 */
+  width: 100%; text-align: left; font-family: inherit; color: inherit; cursor: pointer;
 }
+.side-live:active { transform: scale(0.98); }
 .side-live:hover {
   background: var(--hover);
   border-color: color-mix(in srgb, var(--accent) 30%, transparent);
@@ -950,6 +953,59 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .tone-warn-ink { color: var(--warn-ink); }
 .tone-crit-ink { color: var(--crit-ink); }
 .tone-accent-ink { color: var(--accent-ink); }
+
+/* ============================================================ 实时请求 */
+
+/* 一条请求一张卡。这页 1 秒重画一次，所以卡片里不放任何要靠自己攒状态的东西
+   （没有输入框、没有 CSS 动画），重画代价就是几行文本。 */
+.call {
+  padding: 10px 12px; margin-top: 8px;
+  border: 1px solid var(--hair-2); border-radius: var(--r-sm);
+  background: var(--glass-3);
+  font-size: 12.5px;
+}
+.call:first-child { margin-top: 0; }
+.call-top { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.call-top .grow { flex: 1; min-width: 8px; }
+.call-model { font-weight: 600; font-size: 13px; }
+.call-up { font-weight: 500; }
+.call-ms {
+  font-variant-numeric: tabular-nums; font-size: 13px; color: var(--ink-2);
+  font-family: var(--mono);
+}
+.call-sub { font-size: 11.5px; margin-top: 3px; }
+.call-state { display: flex; align-items: center; gap: 7px; margin-top: 6px; }
+
+/* 已经结束的：留 90 秒当「刚刚发生过什么」，压暗一档，别跟在跑的抢注意力 */
+.call.is-done { opacity: 0.72; background: transparent; }
+.call.is-done .call-model { font-weight: 500; }
+/* count_tokens 这类元数据请求：列出来（它也会踩断路器），但更淡 */
+.call.is-meta { border-style: dashed; }
+
+/* 「正在跑」和「刚跑完」得分开，不然长得一样，一眼看不出现在忙不忙 */
+.call-sep {
+  font-size: 11.5px; color: var(--ink-3);
+  margin-top: 14px; padding-top: 8px; border-top: 1px solid var(--hair);
+}
+
+/* 降级轨迹：这条请求前面被哪几个候选拒过。降级最怕的是把问题藏起来 */
+.trail {
+  margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--hair-2);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.trail-row {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 11.5px; color: var(--ink-2);
+}
+.trail-row .grow { flex: 1; min-width: 8px; }
+
+.brk-row {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 7px 0; border-bottom: 1px solid var(--hair); font-size: 12.5px;
+}
+.brk-row:last-child { border-bottom: none; }
+.brk-row .grow { flex: 1; min-width: 8px; }
+.brk-name { font-weight: 500; min-width: 120px; }
 
 /* ============================================================ 模型路由 */
 .route {
