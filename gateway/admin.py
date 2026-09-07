@@ -4,14 +4,15 @@ import asyncio
 import json
 import time
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import config, db, failover, inflight, proxy as proxy_mod, stats as stats_mod, upstream as upstream_mod
+from . import db, failover, inflight, protocols, proxy as proxy_mod
+from . import stats as stats_mod
+from . import upstream as upstream_mod
 from .reqlog import log
 
 router = APIRouter(prefix="/admin/api")
@@ -76,8 +77,8 @@ class FailoverIn(BaseModel):
 
 def _validate_protocol(protocol: str) -> str:
     clean = protocol.strip().lower()
-    if clean not in db.PROTOCOLS:
-        raise HTTPException(400, f"接口只能是 {' / '.join(db.PROTOCOLS)}")
+    if clean not in protocols.NAMES:
+        raise HTTPException(400, f"接口只能是 {' / '.join(protocols.NAMES)}")
     return clean
 
 
@@ -121,17 +122,16 @@ def _validate_egress(raw: str) -> str:
             raise HTTPException(
                 400, "要用 socks5 代理得先装 socksio：.venv\\Scripts\\python -m pip install socksio"
             ) from exc
-    _, _, frag = egress.partition("#")
+    # 语法和文件在不在都交给 upstream.ca_context 查 —— 转发时撞上的是同一段代码，
+    # 所以「保存时被拒」和「请求时降级」说的是同一件事，不会出现两套规则
+    _, frag = upstream_mod.split_ca(egress)
     if frag:
         if scheme != "https":
             raise HTTPException(400, "#ca= 只有 https 代理用得上 —— socks5/http 的门没有要验的证书")
-        if not frag.startswith("ca=") or len(frag) == 3:
-            raise HTTPException(400, f"代理 URL 的 # 片段只认 ca=<证书路径>（收到 {frag!r}）")
-        ca = Path(frag[3:])
-        if not ca.is_absolute():
-            ca = config.PROJECT_ROOT / ca
-        if not ca.is_file():
-            raise HTTPException(400, f"#ca 指的证书文件不存在：{ca}")
+        try:
+            upstream_mod.ca_context(frag)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     return egress
 
 
@@ -156,7 +156,7 @@ def _serialize_upstream(u: db.Upstream, groups: list[db.Group]) -> dict[str, Any
         "enabled": u.enabled,
         "header_override": u.header_override,
         "egress": u.egress,
-        "supports": [p for p in db.PROTOCOLS if any(g.protocol == p for g in groups)],
+        "supports": [p for p in protocols.NAMES if any(g.protocol == p for g in groups)],
         "groups": [_serialize_group(g) for g in groups],
     }
 
@@ -356,7 +356,7 @@ def post_clone_group(group_id: int) -> dict[str, Any]:
     """把这把 key 复制到另一种接口上。有些站一把 key 两种接口都能用，而接口是分组的属性，
     手动再填一遍 key 很烦。"""
     source = _require_group(group_id)
-    other = next(p for p in db.PROTOCOLS if p != source.protocol)
+    other = next(p for p in protocols.NAMES if p != source.protocol)
     try:
         created = db.create_group(
             source.upstream_id, source.name, other, source.api_key, source.enabled
@@ -389,14 +389,18 @@ async def get_remote_models(group_id: int) -> dict[str, Any]:
         models = await upstream_mod.fetch_remote_models(
             parent.base_url, group.api_key, parent.header_override, group.protocol, parent.egress
         )
-    except (httpx.HTTPError, ValueError) as exc:
+    # 三类失败处置不同，顺序也就不能随便排：ValueError 是**出口配坏了**（#ca 指的文件
+    # 不在之类），属于自己这边的配置错，不是上游的锅，所以单独给 400 让它和「站连不上」分开。
+    # 以前它和 HTTPError 写在同一条 except 里，结果下面那条 except 的 ValueError 永远走不到
+    except ValueError as exc:
+        raise HTTPException(400, f"出口配错了: {exc}") from exc
+    except httpx.HTTPError as exc:
         # 连不上时 str(exc) 常常是空的（Windows 上 DNS 失败尤其如此），只写「拉取失败:」
-        # 没法排查，所以补上异常类型和实际请求的那个地址。ValueError 是出口配坏了
-        # （#ca 的文件不在之类）—— 门不通和站不通对用户来说是同一件事：去修门
+        # 没法排查，所以补上异常类型和实际请求的那个地址
         why = str(exc) or exc.__class__.__name__
         raise HTTPException(502, f"拉取失败: {why}（{upstream_mod.models_url(parent.base_url)}）") from exc
-    except (ValueError, RuntimeError) as exc:
-        # 这一类是 fetch_remote_models 自己抛的，消息里已经带了地址
+    except RuntimeError as exc:
+        # fetch_remote_models 自己抛的（非 200 / 不是 JSON / 没有 data 数组），消息里已经带了地址
         raise HTTPException(502, f"拉取失败: {exc}") from exc
     return {"models": list(models)}
 

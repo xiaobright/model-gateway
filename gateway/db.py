@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -84,11 +85,21 @@ CREATE TABLE IF NOT EXISTS settings(
 # request_log 只用于人工排查，超出这个条数就从最旧的开始丢，避免 db 无限膨胀
 LOG_KEEP_ROWS = 2000
 
+# 库结构的版本号（存在 sqlite 的 user_version 里）。每次改结构 +1，并在 _upgrade 里
+# 补一条对应 stage 的动作。已经是这个号的库启动时直接放行 —— 不用再按形状去猜，
+# 也不用每次把每张表的 table_info 翻一遍
+#
+#   0 = 还没打过号（最早那一代，得按形状认）
+#   1 = api_key 还在供应商行上，没有分组
+#   2 = 有分组，但接口标记还挂在供应商上，候选还是 (模型, 分组) 复合主键
+#   3 = 当前：接口在分组上，候选有自增 id
+SCHEMA_VERSION = 3
+
+# 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
+BACKUP_KEEP = 3
+
 # 迁移时给每个老上游建的那个组的名字，也是新建分组时的默认组名
 DEFAULT_GROUP = "默认"
-
-# 分组走哪种接口 / 模型在哪种接口下暴露。和 protocols.Protocol.name 对齐
-PROTOCOLS = ("anthropic", "openai")
 
 class DuplicateName(Exception):
     """名称已被占用（供应商名全局唯一，分组名在「供应商 + 接口」内唯一）。"""
@@ -234,7 +245,22 @@ def _backup_db(path) -> str:
     finally:
         dst.close()
         src.close()
+    _prune_backups(path)
     return target.name
+
+
+def _prune_backups(path) -> None:
+    """迁移备份只留最近几份。
+
+    迁移是一次性的，而这些 .bak 从来没人清理过 —— 攒下去它就和「不轮转的日志」一样，
+    变成 data 目录里一堆没人看、也没人敢删的东西。留三份足够回退。
+    """
+    backups = sorted(
+        path.parent.glob(f"{path.name}.bak-*"), key=lambda f: f.stat().st_mtime, reverse=True
+    )
+    for stale in backups[BACKUP_KEEP:]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
 
 
 def _migrate_to_groups(conn: sqlite3.Connection) -> None:
@@ -374,7 +400,12 @@ def _warn_mixed_models(conn: sqlite3.Connection) -> None:
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
-    """给早期版本的库补列 —— CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段。"""
+    """给**正在被迁移的**库补列 —— CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段。
+
+    只在迁移那条路上调：已经是最新的库靠 user_version 直接放行，不必每次启动都把
+    每张表的 table_info 翻一遍。重建表的迁移动作跑完还会再补一次（漏一个字段的代价
+    是启动之后到处报 no such column，而这个检查是幂等的）。
+    """
     wanted = {
         "upstreams": [
             ("header_override", "TEXT NOT NULL DEFAULT ''"),
@@ -407,38 +438,84 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
+def _schema_version(path) -> int:
+    """库自己记的版本号。0 = 从没打过号，也就是给版本号之前那一代的老库。"""
+    if not path.exists():
+        return 0
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except sqlite3.DatabaseError:
+        return 0
+    finally:
+        conn.close()
+
+
+def _stamp(path, version: int) -> None:
+    with _conn() as conn:
+        # PRAGMA 不接受参数绑定；值是代码里的常量，不是外部输入
+        conn.execute(f"PRAGMA user_version={version}")
+
+
+def _schema_stage(path) -> int:
+    """这个库停在哪一代。
+
+    只有没打过号的库才需要按形状认 —— 那一代没留版本号，而形状认一次就够：
+    认完立刻打号，之后每次启动只看 user_version，不再去翻 table_info。
+    """
+    version = _schema_version(path)
+    if version:
+        return version
+    if _is_pre_group_shape(path):
+        return 0
+    if _is_pre_protocol_shape(path):
+        return 1
+    if _is_pre_routeid_shape(path):
+        return 2
+    return SCHEMA_VERSION
+
+
+def _upgrade(path, stage: int) -> None:
+    """把库升到当前版本。备份和形状检测都只在这一条路上发生。"""
+    backup = _backup_db(path)
+    # 重建 upstream_groups 要自己管事务和外键开关，得单独跑在别的写操作之前
+    if stage == 1:
+        _migrate_group_protocols(path)
+    with _conn() as conn:
+        # 补列必须在**重建表之前**：_migrate_route_ids 是 INSERT ... SELECT，
+        # 要从老表上读 priority，而老库根本没这一列 —— 先补上才不会报 no such column
+        _add_missing_columns(conn)
+        if stage == 0:
+            # 最老那一代一步到位：每个供应商变成一个分组，候选直接建成最新形状
+            _migrate_to_groups(conn)
+        else:
+            _migrate_route_ids(conn)
+        _drop_legacy_bits(conn)
+        _normalize_base_urls(conn)
+        _backfill_log_protocol(conn)
+        _warn_mixed_models(conn)
+        # 重建过表之后再补一次：DROP COLUMN 之类可能把刚补上的列又弄丢，
+        # 漏一个的代价是启动之后到处报 no such column。这个检查是幂等的
+        _add_missing_columns(conn)
+        # 版本号和迁移在同一个事务里：迁移没提交，号也不会打上，下次启动会重跑
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    log(f"db migrated to schema v{SCHEMA_VERSION}, backup at data/{backup}")
+
+
 def init_db() -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = config.DB_PATH
-    # 判断和备份都得在自己开连接之前做完
-    old_v1 = _is_pre_group_shape(path)
-    old_v2 = not old_v1 and _is_pre_protocol_shape(path)
-    # v1 的库由 _migrate_to_groups 直接建成新形状，不用再走一遍候选主键的迁移；
-    # v2 的库有分组但候选还是复合主键，两件事都要做
-    old_v3 = not old_v1 and _is_pre_routeid_shape(path)
-    stale = old_v1 or old_v2 or old_v3
-    backup = _backup_db(path) if stale else ""
-    # 重建 upstream_groups 要自己管事务和外键开关，而且得在 CREATE TABLE IF NOT EXISTS 之前
-    if old_v2:
-        _migrate_group_protocols(path)
     with _conn() as conn:
-        # 老库里 model_routes 已经存在，IF NOT EXISTS 会跳过它，重建交给迁移
+        # 新库建表；老库里已存在的表 IF NOT EXISTS 会跳过，重建交给迁移
         conn.executescript(_SCHEMA)
-        _add_missing_columns(conn)
-        if old_v1:
-            _migrate_to_groups(conn)
-        elif old_v3:
-            _migrate_route_ids(conn)
-        if stale:
-            _drop_legacy_bits(conn)
-            _normalize_base_urls(conn)
-            _backfill_log_protocol(conn)
-            _warn_mixed_models(conn)
-            # 迁移里有重建表的动作，再补一次列：漏一个字段的代价是启动之后到处报
-            # 「no such column」，而这个检查是幂等的、几乎不花时间
-            _add_missing_columns(conn)
-    if backup:
-        log(f"db migrated to latest schema, backup at data/{backup}")
+
+    stage = _schema_stage(path)
+    if stage >= SCHEMA_VERSION:
+        # 新库、或者形状已经最新但还没打过号的老库：补上号，以后就不用再按形状认了
+        if _schema_version(path) != SCHEMA_VERSION:
+            _stamp(path, SCHEMA_VERSION)
+        return
+    _upgrade(path, stage)
 
 
 # ---------------------------------------------------------------- 供应商

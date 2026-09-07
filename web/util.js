@@ -213,11 +213,19 @@ export const supportsIface = (upstream, iface) =>
   !iface || (upstream.supports || []).includes(iface);
 
 /* 接口 = 一条请求走哪种线格式，也就是它打进来的那个路径。两处显示用同一套词，
-   不再有「侧」和「协议」两套说法。 */
-export const PROTO_LABEL = { anthropic: 'Anthropic', openai: 'OpenAI' };
-export const PROTO_PATH = { anthropic: '/v1/messages', openai: '/v1/responses' };
-export const PROTO_CLIENT = { anthropic: 'Claude Code', openai: 'Codex' };
-export const PROTOCOLS = ['anthropic', 'openai'];
+   不再有「侧」和「协议」两套说法。
+
+   加一种协议只改 PROTO_INFO 这一处 —— 下面几个是给现有调用点用的派生常量，别单独往里
+   加东西。这份名单必须和网关侧 gateway/protocols.py 里的描述符对上：那边漏一个，
+   这边就会出现一个点了选不了的接口。 */
+export const PROTO_INFO = {
+  anthropic: { label: 'Anthropic', path: '/v1/messages', client: 'Claude Code' },
+  openai: { label: 'OpenAI', path: '/v1/responses', client: 'Codex' },
+};
+export const PROTOCOLS = Object.keys(PROTO_INFO);
+export const PROTO_LABEL = Object.fromEntries(PROTOCOLS.map((p) => [p, PROTO_INFO[p].label]));
+export const PROTO_PATH = Object.fromEntries(PROTOCOLS.map((p) => [p, PROTO_INFO[p].path]));
+export const PROTO_CLIENT = Object.fromEntries(PROTOCOLS.map((p) => [p, PROTO_INFO[p].client]));
 
 /* 1M 上下文是「上游真名」上的一个后缀（`名字[1m]`）：网关转发时摘掉它、换成
    anthropic-beta 头。这里只管在界面和存储之间来回翻译，规则和 gateway/naming.py 对齐。 */

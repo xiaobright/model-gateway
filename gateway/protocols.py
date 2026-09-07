@@ -151,6 +151,11 @@ class Protocol:
     count_content: Callable[[bytes], tuple[int, bool]]
     error_body: Callable[[int, str], dict]
     auth_headers: Callable[[str], dict[str, str]]
+    # 有些站按客户端指纹拦截，默认就伪装成这个接口对应的官方客户端。
+    # 供应商自己的「请求头覆写」能改掉或删掉这里的任何一个头。
+    # 放在描述符里而不是单独一张表：它和「这个接口怎么鉴权」是同一类知识，
+    # 加一种协议时不该有人记得去别处补一份
+    fingerprint: dict[str, str] = field(default_factory=dict)
     # 客户端没带时补上的头
     defaults: dict[str, str] = field(default_factory=dict)
     # 非空表示这个协议用这个头传 beta 开关（1M 上下文就走它）
@@ -165,6 +170,7 @@ OPENAI = Protocol(
     count_content=openai_content,
     error_body=openai_error,
     auth_headers=openai_auth,
+    fingerprint={"user-agent": "codex_cli_rs", "originator": "codex_cli_rs"},
 )
 
 ANTHROPIC = Protocol(
@@ -177,11 +183,15 @@ ANTHROPIC = Protocol(
     count_content=anthropic_content,
     error_body=anthropic_error,
     auth_headers=anthropic_auth,
+    fingerprint={"user-agent": "claude-cli/2.0.0 (external, cli)", "x-app": "cli"},
     defaults={"anthropic-version": "2023-06-01"},
     beta_header="anthropic-beta",
 )
 
+# 协议名只有这两个地方之一在登记：描述符自己。别处一律从 NAMES 派生，
+# 漏改一处就会「新协议在转发侧存在、在下拉里没有」这种半吊子状态
 ALL: dict[str, Protocol] = {p.name: p for p in (ANTHROPIC, OPENAI)}
+NAMES: tuple[str, ...] = tuple(ALL)
 
 
 def by_name(name: str) -> Protocol:

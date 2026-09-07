@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import json
+import ssl
+from pathlib import Path
 
 import httpx
 
-from . import protocols
+from . import config, protocols
 
 MODELS_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
 # 两种接口的路径都在 /v1 底下（`/v1/responses`、`/v1/messages`），所以前缀只有一个
 API_PREFIX = "/v1"
 
-# 有些站按客户端指纹拦截，默认就伪装成这个接口对应的官方客户端。
-# 供应商自己的「请求头覆写」能改掉或删掉这里的任何一个头。
-FINGERPRINTS = {
-    "openai": {"user-agent": "codex_cli_rs", "originator": "codex_cli_rs"},
-    "anthropic": {"user-agent": "claude-cli/2.0.0 (external, cli)", "x-app": "cli"},
-}
+# 自签证书的 https 代理用 `#ca=<pem 路径>` 把签发的那张证书钉进信任列表
+CA_PREFIX = "ca="
 
 
 def normalize_base(base_url: str) -> str:
@@ -46,7 +44,7 @@ def build_headers(api_key: str, header_override: str = "", protocol: str = "open
     `Authorization` 的话多半是 401；`anthropic-version` 也是它那边的必需头。"""
     proto = protocols.by_name(protocol)
     # 键统一小写，否则覆写 "user-agent" 时会和 "User-Agent" 同时存在，httpx 会把两个都发出去
-    headers = dict(FINGERPRINTS.get(protocol) or FINGERPRINTS["openai"])
+    headers = dict(proto.fingerprint)
     headers.update(proto.defaults)
     if api_key:
         headers.update(proto.auth_headers(api_key))
@@ -69,6 +67,38 @@ def parse_override(raw: str) -> dict[str, str | None]:
     if not isinstance(parsed, dict):
         return {}
     return {str(k).lower(): v for k, v in parsed.items() if isinstance(v, (str, type(None)))}
+
+
+def split_ca(egress: str) -> tuple[str, str]:
+    """拆掉代理 URL 上的 `#ca=…` 尾巴，返回 (剥干净的 URL, 片段原文)。
+
+    httpx 不认识这个片段，所以必须传给它之前剥掉。没有片段时第二项是空串。
+    """
+    base, _, frag = egress.partition("#")
+    return (base, frag) if frag else (egress, "")
+
+
+def ca_context(frag: str) -> ssl.SSLContext:
+    """把 `#ca=` 指的那张证书钉进一个 ssl context。
+
+    自签证书的 https 代理（VPS 上 gost 那扇门）用系统根证书验不过 —— 钉上签发它那张
+    就能过，而系统根证书原样保留，不影响别的站。相对路径按仓库根解析，网关从哪个
+    目录启动都一样。
+
+    语法不对、文件不在，一律抛 ValueError。保存出口时和真正建 client 时都得走这个函数，
+    所以「配错了」和「配错到什么程度」只有一份说法 —— 保存时就地报 400，别攒到第一个
+    请求失败才发现。
+    """
+    if not frag.startswith(CA_PREFIX) or len(frag) == len(CA_PREFIX):
+        raise ValueError(f"代理 URL 的 # 片段只认 ca=<证书路径>（收到 {frag!r}）")
+    ca = Path(frag[len(CA_PREFIX):])
+    if not ca.is_absolute():
+        ca = config.PROJECT_ROOT / ca
+    if not ca.is_file():
+        raise ValueError(f"#ca 指的证书文件不存在：{ca}")
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(cafile=str(ca))
+    return ctx
 
 
 async def fetch_remote_models(

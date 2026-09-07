@@ -3,18 +3,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import ssl
 import time
-from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, db, failover, inflight, naming, protocols
+from . import config, db, failover, inflight, naming, protocols, upstream as upstream_mod
 from .reqlog import log
-from .upstream import endpoint as upstream_endpoint, parse_override
+from .upstream import endpoint as upstream_endpoint
 
 # connect 只给 8 秒：真库里 104 个 502 全是连不上，平均白等 16.6 秒（旧值是 15 秒的
 # connect 超时在磨）。握手 8 秒都完不成的站，也扛不住几十万 token 的请求体。
@@ -49,10 +47,9 @@ def client_args(egress: str) -> dict:
     上游都要绕一趟 Clash）。明确给某个站指了代理，就按说的走 —— 真实场景里没人会给
     127.0.0.1 的站配代理，而测试要的正是「字节真的从那扇门出去了」。
 
-    代理 URL 允许带 `#ca=<pem 路径>` 的尾巴：自签证书的 https 代理（VPS 上 gost 那扇门）
-    用系统根证书验不过，把签发的那张钉进 client 的信任列表 —— 系统根证书原样保留，
-    不影响别的站。片段传给 httpx 前剥掉，它不认识这东西。相对路径按仓库根解析，
-    网关从哪个目录启动都一样。
+    代理 URL 允许带 `#ca=<pem 路径>` 的尾巴（自签证书的 https 代理，VPS 上 gost 那扇门）。
+    怎么拆、怎么校验都在 upstream 里（split_ca / ca_context）—— 保存出口时和真正建 client
+    时走的是同一段代码，别在两处各写一份规则。
     """
     egress = (egress or "").strip()
     proxy = None if egress in (EGRESS_SYSTEM, EGRESS_DIRECT) else egress
@@ -62,21 +59,11 @@ def client_args(egress: str) -> dict:
         "proxy": proxy,
     }
     if proxy:
-        base, _, frag = proxy.partition("#")
+        base, frag = upstream_mod.split_ca(proxy)
         if frag:
-            args["proxy"] = base
-            if not frag.startswith("ca=") or len(frag) == 3:
-                raise ValueError(f"代理 URL 的 # 片段只认 ca=<证书路径>（收到 {frag!r}）")
-            ca = Path(frag[3:])
-            if not ca.is_absolute():
-                ca = config.PROJECT_ROOT / ca
-            if not ca.is_file():
-                raise ValueError(f"#ca 指的证书文件不存在：{ca}")
-            ctx = ssl.create_default_context()
-            ctx.load_verify_locations(cafile=str(ca))
             # httpx 连代理这一跳用的是 Proxy 对象上单独的 ssl_context，client 的
             # verify 管不到它 —— 钉证书必须钉在这里
-            args["proxy"] = httpx.Proxy(httpx.URL(base), ssl_context=ctx)
+            args["proxy"] = httpx.Proxy(httpx.URL(base), ssl_context=upstream_mod.ca_context(frag))
     return args
 
 
@@ -118,7 +105,7 @@ _clients: dict[str, httpx.AsyncClient] = {}
 _client_loop: asyncio.AbstractEventLoop | None = None
 
 
-def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
+async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
     """按「出口」复用 client，省掉每个请求一次 TLS 握手（对远端公益站是几百 ms 的差别）。
 
     一个出口一个 client：代理是建 client 时定的，没法按请求换。出口最多也就三五种，
@@ -127,7 +114,9 @@ def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
     global _client_loop
     loop = asyncio.get_running_loop()
     if _client_loop is not loop:
-        _clients.clear()
+        # 换 loop 了（托盘模式下服务跑在另一个线程里）。旧 client 的连接池绑着上一个
+        # loop，留着就是泄漏一批连接和 fd —— 而且它们已经没人能用了
+        await aclose_client()
         _client_loop = loop
     client = _clients.get(egress)
     if client is None or client.is_closed:
@@ -197,7 +186,7 @@ def _build_headers(
     if want_1m and proto.beta_header:
         headers[proto.beta_header] = naming.add_beta(headers.get(proto.beta_header, ""), naming.BETA_1M)
     # 覆写放最后：它要能改掉上面自动加的任何头（值写 null 表示删掉那个头）
-    for key, value in parse_override(upstream.header_override).items():
+    for key, value in upstream_mod.parse_override(upstream.header_override).items():
         if value is None:
             headers.pop(key, None)
         else:
@@ -319,7 +308,7 @@ async def forward(
             # 出口是**供应商**的属性，而每个候选可能属于不同的供应商，所以 client 在循环里取。
             # 放在 try 里：出口配坏了（比如 #ca 指的证书被删了）是「这扇门不通」，
             # 按连不上处理、降级换下一扇，而不是整个请求 500
-            client = get_client(route.upstream.egress)
+            client = await get_client(route.upstream.egress)
             resp = await client.send(
                 client.build_request("POST", url, content=sent_body, headers=headers), stream=True
             )
@@ -347,9 +336,8 @@ async def forward(
             continue
 
         inflight.phase(call, inflight.WAIT, status=resp.status_code)
-        detail = ""
-        if payload.get("store") is not None or payload.get("previous_response_id") is not None:
-            detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}"
+        # 带了 stateful 字段的请求不降级，日志里标出来 —— 排查「为什么这条没换站」时靠它
+        detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}" if stateful else ""
         log(
             f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
             f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
