@@ -99,7 +99,7 @@ export function renderKpis() {
 
   const hit = Math.round((t.cache_hit_rate || 0) * 1000) / 10;
   setNum('hit', hit, (v) => v.toFixed(1));
-  setNote('hit', `${fmtTokens(t.cached_tokens)} / ${fmtTokens(t.input_tokens)} 输入 tokens`);
+  setNote('hit', `${fmtTokens(t.cached_tokens)} / ${fmtTokens(t.context_tokens ?? t.input_tokens)} 输入 tokens`);
   ring.set(hit);
 
   // 前两格的 sparkline 用时间线数据：一个看近期忙闲，一个看累计趋势的切线
@@ -231,10 +231,11 @@ function multiGroupIds() {
 
 /* 一个分组下可以挂同一个模型的好几条候选（各指一个不同的上游真名），这时候光写
    「供应商 · 分组」两个圆片长得一模一样，所以 showRemote 会强制把真名显示出来。 */
-function chipHtml(model, c, showGroup, showRemote) {
+function chipHtml(model, c, showGroup, showRemote, activeRouteId) {
   const live = c.upstream_enabled && c.group_enabled;
   const cool = c.cooling_ms > 0;
-  const cls = ['chip', c.is_active ? 'chip-on' : '', live ? '' : 'chip-off',
+  const active = c.route_id === activeRouteId;
+  const cls = ['chip', active ? 'chip-on' : '', live ? '' : 'chip-off',
     cool ? 'chip-cool' : ''].filter(Boolean).join(' ');
   const label = showGroup ? `${c.upstream_name} · ${c.group_name}` : c.upstream_name;
   const { bare, onem } = splitOneM(c.remote_model);
@@ -249,7 +250,7 @@ function chipHtml(model, c, showGroup, showRemote) {
     ? ` <span class="tag tag-warn" title="连续失败 ${c.fails} 次，冷却期内自动降级会跳过它">`
       + `冷却 ${fmtLeft(c.cooling_ms)}</span>` : '';
   const full = named ? `${label} · ${bare}` : label;
-  const tip = c.is_active ? '当前生效的候选' : `切到 ${full}`;
+  const tip = active ? '当前实际使用的候选' : (c.is_active ? '保存的首选候选' : `切到 ${full}`);
   return `<span class="${cls}" data-rid="${c.route_id}">
     <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"
             data-rid="${c.route_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
@@ -316,7 +317,9 @@ export function renderRoutes() {
 
   $('route-list').innerHTML = list.map((g) => {
     const dead = g.active_route_id === null
-      ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>无可用上游</span>' : '';
+      ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>无可用上游</span>'
+      : g.preferred_route_id !== null && g.preferred_route_id !== g.active_route_id
+        ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>正在使用备用候选</span>' : '';
     // 「全部」视图里两种接口混在一起，得标出来谁是谁
     const ifaceTag = !iface && g.protocol
       ? ` <span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
@@ -329,7 +332,9 @@ export function renderRoutes() {
     const sibs = new Map();
     for (const c of g.candidates) sibs.set(c.group_id, (sibs.get(c.group_id) || 0) + 1);
     const chips = g.candidates.map((c) =>
-      chipHtml(g.model_name, c, multi.has(c.upstream_id), sibs.get(c.group_id) > 1)).join('');
+      chipHtml(
+        g.model_name, c, multi.has(c.upstream_id), sibs.get(c.group_id) > 1, g.active_route_id,
+      )).join('');
 
     return `<div class="route" data-model="${esc(g.model_name)}">
       <div class="route-name">${esc(g.model_name)}${ifaceTag}${dead}</div>

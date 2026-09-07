@@ -74,30 +74,13 @@ RESP_DROP = {"transfer-encoding", "connection", "keep-alive", "content-encoding"
 REDACT_ON_CAPTURE = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
 
 HEAD_KEEP = 8192   # 开头留这么多：Anthropic 的输入 token 只在流开头的 message_start 里报一次
-TAIL_KEEP = 65536  # 末尾留这么多，用来抓 usage 和完成标记
+TAIL_KEEP = 65536  # 末尾留这么多，用来抓 usage
 
 # 连上游都没连上时的 usage：一个数都没有
-NO_USAGE: protocols.Usage = (None, None, None)
+NO_USAGE: protocols.Usage = (None, None, None, None)
 
 # /v1/models 的 Anthropic 形状要求每项带 created_at，值本身没有客户端会用
 MODEL_CREATED_AT = "2025-01-01T00:00:00Z"
-
-def has_end_marker(
-    buf: bytes | bytearray,
-    fresh: int,
-    markers: tuple[bytes, ...] = protocols.OPENAI.end_markers,
-) -> bool:
-    """在缓冲区末尾 fresh 个新字节里找完成标记。
-
-    多带 overlap 字节回看，否则标记正好被 TCP 切成两半时会漏掉，
-    整条流就会被误判成 truncated。
-    """
-    if fresh <= 0:
-        return False
-    overlap = max(len(m) for m in markers) - 1
-    window = bytes(buf[-(fresh + overlap):])
-    return any(m in window for m in markers)
-
 
 router = APIRouter()
 
@@ -135,6 +118,39 @@ async def aclose_client() -> None:
                 await client.aclose()
     _clients.clear()
     _client_loop = None
+
+
+class ClientDisconnected(Exception):
+    """下游在等待上游响应头时已经断开。"""
+
+
+RESPONSE_POLL = 0.05
+
+
+async def _send_until_headers(
+    request: Request, client: httpx.AsyncClient, prepared: httpx.Request
+) -> httpx.Response:
+    """等待响应头，同时让下游断开能够取消尚未完成的发送。
+
+    `httpx.AsyncClient.send()` 会一直等到响应头，relay 还没开始之前没有其它取消点。
+    Request.is_disconnected() 是非阻塞检查，短暂让出事件循环即可避免把下游断开拖到
+    上游 read/connect timeout 才收尾。
+    """
+    task = asyncio.create_task(client.send(prepared, stream=True))
+    try:
+        while not task.done():
+            if await request.is_disconnected():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise ClientDisconnected
+            await asyncio.sleep(RESPONSE_POLL)
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 def _error(proto: protocols.Protocol, status: int, message: str) -> JSONResponse:
@@ -309,9 +325,37 @@ async def forward(
             # 放在 try 里：出口配坏了（比如 #ca 指的证书被删了）是「这扇门不通」，
             # 按连不上处理、降级换下一扇，而不是整个请求 500
             client = await get_client(route.upstream.egress)
-            resp = await client.send(
-                client.build_request("POST", url, content=sent_body, headers=headers), stream=True
+            resp = await _send_until_headers(
+                request,
+                client,
+                client.build_request("POST", url, content=sent_body, headers=headers),
             )
+        except ClientDisconnected:
+            elapsed = time.monotonic() - began
+            log(
+                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} -> 499 "
+                f"(客户端在等待响应头时断开) after {elapsed:.1f}s req={len(sent_body)}B"
+            )
+            inflight.finish(call, status=499, note="client_abort")
+            if record:
+                _record(
+                    request=request, route=route, proto=proto, model=asked,
+                    remote_model=remote, status=499, stream_flag=stream_flag,
+                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    usage=NO_USAGE, note="client_abort", attempt=attempt,
+                )
+            return _error(proto, 499, "客户端已断开")
+        except asyncio.CancelledError:
+            elapsed = time.monotonic() - began
+            inflight.finish(call, status=499, note="client_abort")
+            if record:
+                _record(
+                    request=request, route=route, proto=proto, model=asked,
+                    remote_model=remote, status=499, stream_flag=stream_flag,
+                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    usage=NO_USAGE, note="client_abort", attempt=attempt,
+                )
+            raise
         except (httpx.HTTPError, ValueError) as exc:
             fail, resp = exc, None
             elapsed = time.monotonic() - began
@@ -359,10 +403,11 @@ async def forward(
         if nxt < 0:
             # 没有退路了就把上游的响应原样透传下去，和没有降级时的行为一字不差
             break
-        # 还有候选可试：把这次的错误体读出来记一行（错误体都很小），然后换下一个
+        # 还有候选可试：错误体不能挡住降级。没有退路时上面的 response 会照旧原样透传，
+        # 这里直接关掉响应，日志只记状态和候选，不等待可能永远不来的正文。
+        log(f"  上游返回 {resp.status_code}，关闭响应后换下一个候选")
         with contextlib.suppress(Exception):
-            raw = await resp.aread()
-            log(f"  上游返回 {resp.status_code}，换下一个候选。响应开头: {raw[:180]!r}")
+            await resp.aclose()
         elapsed = time.monotonic() - began
         inflight.failed(call, status=resp.status_code, note="failed_over", ms=int(elapsed * 1000))
         if record:
@@ -372,8 +417,6 @@ async def forward(
                 req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
                 usage=NO_USAGE, note="failed_over", attempt=attempt,
             )
-        with contextlib.suppress(Exception):
-            await resp.aclose()
         resp = None
         index = nxt
 
@@ -397,7 +440,7 @@ async def forward(
         sent = 0
         text_bytes = 0
         thinking = False
-        seen_end = False
+        observer = protocols.SSEObserver(proto)
         head = bytearray()
         tail = bytearray()
         note = "ok"
@@ -417,14 +460,14 @@ async def forward(
                         got = proto.extract_usage(bytes(head), b"")
                         inflight.usage(call, tokens_in=proto.context_tokens(got))
                 tail.extend(chunk)
-                # 这一块里有多少字节是真内容、有没有思维链。整条响应的字节数里 SSE 帧
-                # 占了大头，拿它折 token 会差十倍；而思维链发来的是总结、计费按完整的算，
-                # 所以这两件事都得单独记，见 protocols.count_content
-                got, think = proto.count_content(chunk)
-                text_bytes += got
-                thinking = thinking or think
-                if not seen_end and has_end_marker(tail, len(chunk), proto.end_markers):
-                    seen_end = True
+                # 观察器按完整 SSE 帧统计内容和结束事件；它不参与实际转发，解析出错也不能
+                # 影响下面的原始 chunk。
+                try:
+                    observer.feed(chunk)
+                    text_bytes = observer.text_bytes
+                    thinking = observer.thinking
+                except Exception as exc:
+                    log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
                 if len(tail) > TAIL_KEEP:
                     del tail[: len(tail) - TAIL_KEEP]
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
@@ -436,12 +479,12 @@ async def forward(
         except (GeneratorExit, asyncio.CancelledError):
             # 很多上游发完完成事件后并不主动收连接，客户端（codex 就是这样）拿到完成事件
             # 就走了，我们这边还卡在等下一块。这属于正常收尾，不是异常。
-            note = "ok" if seen_end else "client_abort"
-            log(f"  client left after {sent}B (completed={seen_end})")
+            note = "ok" if observer.ended else "client_abort"
+            log(f"  client left after {sent}B (completed={observer.ended})")
             raise
         else:
             # 只有「上游说 200 且是流式」时缺完成事件才算被截断，4xx/5xx 本来就没有完成事件
-            if stream_flag and upstream_resp.status_code < 300 and not seen_end:
+            if stream_flag and upstream_resp.status_code < 300 and not observer.ended:
                 note = "truncated"
                 log(f"  WARN stream ended WITHOUT completion event status={upstream_resp.status_code} resp={sent}B")
             else:
@@ -492,7 +535,7 @@ def _record(
     text_bytes: int = 0,
     thinking: bool = False,
 ) -> None:
-    input_tokens, output_tokens, cached_tokens = usage
+    input_tokens, output_tokens, cached_tokens, cache_creation_tokens = usage
     try:
         db.insert_request(
             client=_client_label(request.headers.get("user-agent", "")),
@@ -511,6 +554,7 @@ def _record(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             note=note,
             attempt=attempt,
         )
@@ -576,4 +620,3 @@ async def models_list(request: Request) -> JSONResponse:
             "last_id": names[-1] if names else None,
         }
     )
-

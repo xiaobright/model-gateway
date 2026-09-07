@@ -12,18 +12,21 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Callable
 
 # 上游的 usage 是从字节流里正则捞的，不做完整 SSE 解析：只要认出数字就够记账，
 # 而任何一次解析失败都不该影响转发本身。
-Usage = tuple[int | None, int | None, int | None]   # (输入, 输出, 缓存读取)
+Usage = tuple[int | None, int | None, int | None, int | None]
+# (输入, 输出, 缓存读取, 缓存创建)
 
 _IN = re.compile(rb'"input_tokens":\s*(\d+)')
 _OUT = re.compile(rb'"output_tokens":\s*(\d+)')
 _CACHED = re.compile(rb'"cached_tokens":\s*(\d+)')
 _CACHE_READ = re.compile(rb'"cache_read_input_tokens":\s*(\d+)')
+_CACHE_CREATE = re.compile(rb'"cache_creation_input_tokens":\s*(\d+)')
 
 # 「真正拿到手的内容有多少字节」。SSE 帧和 JSON 结构不算 —— 那些字节不是内容，
 # Responses API 的流里光事件框架就几十 KB，按整条响应的字节数去折 token 会差十倍。
@@ -56,7 +59,7 @@ def _largest(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
 
 def openai_usage(head: bytes, tail: bytes) -> Usage:
     """Responses API 只在最后的 response.completed 里报一次 usage，看尾巴就够。"""
-    return _last(_IN, tail), _last(_OUT, tail), _last(_CACHED, tail)
+    return _last(_IN, tail), _last(_OUT, tail), _last(_CACHED, tail), None
 
 
 def anthropic_usage(head: bytes, tail: bytes) -> Usage:
@@ -70,6 +73,7 @@ def anthropic_usage(head: bytes, tail: bytes) -> Usage:
         _largest(_IN, head, tail),
         _last(_OUT, head, tail),
         _largest(_CACHE_READ, head, tail),
+        _largest(_CACHE_CREATE, head, tail),
     )
 
 
@@ -80,8 +84,8 @@ def openai_context(usage: Usage) -> int:
 
 def anthropic_context(usage: Usage) -> int:
     """Messages API 的 input_tokens **不含**缓存读取（cache_read 是另一个字段），
-    所以上下文得两个加起来 —— 少加一边，少掉的正好是缓存那一大半。"""
-    return (usage[0] or 0) + (usage[2] or 0)
+    所以上下文得把缓存读取和缓存创建都加上 —— 少加一边，缓存命中率就会超过 100%。"""
+    return (usage[0] or 0) + (usage[2] or 0) + (usage[3] or 0)
 
 
 def _total(pattern: re.Pattern[bytes], chunk: bytes) -> int:
@@ -142,8 +146,9 @@ def anthropic_auth(api_key: str) -> dict[str, str]:
 @dataclass(frozen=True, slots=True)
 class Protocol:
     name: str
-    # 流结束的标记。少一个就会把正常结束的流误判成「被截断」
-    end_markers: tuple[bytes, ...]
+    # SSE 的事件名和独立 data 行。不能把它们当普通字符串在正文里搜索。
+    end_event_types: tuple[str, ...]
+    end_data_markers: tuple[str, ...]
     extract_usage: Callable[[bytes, bytes], Usage]
     # usage -> 整个上下文的 token 数。两种接口的 input_tokens 含不含缓存不一样
     context_tokens: Callable[[Usage], int]
@@ -164,7 +169,8 @@ class Protocol:
 
 OPENAI = Protocol(
     name="openai",
-    end_markers=(b"response.completed", b"[DONE]"),
+    end_event_types=("response.completed",),
+    end_data_markers=("[DONE]",),
     extract_usage=openai_usage,
     context_tokens=openai_context,
     count_content=openai_content,
@@ -175,9 +181,9 @@ OPENAI = Protocol(
 
 ANTHROPIC = Protocol(
     name="anthropic",
-    # message_stop 是 Messages API 的结束事件；[DONE] 是给「OpenAI 转 Anthropic」
-    # 那类中转站留的，它们有时会在末尾多发一行
-    end_markers=(b"message_stop", b"[DONE]"),
+    end_event_types=("message_stop",),
+    # [DONE] 是给「OpenAI 转 Anthropic」那类中转站留的，它们有时会在末尾多发一行
+    end_data_markers=("[DONE]",),
     extract_usage=anthropic_usage,
     context_tokens=anthropic_context,
     count_content=anthropic_content,
@@ -198,3 +204,68 @@ def by_name(name: str) -> Protocol:
     """按名字取描述符。认不出来时退回 OPENAI，调用方全都是「拿它拼个头」的场景，
     没有哪个值得为此抛异常。"""
     return ALL.get(name, OPENAI)
+
+
+class SSEObserver:
+    """按完整 SSE 事件观察流，不改变也不缓存要转发的原始字节。
+
+    网络 chunk 只是传输层分片，不能拿它当事件边界。未结束的帧留在自己的 buffer 里，
+    直到下一次 feed 补齐；观察失败最多少一条统计，不应影响 relay 原样转发。
+    """
+
+    def __init__(self, proto: Protocol) -> None:
+        self.proto = proto
+        self._buffer = bytearray()
+        self.ended = False
+        self.text_bytes = 0
+        self.thinking = False
+
+    def feed(self, chunk: bytes) -> None:
+        self._buffer.extend(chunk)
+        while True:
+            match = re.search(rb"\r?\n\r?\n", self._buffer)
+            if match is None:
+                return
+            frame = bytes(self._buffer[: match.start()])
+            del self._buffer[: match.end()]
+            self._observe_frame(frame)
+
+    def _observe_frame(self, frame: bytes) -> None:
+        event = ""
+        data: list[bytes] = []
+        for line in frame.splitlines():
+            if line.startswith(b":"):
+                continue
+            if line.startswith(b"event:"):
+                event = line[6:].lstrip().decode("utf-8", "ignore")
+            elif line.startswith(b"data:"):
+                data.append(line[5:].lstrip())
+
+        if not data and not event:
+            return
+        data_bytes = b"\n".join(data)
+        try:
+            got, think = self.proto.count_content(frame)
+            self.text_bytes += got
+            self.thinking = self.thinking or think
+        except Exception:
+            # 统计只是观察，坏 JSON / 奇怪编码不能让下游断流。
+            pass
+
+        if event in self.proto.end_event_types:
+            self.ended = True
+            return
+        if event:
+            # 有 event 头时以它为准；否则一个正文里的 type 字段可能把非结束事件
+            # 错当成结束。没有 event 头的上游才使用 data JSON 的 type 兜底。
+            return
+        data_text = data_bytes.decode("utf-8", "ignore").strip()
+        if data_text in self.proto.end_data_markers:
+            self.ended = True
+            return
+        try:
+            payload = json.loads(data_text)
+        except (TypeError, ValueError):
+            return
+        if isinstance(payload, dict) and payload.get("type") in self.proto.end_event_types:
+            self.ended = True

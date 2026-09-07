@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from helpers import wait_for_row, MockUpstream, add_upstream, add_group, provider_id, add_route, route_id, msg, parse_sse_events
 
 
@@ -51,6 +53,24 @@ def test_upstream_error_is_passed_through(gateway):
         resp = gateway.post("/v1/responses", json={"model": "gpt-test", "fail": True})
         assert resp.status_code == 429
         assert resp.json()["error"]["message"] == "quota exhausted"
+
+
+def test_hanging_error_body_does_not_block_failover(gateway):
+    """拿到 503 头后，错误正文不应挡住备用站。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_a, "opus-a")
+        add_route(gateway, "opus", g_b, "opus-b")
+        a.fail_with(503)
+        a.sick["hang_body"] = True
+
+        began = time.monotonic()
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        elapsed = time.monotonic() - began
+
+        assert resp.status_code == 200 and resp.json()["upstream"] == "siteB"
+        assert elapsed < 8.0, f"备用站被错误体拖住了 {elapsed:.2f}s"
 
 
 def test_unknown_model_returns_404(gateway):

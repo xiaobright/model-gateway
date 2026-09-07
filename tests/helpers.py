@@ -65,6 +65,12 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         code = sick.get("status")
         if not code:
             return None
+        if sick.get("hang_body"):
+            async def never() -> object:
+                await asyncio.Event().wait()
+                yield b""
+
+            return StreamingResponse(never(), status_code=code, media_type="application/json")
         return JSONResponse({"error": {"message": f"{name} is sick", "code": code}}, status_code=code)
 
     def unknown(model: str) -> JSONResponse | None:

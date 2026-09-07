@@ -28,8 +28,9 @@ WINDOWS: dict[str, tuple[int, int]] = {
 }
 DEFAULT_WINDOW = "1h"
 
-# 这几种收尾算"上游没把事办好"，用于健康度；client_abort 是下游自己走的，不算上游的锅
-BAD_NOTES = frozenset({"connect_failed", "upstream_abort", "truncated"})
+# 这些收尾都不是一次成功完成的请求，用于健康度和失败计数。client_abort 的责任在下游，
+# 但它同样不能在统计卡片里被算成成功；日志里的 note 仍保留了责任边界。
+BAD_NOTES = frozenset({"connect_failed", "upstream_abort", "truncated", "client_abort"})
 
 # ---------------------------------------------------------------- 活跃流
 
@@ -61,7 +62,38 @@ def _pct(values: Sequence[float], q: float) -> float:
 
 
 def _failed(row: dict) -> bool:
-    return row["status"] >= 500 or row["note"] in BAD_NOTES
+    return int(row.get("status") or 0) >= 400 or row.get("note") in BAD_NOTES
+
+
+def _saved(row: dict) -> bool:
+    """只有第二次尝试最终正常收尾，才算一次真正的救回。"""
+    return (
+        int(row.get("attempt") or 1) > 1
+        and 200 <= int(row.get("status") or 0) < 400
+        and not _failed(row)
+        and row.get("note") != "client_abort"
+    )
+
+
+def request_stats(rows: Iterable[dict] | None = None) -> dict[str, int]:
+    """集中计算转发统计，所有协议相关的输入口径都从 Protocol 描述符派生。"""
+    rows = tuple(_all_rows() if rows is None else rows)
+    return {
+        "requests": len(rows),
+        "input_tokens": sum(int(r.get("input_tokens") or 0) for r in rows),
+        "output_tokens": sum(int(r.get("output_tokens") or 0) for r in rows),
+        "cached_tokens": sum(int(r.get("cached_tokens") or 0) for r in rows),
+        "cache_creation_tokens": sum(int(r.get("cache_creation_tokens") or 0) for r in rows),
+        "context_tokens": sum(context_tokens(r) for r in rows),
+        "saved": sum(_saved(r) for r in rows),
+        "failed_over": sum(r.get("note") == "failed_over" for r in rows),
+    }
+
+
+def cache_hit_rate(stats: dict[str, int]) -> float:
+    """缓存读取 / 协议归一化后的总输入；Anthropic 的 cache_read 不在 input 内。"""
+    total = stats.get("context_tokens") or 0
+    return round((stats.get("cached_tokens") or 0) / total, 4) if total else 0.0
 
 
 def _buckets(window: str) -> tuple[int, int, int]:
@@ -196,8 +228,7 @@ def model_top(limit: int = 8, rows: Iterable[dict] | None = None) -> list[dict[s
 def overview(window: str = DEFAULT_WINDOW, top: int = 8) -> dict[str, Any]:
     """概览视图一次拿全，省掉前端三次往返。"""
     rows = _all_rows()
-    stats = db.request_stats()
-    total_in = stats["input_tokens"]
+    stats = request_stats(rows)
     return {
         "series": series(window, rows),
         "upstreams": upstream_health(rows),
@@ -205,7 +236,7 @@ def overview(window: str = DEFAULT_WINDOW, top: int = 8) -> dict[str, Any]:
         "live": live(),
         "totals": {
             **stats,
-            "cache_hit_rate": round(stats["cached_tokens"] / total_in, 4) if total_in else 0.0,
+            "cache_hit_rate": cache_hit_rate(stats),
             "p95": p95_overall(rows),
         },
     }
@@ -251,7 +282,12 @@ def context_tokens(row: dict) -> int:
     规则只在 protocols 里写一份。"""
     proto = protocols.by_name(row.get("protocol") or "")
     return proto.context_tokens(
-        (row["input_tokens"], row["output_tokens"], row["cached_tokens"])
+        (
+            row.get("input_tokens"),
+            row.get("output_tokens"),
+            row.get("cached_tokens"),
+            row.get("cache_creation_tokens"),
+        )
     )
 
 

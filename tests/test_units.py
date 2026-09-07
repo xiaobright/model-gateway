@@ -10,39 +10,82 @@ import pytest
 from helpers import PROXY_CERT, PROXY_KEY, MockProxy, MockUpstream
 
 
-def test_has_end_marker_spans_chunk_boundary():
-    """传输层常会把小块合并，端到端测不稳，所以直接测这个纯函数。"""
-    from gateway.proxy import has_end_marker
+def test_sse_observer_spans_chunks_and_counts_content_once():
+    """事件边界和内容统计都不应受传输层 chunk 分片影响。"""
+    from gateway.protocols import OPENAI, SSEObserver
 
-    buf = bytearray()
-    for piece in (b'data: {"type": "response.comp', b'leted", "usage": {}}\n\n'):
-        buf.extend(piece)
-        found = has_end_marker(buf, len(piece))
-    assert found, "标记被切成两半时必须靠回看窗口认出来"
+    observer = SSEObserver(OPENAI)
+    for piece in (
+        b'data: {"delta":"hello ',
+        b'world"}\n\n',
+        b'data: {"delta":"literal [DONE]"}\n\n',
+    ):
+        observer.feed(piece)
+    assert observer.text_bytes == len("hello world") + len("literal [DONE]")
+    assert not observer.ended, "正文里的 [DONE] 不是完成事件"
 
-    # 单块内的两种标记都要认
-    assert has_end_marker(bytearray(b'data: [DONE]\n\n'), 14)
-    assert has_end_marker(bytearray(b'x' * 100 + b'response.completed'), 18)
-    # 只在新数据窗口里找：老数据里的标记不该被反复命中
-    assert not has_end_marker(bytearray(b'response.completed' + b'y' * 500), 100)
-    assert not has_end_marker(bytearray(b'data: {"type": "response.in_progress"}'), 38)
-    assert not has_end_marker(bytearray(b'anything'), 0)
+    observer.feed(b'data: {"type":"response.comp')
+    observer.feed(b'leted", "usage": {}}\n\n')
+    assert observer.ended, "完成事件跨 chunk 也必须识别"
 
 
-def test_has_end_marker_recognizes_anthropic_completion_event():
-    from gateway.protocols import ANTHROPIC
-    from gateway.proxy import has_end_marker
+def test_sse_observer_requires_the_protocol_specific_event():
+    from gateway.protocols import ANTHROPIC, SSEObserver
 
-    markers = ANTHROPIC.end_markers
-    buf = bytearray()
-    for piece in (b"event: message_st", b'op\ndata: {"type":"message_stop"}\n\n'):
-        buf.extend(piece)
-        found = has_end_marker(buf, len(piece), markers)
-    assert found, "结束事件被切成两半时也要认出来"
-    assert not has_end_marker(bytearray(b'event: message_delta\ndata: {}'), 29, markers)
-    # Responses API 的标记不该被 Anthropic 认成结束，反过来也一样
-    assert not has_end_marker(bytearray(b"data: response.completed"), 24, markers)
-    assert not has_end_marker(bytearray(b'data: {"type":"message_stop"}'), 29)
+    observer = SSEObserver(ANTHROPIC)
+    observer.feed(b"event: message_st")
+    observer.feed(b"op\ndata: {}\n\n")
+    assert observer.ended, "Anthropic 的真实事件类型跨 chunk 也能结束"
+
+    data_only = SSEObserver(ANTHROPIC)
+    data_only.feed(b'data: {"type":"message_stop"}\n\n')
+    assert data_only.ended, "没有 event 头时使用 data JSON 的 type"
+
+    wrong = SSEObserver(ANTHROPIC)
+    wrong.feed(b"data: response.completed\n\n")
+    assert not wrong.ended
+
+
+def test_sse_observer_keeps_an_incomplete_frame_for_the_next_chunk():
+    from gateway.protocols import OPENAI, SSEObserver
+
+    observer = SSEObserver(OPENAI)
+    observer.feed(b'data: {"delta":"hello')
+    assert observer.text_bytes == 0 and not observer.ended
+    observer.feed(b' world"}\n\n')
+    assert observer.text_bytes == len("hello world")
+
+
+def test_waiting_for_headers_can_be_cancelled_when_client_disconnects():
+    from gateway.proxy import ClientDisconnected, _send_until_headers
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class Request:
+        checks = 0
+
+        async def is_disconnected(self):
+            self.checks += 1
+            return self.checks > 1
+
+    class Client:
+        async def send(self, prepared, *, stream):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    async def run():
+        task = asyncio.create_task(_send_until_headers(Request(), Client(), object()))
+        await started.wait()
+        with pytest.raises(ClientDisconnected):
+            await task
+
+    asyncio.run(run())
+    assert cancelled.is_set(), "下游断开后必须取消等待响应头的上游任务"
 
 
 def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():

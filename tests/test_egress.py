@@ -30,6 +30,20 @@ def set_egress(client: httpx.Client, name: str, egress: str) -> None:
     assert resp.json()["egress"] == egress
 
 
+def test_disabling_a_provider_does_not_reset_its_egress(gateway):
+    with MockUpstream("siteA") as a:
+        add_upstream(gateway, a, "siteA")
+        set_egress(gateway, "siteA", "direct")
+        row = next(u for u in gateway.get("/admin/api/upstreams").json() if u["name"] == "siteA")
+
+        # 模拟列表里的快捷开关：即使旧调用方没有带 egress，后端也保留它。
+        changed = gateway.put(
+            f"/admin/api/upstreams/{row['id']}",
+            json={"name": row["name"], "base_url": row["base_url"], "enabled": False},
+        )
+        assert changed.status_code == 200 and changed.json()["egress"] == "direct"
+
+
 def test_egress_sends_that_site_through_the_proxy(gateway):
     """填了代理的站，字节真的从那扇门出去；没填的站照旧不走。"""
     with MockProxy() as px, MockUpstream("siteA") as a, MockUpstream("siteB") as b:

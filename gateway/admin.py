@@ -26,7 +26,8 @@ class UpstreamIn(BaseModel):
     enabled: bool = True
     header_override: str = ""
     # 从哪扇门出去：'' 跟随系统代理 / 'direct' 直连 / 一个代理 URL
-    egress: str = ""
+    # PUT 省略时保留已有出口，兼容列表快捷开关等只更新启用状态的调用方。
+    egress: str | None = None
 
 
 class GroupIn(BaseModel):
@@ -205,7 +206,7 @@ def post_upstream(payload: UpstreamIn) -> dict[str, Any]:
             payload.base_url.strip(),
             _validate_override(payload.header_override),
             payload.enabled,
-            _validate_egress(payload.egress),
+            _validate_egress(payload.egress or ""),
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
@@ -217,6 +218,8 @@ def post_upstream(payload: UpstreamIn) -> dict[str, Any]:
 @router.put("/upstreams/{upstream_id}")
 def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
     name = payload.name.strip()
+    current = _require_upstream(upstream_id)
+    egress = current.egress if payload.egress is None else _validate_egress(payload.egress)
     try:
         ok = db.update_upstream(
             upstream_id,
@@ -224,7 +227,7 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
             payload.base_url.strip(),
             payload.enabled,
             _validate_override(payload.header_override),
-            _validate_egress(payload.egress),
+            egress,
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
@@ -421,6 +424,8 @@ def get_model_routes() -> list[dict[str, Any]]:
                 # （add_model_route 守着），活跃的那条优先，免得手改过的老库看起来乱跳
                 "protocol": row["protocol"],
                 "candidates": [],
+                # 保存的首选和当前实际起点分开：停用首选后，自动降级仍可能有可用候选。
+                "preferred_route_id": None,
                 "active_route_id": None,
             },
         )
@@ -450,9 +455,15 @@ def get_model_routes() -> list[dict[str, Any]]:
         )
         if is_active:
             group["protocol"] = row["protocol"]
-            # 供应商和分组都启用才算真的在生效
-            if upstream_on and group_on:
-                group["active_route_id"] = row["route_id"]
+            group["preferred_route_id"] = row["route_id"]
+
+    # 和 proxy.forward 使用同一条 resolve_chain + 断路器排序规则，返回当前真正会先
+    # 尝试的候选。这里不能只看 is_active 那一行，否则首选停用时页面会误报无可用上游。
+    for group in grouped.values():
+        chain = db.resolve_chain(group["model_name"], group["protocol"])
+        if chain:
+            ordered = failover.order_chain(chain) if failover.enabled(group["protocol"]) else chain
+            group["active_route_id"] = ordered[0].route_id
     return sorted(grouped.values(), key=lambda g: g["model_name"])
 
 
@@ -622,11 +633,10 @@ def clear_requests() -> dict[str, Any]:
 
 @router.get("/stats")
 def get_stats() -> dict[str, Any]:
-    stats = db.request_stats()
-    total_in = stats["input_tokens"]
+    stats = stats_mod.request_stats()
     return {
         **stats,
-        "cache_hit_rate": round(stats["cached_tokens"] / total_in, 4) if total_in else 0.0,
+        "cache_hit_rate": stats_mod.cache_hit_rate(stats),
         "live": stats_mod.live(),
     }
 

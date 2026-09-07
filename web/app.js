@@ -394,13 +394,13 @@ function markOverride() {
   $('up-adv').open = Boolean(raw);
 }
 
-function upstreamPayload() {
+function upstreamPayload(source = null, enabled = null) {
   return {
-    name: $('up-name').value.trim(),
-    base_url: $('up-base').value.trim(),
-    enabled: $('up-enabled').checked,
-    header_override: $('up-override').value.trim(),
-    egress: egressValue(),
+    name: source ? source.name : $('up-name').value.trim(),
+    base_url: source ? source.base_url : $('up-base').value.trim(),
+    enabled: enabled ?? (source ? source.enabled : $('up-enabled').checked),
+    header_override: source ? (source.header_override || '') : $('up-override').value.trim(),
+    egress: source ? (source.egress || '') : egressValue(),
   };
 }
 
@@ -819,10 +819,7 @@ const ACTIONS = {
   'toggle-upstream': async ({ uid }, el) => {
     const u = state.upstreams.find((x) => x.id === Number(uid));
     try {
-      await api('PUT', `/admin/api/upstreams/${u.id}`, {
-        name: u.name, base_url: u.base_url, header_override: u.header_override,
-        enabled: el.checked,
-      });
+      await api('PUT', `/admin/api/upstreams/${u.id}`, upstreamPayload(u, el.checked));
     } catch (e) {
       el.checked = !el.checked;
       throw e;

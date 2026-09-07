@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS request_log(
   input_tokens INTEGER,
   output_tokens INTEGER,
   cached_tokens INTEGER,
+  cache_creation_tokens INTEGER,
   note TEXT NOT NULL DEFAULT '',
   attempt INTEGER NOT NULL DEFAULT 1
 );
@@ -92,8 +93,9 @@ LOG_KEEP_ROWS = 2000
 #   0 = 还没打过号（最早那一代，得按形状认）
 #   1 = api_key 还在供应商行上，没有分组
 #   2 = 有分组，但接口标记还挂在供应商上，候选还是 (模型, 分组) 复合主键
-#   3 = 当前：接口在分组上，候选有自增 id
-SCHEMA_VERSION = 3
+#   3 = 接口在分组上，候选有自增 id
+#   4 = request_log 记录 Anthropic 的缓存创建 token
+SCHEMA_VERSION = 4
 
 # 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
 BACKUP_KEEP = 3
@@ -429,6 +431,9 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             # 总结、计费按完整的算，那种记录的字节数和 token 数不是一回事
             ("resp_text_bytes", "INTEGER NOT NULL DEFAULT 0"),
             ("thinking", "INTEGER NOT NULL DEFAULT 0"),
+            # Anthropic 的 input_tokens 不含 cache_read / cache_creation，统计时需要保留
+            # 这两个分量，才能按协议算出真实上下文和缓存命中率。
+            ("cache_creation_tokens", "INTEGER"),
         ],
     }
     for table, columns in wanted.items():
@@ -482,14 +487,16 @@ def _upgrade(path, stage: int) -> None:
     if stage == 1:
         _migrate_group_protocols(path)
     with _conn() as conn:
-        # 补列必须在**重建表之前**：_migrate_route_ids 是 INSERT ... SELECT，
+        # 补列必须在**重建表之前**：旧版 _migrate_route_ids 是 INSERT ... SELECT，
         # 要从老表上读 priority，而老库根本没这一列 —— 先补上才不会报 no such column
         _add_missing_columns(conn)
         if stage == 0:
             # 最老那一代一步到位：每个供应商变成一个分组，候选直接建成最新形状
             _migrate_to_groups(conn)
-        else:
+        elif stage in (1, 2):
+            # v1/v2 还是 (model_name, group_id) 复合主键，v3 才引入候选自增 id
             _migrate_route_ids(conn)
+        # stage 3 -> 4 只有 request_log 补列，不重建 model_routes，避免改变候选 id。
         _drop_legacy_bits(conn)
         _normalize_base_urls(conn)
         _backfill_log_protocol(conn)
@@ -998,16 +1005,17 @@ def insert_request(
     attempt: int = 1,
     resp_text_bytes: int = 0,
     thinking: bool = False,
+    cache_creation_tokens: int | None = None,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             "INSERT INTO request_log(client, model, remote_model, protocol, upstream, group_name,"
             " status, stream, req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens,"
-            " cached_tokens, note, attempt, resp_text_bytes, thinking)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " cached_tokens, cache_creation_tokens, note, attempt, resp_text_bytes, thinking)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (client, model, remote_model, protocol, upstream, group_name, status, int(stream),
-             req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens, note,
-             attempt, resp_text_bytes, int(thinking)),
+             req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens,
+             cache_creation_tokens, note, attempt, resp_text_bytes, int(thinking)),
         )
         conn.execute(
             "DELETE FROM request_log WHERE id <= (SELECT MAX(id) - ? FROM request_log)", (LOG_KEEP_ROWS,)
@@ -1044,19 +1052,7 @@ def clear_request_log() -> int:
 
 
 def request_stats() -> dict:
-    with _conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(input_tokens),0) AS it,"
-            " COALESCE(SUM(output_tokens),0) AS ot, COALESCE(SUM(cached_tokens),0) AS ct,"
-            # 第二次以上的尝试还成了，就是被自动降级救回来的一次
-            " COALESCE(SUM(attempt > 1 AND status < 400),0) AS saved,"
-            " COALESCE(SUM(note='failed_over'),0) AS failed_over FROM request_log"
-        ).fetchone()
-    return {
-        "requests": row["n"],
-        "input_tokens": row["it"],
-        "output_tokens": row["ot"],
-        "cached_tokens": row["ct"],
-        "saved": row["saved"],
-        "failed_over": row["failed_over"],
-    }
+    """兼容旧调用点；统计口径统一由 stats 模块按协议描述符计算。"""
+    from . import stats as stats_mod
+
+    return stats_mod.request_stats()

@@ -43,6 +43,32 @@ def test_disabled_upstream_is_not_routed(gateway):
         assert "gpt-test" in exposed, "停用供应商只影响路由，不改变对下游暴露的模型清单"
 
 
+def test_route_status_reports_the_available_fallback_when_preferred_is_disabled(gateway):
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        r_a = add_route(gateway, "opus", g_a, "opus-a")
+        r_b = add_route(gateway, "opus", g_b, "opus-b")
+        uid = provider_id(gateway, "siteA")
+        detail = next(u for u in gateway.get("/admin/api/upstreams").json() if u["id"] == uid)
+
+        disabled = gateway.put(
+            f"/admin/api/upstreams/{uid}",
+            json={
+                "name": detail["name"],
+                "base_url": detail["base_url"],
+                "enabled": False,
+                "egress": detail["egress"],
+            },
+        )
+        assert disabled.status_code == 200, disabled.text
+
+        row = next(r for r in gateway.get("/admin/api/models").json() if r["model_name"] == "opus")
+        assert row["preferred_route_id"] == r_a
+        assert row["active_route_id"] == r_b
+        assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
+
+
 def test_disabled_group_is_not_routed(gateway):
     """分组也能单独停用：同一个站的某把 key 额度用完了，先停这一组而不是整个站。"""
     with MockUpstream("siteA") as a:

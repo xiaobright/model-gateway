@@ -30,6 +30,35 @@ def test_request_log_records_usage_and_stats(gateway):
         assert 0 < stats["cache_hit_rate"] < 1
 
 
+def test_stats_normalize_anthropic_cache_and_count_http_errors_as_failures(gateway):
+    from gateway import db
+
+    common = dict(
+        client="test", model="m", upstream="siteA", stream=False,
+        req_bytes=10, resp_bytes=20, duration_ms=1,
+    )
+    db.insert_request(
+        **common, status=200, protocol="anthropic", input_tokens=100,
+        output_tokens=10, cached_tokens=900, cache_creation_tokens=50, note="ok",
+    )
+    db.insert_request(
+        **common, status=401, protocol="openai", input_tokens=10,
+        output_tokens=0, cached_tokens=0, note="ok",
+    )
+    db.insert_request(
+        **common, status=200, protocol="openai", input_tokens=10,
+        output_tokens=0, cached_tokens=0, attempt=2, note="truncated",
+    )
+
+    stats = gateway.get("/admin/api/stats").json()
+    assert stats["context_tokens"] == 1070, "Anthropic 的 cache_read / cache_creation 都要进输入总量"
+    assert stats["cache_hit_rate"] == round(900 / 1070, 4)
+
+    health = next(h for h in gateway.get("/admin/api/stats/upstreams").json() if h["name"] == "siteA")
+    assert health["bad"] == 2 and health["ok_rate"] == 0.3333
+    assert stats["saved"] == 0, "截断的第二次尝试不能算救回"
+
+
 def test_request_log_records_protocol_and_health_splits_by_it(gateway):
     """管理页要能回答「这条是哪种格式来的」和「这个站的哪种格式在用」。
 
