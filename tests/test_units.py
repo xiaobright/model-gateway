@@ -88,6 +88,33 @@ def test_waiting_for_headers_can_be_cancelled_when_client_disconnects():
     assert cancelled.is_set(), "下游断开后必须取消等待响应头的上游任务"
 
 
+def test_cancelling_as_headers_arrive_closes_the_response():
+    """响应头刚到、轮询还没把 response 交出去时取消，也不能泄漏连接。"""
+    from gateway.proxy import _send_until_headers
+
+    async def run():
+        headers_arrived = asyncio.Event()
+        response = httpx.Response(200, stream=httpx.ByteStream(b"unused"))
+
+        class Request:
+            async def is_disconnected(self):
+                return False
+
+        class Client:
+            async def send(self, prepared, *, stream):
+                headers_arrived.set()
+                return response
+
+        task = asyncio.create_task(_send_until_headers(Request(), Client(), object()))
+        await headers_arrived.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.is_closed
+
+    asyncio.run(run())
+
+
 def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
     """#ca= 把自签代理的证书钉进信任列表；不钉就过不了 TLS —— 这正是它的用处。
 

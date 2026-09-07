@@ -974,6 +974,16 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
   font-family: var(--mono);
 }
 .call-sub { font-size: 11.5px; margin-top: 3px; }
+.call-cancel {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 26px; height: 26px; padding: 0; border: 1px solid transparent;
+  border-radius: var(--r-sm); background: transparent; color: var(--ink-3);
+  font: inherit; font-size: 20px; line-height: 1; cursor: pointer;
+}
+.call-cancel:hover, .call-cancel:focus-visible {
+  color: var(--crit); background: var(--hover); border-color: var(--hair-2);
+}
+.call-cancel:disabled { opacity: 0.4; cursor: default; }
 .call-state { display: flex; align-items: center; gap: 7px; margin-top: 6px; }
 
 /* 已经结束的：留 90 秒当「刚刚发生过什么」，压暗一档，别跟在跑的抢注意力 */

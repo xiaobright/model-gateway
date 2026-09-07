@@ -146,6 +146,12 @@ async def _send_until_headers(
                 raise ClientDisconnected
             await asyncio.sleep(RESPONSE_POLL)
         return await task
+    except BaseException:
+        # 取消恰好撞上响应头到达时，send 的任务可能已经完成，也要归还那条连接。
+        if task.done() and not task.cancelled() and task.exception() is None:
+            with contextlib.suppress(Exception):
+                await task.result().aclose()
+        raise
     finally:
         if not task.done():
             task.cancel()
@@ -325,11 +331,26 @@ async def forward(
             # 放在 try 里：出口配坏了（比如 #ca 指的证书被删了）是「这扇门不通」，
             # 按连不上处理、降级换下一扇，而不是整个请求 500
             client = await get_client(route.upstream.egress)
-            resp = await _send_until_headers(
-                request,
-                client,
-                client.build_request("POST", url, content=sent_body, headers=headers),
+            resp = await inflight.wait_for_upstream(
+                call,
+                _send_until_headers(
+                    request,
+                    client,
+                    client.build_request("POST", url, content=sent_body, headers=headers),
+                ),
             )
+        except inflight.ManualAbort:
+            elapsed = time.monotonic() - began
+            log(f"POST {endpoint} model={requested!r} -> 499 (手动中断) after {elapsed:.1f}s")
+            inflight.finish(call, status=499, note="manual_abort")
+            if record:
+                _record(
+                    request=request, route=route, proto=proto, model=asked,
+                    remote_model=remote, status=499, stream_flag=stream_flag,
+                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    usage=NO_USAGE, note="manual_abort", attempt=attempt,
+                )
+            return _error(proto, 499, "请求已手动中断")
         except ClientDisconnected:
             elapsed = time.monotonic() - began
             log(
@@ -440,15 +461,22 @@ async def forward(
         sent = 0
         text_bytes = 0
         thinking = False
-        observer = protocols.SSEObserver(proto)
+        content_type = upstream_resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        observer = protocols.SSEObserver(proto) if content_type == "text/event-stream" else None
+        json_body = bytearray()
         head = bytearray()
         tail = bytearray()
         note = "ok"
         # 第一块字节开始往下走才算「正在返回」：在这之前是「等上游出字」，两件事的
         # 处置完全不同（卡在等待是模型在想，卡在连接是站连不上）
-        inflight.phase(call, inflight.STREAM)
+        chunks = upstream_resp.aiter_bytes()
         try:
-            async for chunk in upstream_resp.aiter_bytes():
+            while True:
+                try:
+                    chunk = await inflight.wait_for_upstream(call, anext(chunks))
+                except StopAsyncIteration:
+                    break
+                inflight.phase(call, inflight.STREAM)
                 sent += len(chunk)
                 if len(head) < HEAD_KEEP:
                     head.extend(chunk[: HEAD_KEEP - len(head)])
@@ -462,16 +490,23 @@ async def forward(
                 tail.extend(chunk)
                 # 观察器按完整 SSE 帧统计内容和结束事件；它不参与实际转发，解析出错也不能
                 # 影响下面的原始 chunk。
-                try:
-                    observer.feed(chunk)
-                    text_bytes = observer.text_bytes
-                    thinking = observer.thinking
-                except Exception as exc:
-                    log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
+                if observer is not None:
+                    try:
+                        observer.feed(chunk)
+                        text_bytes = observer.text_bytes
+                        thinking = observer.thinking
+                    except Exception as exc:
+                        log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
+                else:
+                    # JSON 要收齐后再统计，字符串和 UTF-8 字符也可能被网络切开。
+                    json_body.extend(chunk)
                 if len(tail) > TAIL_KEEP:
                     del tail[: len(tail) - TAIL_KEEP]
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
                 yield chunk
+        except inflight.ManualAbort:
+            note = "manual_abort"
+            log(f"  manually stopped after {sent}B")
         except httpx.HTTPError as exc:
             note = "upstream_abort"
             log(f"  stream aborted: {exc.__class__.__name__}: {exc} after {sent}B")
@@ -479,17 +514,26 @@ async def forward(
         except (GeneratorExit, asyncio.CancelledError):
             # 很多上游发完完成事件后并不主动收连接，客户端（codex 就是这样）拿到完成事件
             # 就走了，我们这边还卡在等下一块。这属于正常收尾，不是异常。
-            note = "ok" if observer.ended else "client_abort"
-            log(f"  client left after {sent}B (completed={observer.ended})")
+            completed = observer is not None and observer.ended
+            note = "ok" if completed else "client_abort"
+            log(f"  client left after {sent}B (completed={completed})")
             raise
         else:
             # 只有「上游说 200 且是流式」时缺完成事件才算被截断，4xx/5xx 本来就没有完成事件
-            if stream_flag and upstream_resp.status_code < 300 and not observer.ended:
+            if observer is not None and upstream_resp.status_code < 300 and not observer.ended:
                 note = "truncated"
                 log(f"  WARN stream ended WITHOUT completion event status={upstream_resp.status_code} resp={sent}B")
             else:
                 log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
+            if json_body:
+                try:
+                    payload = json.loads(json_body)
+                    if isinstance(payload, dict):
+                        text_bytes, thinking = proto.count_json_content(payload)
+                except Exception as exc:
+                    log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
+                inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
             # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
             usage = proto.extract_usage(bytes(head), bytes(tail))
             # 先落库（纯同步，即使外层在取消也能跑完），再还连接

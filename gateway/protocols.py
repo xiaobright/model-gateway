@@ -108,6 +108,39 @@ def openai_content(chunk: bytes) -> tuple[int, bool]:
     return _total(_OPENAI_TEXT, chunk), bool(_OPENAI_THINK.search(chunk))
 
 
+def _text_size(value: object) -> int:
+    return len(value.encode("utf-8")) if isinstance(value, str) else 0
+
+
+def anthropic_json_content(payload: dict) -> tuple[int, bool]:
+    """非流式响应只数输出 content，不能把回显的请求或其它元数据也算进去。"""
+    size, thinking = 0, False
+    for block in payload.get("content", []):
+        kind = block.get("type")
+        if kind == "text":
+            size += _text_size(block.get("text"))
+        elif kind in ("thinking", "redacted_thinking"):
+            thinking = True
+            size += _text_size(block.get("thinking"))
+    return size, thinking
+
+
+def openai_json_content(payload: dict) -> tuple[int, bool]:
+    """Responses 的完整 JSON 用 output 数组，流式的 delta 正则在这里匹配不到。"""
+    size, thinking = 0, False
+    for item in payload.get("output", []):
+        kind = item.get("type")
+        if kind == "message":
+            for part in item.get("content", []):
+                size += _text_size(part.get("text")) + _text_size(part.get("refusal"))
+        elif kind == "reasoning":
+            thinking = True
+            size += sum(_text_size(part.get("text")) for part in item.get("summary", []))
+        elif kind == "function_call":
+            size += _text_size(item.get("arguments"))
+    return size, thinking
+
+
 def openai_error(status: int, message: str) -> dict:
     return {"error": {"message": message, "type": "gateway_error", "code": status}}
 
@@ -154,6 +187,8 @@ class Protocol:
     context_tokens: Callable[[Usage], int]
     # 一块字节 -> (里面有多少字节是内容, 有没有思维链)
     count_content: Callable[[bytes], tuple[int, bool]]
+    # 完整非流式 JSON -> 同样的内容统计；不把 JSON 当成没有帧边界的 SSE
+    count_json_content: Callable[[dict], tuple[int, bool]]
     error_body: Callable[[int, str], dict]
     auth_headers: Callable[[str], dict[str, str]]
     # 有些站按客户端指纹拦截，默认就伪装成这个接口对应的官方客户端。
@@ -174,6 +209,7 @@ OPENAI = Protocol(
     extract_usage=openai_usage,
     context_tokens=openai_context,
     count_content=openai_content,
+    count_json_content=openai_json_content,
     error_body=openai_error,
     auth_headers=openai_auth,
     fingerprint={"user-agent": "codex_cli_rs", "originator": "codex_cli_rs"},
@@ -187,6 +223,7 @@ ANTHROPIC = Protocol(
     extract_usage=anthropic_usage,
     context_tokens=anthropic_context,
     count_content=anthropic_content,
+    count_json_content=anthropic_json_content,
     error_body=anthropic_error,
     auth_headers=anthropic_auth,
     fingerprint={"user-agent": "claude-cli/2.0.0 (external, cli)", "x-app": "cli"},

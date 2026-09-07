@@ -574,6 +574,12 @@ def get_inflight() -> dict[str, Any]:
     }
 
 
+@router.post("/inflight/{call_id}/cancel")
+async def cancel_inflight(call_id: int) -> dict[str, bool]:
+    # 取消 Future 必须在转发所在的事件循环里执行，不能用同步端点的线程池。
+    return {"ok": True, "cancelled": inflight.cancel(call_id)}
+
+
 # ---------------------------------------------------------------- 自动降级
 
 

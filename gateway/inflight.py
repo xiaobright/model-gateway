@@ -19,8 +19,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import time
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +76,9 @@ class Call:
     trail: list[dict[str, Any]] = field(default_factory=list)   # 前面失败掉的那几次
     note: str = ""
     done_at: float = 0.0
+    cancel_requested: bool = False
+    # 只取消这条请求正在等的上游操作，不碰服务任务或其它请求。
+    pending: asyncio.Future | None = field(default=None, repr=False)
 
     @property
     def elapsed_ms(self) -> int:
@@ -83,6 +88,38 @@ class Call:
 
 _calls: dict[int, Call] = {}
 _ids = itertools.count(1)
+
+
+class ManualAbort(Exception):
+    """用户从实时页中断了这条请求。"""
+
+
+async def wait_for_upstream(call: Call, operation: Awaitable[Any]) -> Any:
+    """登记当前上游等待，让管理接口能立即取消卡住的 send/read。"""
+    pending = asyncio.ensure_future(operation)
+    call.pending = pending
+    if call.cancel_requested:
+        pending.cancel()
+    try:
+        return await pending
+    except asyncio.CancelledError:
+        if call.cancel_requested:
+            raise ManualAbort from None
+        raise
+    finally:
+        call.pending = None
+
+
+def cancel(call_id: int) -> bool:
+    """由 async 管理接口在网关的事件循环里调用；重复中断无副作用。"""
+    call = _calls.get(call_id)
+    if call is None or call.done_at:
+        return False
+    if not call.cancel_requested:
+        call.cancel_requested = True
+        if call.pending is not None:
+            call.pending.cancel()
+    return True
 
 
 # ---------------------------------------------------------------- 写（只有 proxy 调）
@@ -267,6 +304,7 @@ def _as_dict(call: Call) -> dict[str, Any]:
         "elapsed_ms": call.elapsed_ms,
         "trail": list(call.trail),
         "note": call.note,
+        "cancel_requested": call.cancel_requested,
     }
 
 

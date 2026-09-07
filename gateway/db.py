@@ -87,8 +87,8 @@ CREATE TABLE IF NOT EXISTS settings(
 LOG_KEEP_ROWS = 2000
 
 # 库结构的版本号（存在 sqlite 的 user_version 里）。每次改结构 +1，并在 _upgrade 里
-# 补一条对应 stage 的动作。已经是这个号的库启动时直接放行 —— 不用再按形状去猜，
-# 也不用每次把每张表的 table_info 翻一遍
+# 补一条对应 stage 的动作。最新库只额外核对曾被漏迁移的缓存创建列，
+# 不用每次把每张表的 table_info 翻一遍。
 #
 #   0 = 还没打过号（最早那一代，得按形状认）
 #   1 = api_key 还在供应商行上，没有分组
@@ -404,7 +404,7 @@ def _warn_mixed_models(conn: sqlite3.Connection) -> None:
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
     """给**正在被迁移的**库补列 —— CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段。
 
-    只在迁移那条路上调：已经是最新的库靠 user_version 直接放行，不必每次启动都把
+    只在迁移那条路上调：最新库在版本检测后放行，不必每次启动都把
     每张表的 table_info 翻一遍。重建表的迁移动作跑完还会再补一次（漏一个字段的代价
     是启动之后到处报 no such column，而这个检查是幂等的）。
     """
@@ -465,18 +465,21 @@ def _stamp(path, version: int) -> None:
 def _schema_stage(path) -> int:
     """这个库停在哪一代。
 
-    只有没打过号的库才需要按形状认 —— 那一代没留版本号，而形状认一次就够：
-    认完立刻打号，之后每次启动只看 user_version，不再去翻 table_info。
+    没打过号的库按形状认。v4 还要核对缓存创建列：旧版曾把没补列的 v3 库
+    直接盖上 v4 的号，这种库也要能在下次启动时补迁移。
     """
     version = _schema_version(path)
-    if version:
+    if version not in (0, SCHEMA_VERSION):
         return version
-    if _is_pre_group_shape(path):
-        return 0
-    if _is_pre_protocol_shape(path):
-        return 1
-    if _is_pre_routeid_shape(path):
-        return 2
+    if not version:
+        if _is_pre_group_shape(path):
+            return 0
+        if _is_pre_protocol_shape(path):
+            return 1
+        if _is_pre_routeid_shape(path):
+            return 2
+    if "cache_creation_tokens" not in _columns(path, "request_log"):
+        return 3
     return SCHEMA_VERSION
 
 

@@ -108,6 +108,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                 for i in range(6):
                     await asyncio.sleep(0.04)
                     yield f'data: {json.dumps({"upstream": name, "i": i})}\n\n'.encode()
+                    if mode == "stalled":
+                        await asyncio.Event().wait()
                 if mode == "split_marker":
                     # 把完成事件的标记切在两块之间，模拟真实的 TCP 分片
                     yield b'data: {"type": "response.comp'

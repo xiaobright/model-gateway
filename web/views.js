@@ -464,6 +464,9 @@ function callHtml(c) {
       <span class="dim">→</span> <span class="call-up">${where}</span>${nth}
       <span class="grow"></span>
       <span class="call-ms" data-ms>${fmtDur(c.elapsed_ms)}</span>
+      ${done ? '' : `<button type="button" class="call-cancel" data-act="cancel-call" data-id="${c.id}"
+        title="${c.cancel_requested ? '正在中断' : '中断这条请求'}" aria-label="中断 ${esc(c.model)} 的请求"
+        ${c.cancel_requested ? 'disabled' : ''}>×</button>`}
     </div>
     <div class="call-sub dim">${bits.join(' · ')}</div>
     <div class="call-state">${statePart}</div>
@@ -747,6 +750,7 @@ const NOTE_LABEL = {
   connect_failed: ['crit', '连不上'],
   upstream_abort: ['crit', '上游断流'],
   client_abort: ['', '客户端断开'],
+  manual_abort: ['', '手动中断'],
   // 这一次失败被自动降级接住了：客户端没看到它，但钱和时间是真花了，所以照样留痕
   failed_over: ['warn', '已降级'],
 };

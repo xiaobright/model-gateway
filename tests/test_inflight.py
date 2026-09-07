@@ -44,6 +44,26 @@ def test_inflight_lists_the_running_request(gateway):
         assert after["counts"] == {"requests": 0, "streams": 0}
 
 
+def test_manual_cancel_closes_a_real_stream_and_gateway_stays_usable(gateway):
+    """真实 HTTP 连接也要及时收尾，不能只在登记表里把那条请求藏起来。"""
+    with MockUpstream("siteA") as upstream:
+        group = add_upstream(gateway, upstream, "siteA")
+        add_route(gateway, "gpt-test", group)
+        with gateway.stream("POST", "/v1/responses", json={"model": "gpt-test", "stream": True, "mode": "stalled"}) as stream:
+            chunks = stream.iter_bytes()
+            assert next(chunks)
+            target = gateway.get("/admin/api/inflight").json()["calls"][0]
+            response = gateway.post(f'/admin/api/inflight/{target["id"]}/cancel')
+            assert response.json() == {"ok": True, "cancelled": True}
+            rest = b"".join(chunks)
+            assert b"[DONE]" not in rest
+
+        done = wait_inflight(gateway, lambda data: not data["calls"])["recent"][0]
+        assert done["note"] == "manual_abort"
+        assert gateway.get("/admin/api/requests").json()[0]["note"] == "manual_abort"
+        assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
+
+
 def test_inflight_keeps_the_failover_trail(gateway):
     """降级最怕的是把问题藏起来：胜出的那条要带着「前面被谁拒了」。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:

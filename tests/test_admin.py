@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from helpers import wait_for_row, MockUpstream, add_upstream, add_group, provider_id, add_route, route_id, msg
 
 
@@ -295,6 +297,54 @@ def test_cloning_a_group_copies_the_key_to_the_other_interface(gateway):
         detail = gateway.get("/admin/api/upstreams").json()[0]
         assert detail["supports"] == ["anthropic", "openai"]
         assert {g["name"] for g in detail["groups"]} == {"默认"}, "同名不同接口"
+
+
+@pytest.mark.parametrize("version, missing", [(0, True), (3, True), (4, True), (0, False), (4, False)])
+def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatch, version, missing):
+    """未打号、正常 v3、误打 v4 的老库都要补列；完整的新库不应迁移或备份。"""
+    import sqlite3
+
+    from gateway import config, db
+
+    db_path = tmp_path / "gateway.db"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DB_PATH", db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(db._SCHEMA)
+        conn.executescript("""
+            INSERT INTO upstreams(id, name, base_url, egress) VALUES(5, 'siteA', 'https://a.example', 'direct');
+            INSERT INTO upstream_groups(id, upstream_id, name, protocol) VALUES(13, 5, 'default', 'anthropic');
+            INSERT INTO model_routes(id, model_name, group_id, remote_model, is_active, priority)
+                VALUES(42, 'm', 13, 'remote', 1, 7);
+            INSERT INTO request_log(client, model, upstream, protocol, status, stream, req_bytes, resp_bytes, duration_ms)
+                VALUES('test', 'm', 'siteA', 'anthropic', 200, 0, 10, 20, 30);
+        """)
+        if missing:
+            conn.execute("ALTER TABLE request_log DROP COLUMN cache_creation_tokens")
+        conn.execute(f"PRAGMA user_version={version}")
+    conn.close()
+
+    db.init_db()
+    assert db._schema_version(db_path) == db.SCHEMA_VERSION
+    assert "cache_creation_tokens" in db._columns(db_path, "request_log")
+    backups = list(tmp_path.glob("gateway.db.bak-*"))
+    assert bool(backups) == missing
+    if missing:
+        assert "cache_creation_tokens" not in db._columns(backups[0], "request_log")
+    route = db.resolve_route("m", "anthropic")
+    assert (route.route_id, route.group_id, route.remote_model, route.upstream.egress) == (42, 13, "remote", "direct")
+    assert db.list_routes()[0]["priority"] == 7
+    assert db.recent_requests(1)[0]["cache_creation_tokens"] is None
+    db.insert_request(
+        client="test", model="m", upstream="siteA", status=200, stream=False,
+        req_bytes=10, resp_bytes=20, duration_ms=30, input_tokens=100,
+        output_tokens=10, cached_tokens=20, cache_creation_tokens=50, note="ok", protocol="anthropic",
+    )
+    assert len(db.recent_requests()) == 2
+    assert db.recent_requests(1)[0]["cache_creation_tokens"] == 50
+    monkeypatch.setattr(db, "_backup_db", lambda path: pytest.fail("重复启动不应再次迁移"))
+    db.init_db()
+    assert db.resolve_route("m", "anthropic").route_id == 42
 
 
 _PRE_GROUP_SCHEMA = """

@@ -798,6 +798,12 @@ const ACTIONS = {
 
   'go-live': () => showView('live'),
 
+  'cancel-call': async ({ id }) => {
+    const result = await api('POST', `/admin/api/inflight/${Number(id)}/cancel`);
+    await refreshInflight();
+    toast(result.cancelled ? '已请求中断' : '请求已结束', 'ok');
+  },
+
   'toggle-theme': cycleTheme,
 
   'close-dialog': (_d, el) => el.closest('dialog').close(),
@@ -1026,7 +1032,7 @@ const ACTIONS = {
     const id = Number(rid);
     const group = state.routes.find((r) => r.model_name === model);
     const cand = group && group.candidates.find((c) => c.route_id === id);
-    if (!cand || cand.is_active) return;
+    if (!cand) return;
     if (!cand.upstream_enabled) return toast('这个供应商是停用状态，先在「上游站点」里启用它', 'err');
     if (!cand.group_enabled) return toast('这个分组是停用状态，展开那一行把它打开', 'err');
     const from = group.active_route_id;
