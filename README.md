@@ -15,10 +15,9 @@
 那把 key 走哪种接口。
 
 协议只在 `gateway/protocols.py` 登记一次：写一个描述符（结束标记、usage 在哪、鉴权头、
-错误体形状、客户端指纹），再到 `proxy.py` 挂一条路由。名字集合、指纹表、下拉选项都从
-`protocols.NAMES` 派生，别的模块不用再补一份 —— 以前要在三处各写一个名字，漏一处就是
-「转发侧认得、界面上选不到」这种半吊子状态。前端那份展示信息在 `web/util.js` 的
-`PROTO_INFO` 里，加协议时同步加一行（它是界面文案，没法和后端共用同一个常量）。
+错误体形状、客户端提示和默认统计/降级信息），再到 `proxy.py` 挂一条显式路由。名字集合、
+指纹表、管理页下拉选项都从描述符派生；前端启动时读取只读的
+`GET /admin/api/protocols`，不再另存一份协议 ID。这里仍是直通协议，不负责格式转换。
 
 上游地址一律填**站根**，不带 `/v1`。Anthropic 客户端让你填的就是站根（它自己拼 `/v1/messages`），
 OpenAI 那边习惯填到 `/v1` 为止 —— 同一个站两种说法，说明 `/v1` 属于接口路径而不属于站点。
@@ -425,17 +424,43 @@ connect 超时，串行就得等三倍。
 
 ## 测试
 
+PowerShell 下的日常快速验证（不启动监听端口、不访问公网）：
+
 ```
-.venv\Scripts\python -m pytest tests/ -v
+$env:PYTHONUTF8 = '1'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+& '.\.venv\Scripts\python.exe' -m pytest tests -q -p no:cacheprovider -m 'not network' --durations=10
+```
+
+需要真实 TCP、代理、TLS 或客户端断开语义时跑网络边界：
+
+```
+& '.\.venv\Scripts\python.exe' -m pytest tests -q -p no:cacheprovider -m network --durations=10
+```
+
+完整验收（包含两组）：
+
+```
+& '.\.venv\Scripts\python.exe' -m pytest tests -q -p no:cacheprovider --durations=15
+```
+
+前端没有构建步骤，语法和异步边界检查直接运行：
+
+```
+node --check web/app.js
+node --check web/views.js
+node --check web/util.js
+node --check web/async-state.js
+node --check web/group-editor.js
+node tests/web_protocols.test.mjs
 ```
 
 按关注点分了文件：`test_proxy`（转发）、`test_routing`（路由）、`test_admin`（管理接口与迁移）、
 `test_stats`（记录与统计）、`test_failover`（自动降级）、`test_inflight`（实时页）、
 `test_egress`（出口）、`test_units`（不依赖网关的纯函数）、`test_lifecycle`（进程内分块统计与取消）。
-真实 HTTP 用例共用 `conftest.py` 和 `helpers.py` 里的服务、mock 上游和断言帮手；进程内用例不启动服务。
-
-自动降级和出口那两组得等真实的 connect 超时和冷却期满，标了 `slow`，日常可以只跑其余的
-（`pytest -m "not slow"`，省掉一半时间）。
+默认用例通过 FastAPI `TestClient` 和 `httpx.MockTransport` 在进程内运行；`network` 标记的
+用例才启动 Uvicorn、真实 mock 上游或代理。两组集合互斥，合起来等于完整测试集。不要用
+跳过标记代替网络边界：自动降级规则本身走进程内模拟，真实流中断、代理和 TLS 才保留 socket。
 
 测试起两个真实 mock 上游验证：批量导入、流式透传、**流进行中切换不断流且后续请求走新上游**、错误透传、
 删除/停用候选后的路由兜底、带 `/` 的模型名可删除、重名上游返回 409、管理接口拒绝跨站，以及三种流收尾：
@@ -497,7 +522,10 @@ Anthropic 要把缓存读取加进去）、**某个方向忽大忽小时返回 0
 
 `web/` 没有构建步骤，浏览器直接吃原生 ES 模块：`index.html`（结构）、`style.css`（设计令牌 + 组件，
 跟随系统深浅色，右上角可手动切换）、`app.js`（视图路由 + 一张 `data-act` 动作表，事件走委托）、
-`views.js`（各视图的渲染）、`charts.js`（SVG 图表）、`motion.js`（动效与全局光照）、`util.js`（纯工具）。
+`views.js`（各视图的渲染）、`charts.js`（SVG 图表）、`motion.js`（动效与全局光照）、`util.js`（纯工具）、
+`group-editor.js`（分组编辑会话、模型列表请求和局部写入锁）、`async-state.js`（同一数据域的刷新合并）。
+协议筛选、分组接口选择和复制目标共用 `/admin/api/protocols` 的最后一份有效投影；加载失败时保留
+旧列表并显示重试入口，首次失败不会拿空值提交配置。
 
 `dev/` 里是做视觉效果时的一次性实验页（玻璃质感那版），不参与运行、也不在 `/static` 下 ——
 放在 `web/` 里会被当成静态资源服务出去。

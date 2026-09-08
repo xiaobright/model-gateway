@@ -36,6 +36,10 @@ function renderProtocolControls() {
   $('protocol-status').textContent = '';
 }
 
+// Preserve the current new-model default when OpenAI is registered; a test or
+// future deployment with another first protocol still gets a valid choice.
+const defaultProtocol = () => PROTOCOLS.includes('openai') ? 'openai' : PROTOCOLS[0];
+
 function protocolStatus(message, retry = false) {
   const host = $('protocol-status');
   if (!host) return;
@@ -51,8 +55,13 @@ async function refreshProtocols() {
   protocolLoading = true;
   try {
     const data = await api('GET', '/admin/api/protocols');
+    const firstLoad = !state.protocolsReady;
     setProtocolMetadata(data && data.protocols);
     state.protocolsReady = true;
+    if (firstLoad) {
+      const saved = localStorage.getItem('mg-iface') || '';
+      state.iface = PROTOCOLS.includes(saved) ? saved : '';
+    }
     renderProtocolControls();
     views.renderRoutes();
     views.renderUpstreams();
@@ -564,7 +573,7 @@ function openGroup(upstreamId, gid) {
   const have = up.supports || [];
   const missing = PROTOCOLS.find((p) => !have.includes(p));
   fillIfaceSelect('grp-proto', g ? g.protocol
-    : (have.length === 1 && missing ? missing : (state.iface || 'openai')));
+    : (have.length === 1 && missing ? missing : (state.iface || defaultProtocol())));
 
   // 有候选就不给改接口了：候选是「这个模型在哪个接口下暴露」的唯一记录（后端也会拒）
   const taken = g ? modelsOfGroup(g.id).length : 0;
@@ -776,7 +785,7 @@ function openRoute(model, rid) {
   const row = model ? state.routes.find((r) => r.model_name === model) : null;
   const cand = row && rid ? row.candidates.find((c) => c.route_id === rid) : null;
   // 已有模型的接口已经定了；新增时跟当前分段（分段在「全部」就默认 OpenAI）
-  const iface = row ? row.protocol : (state.iface || PROTOCOLS[0]);
+  const iface = row ? row.protocol : (state.iface || defaultProtocol());
   const pool = upstreamsFor(iface);
   if (!pool.length) {
     return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
@@ -927,7 +936,8 @@ const ACTIONS = {
 
   'retry-protocols': async () => {
     await refreshProtocols();
-    await refreshConfig();
+    await Promise.all([refreshConfig(), refreshOverview(), refreshStats()]);
+    await refreshLog();
     toast('协议选项已恢复', 'ok');
   },
 
@@ -1446,8 +1456,7 @@ $('endpoint').textContent = `${location.origin}/v1`;
 views.initLogFollow();   // 「自动跟随新记录」的勾选状态变化时补插攒下的行
 for (const b of $('seg-window').children) b.classList.toggle('is-on', b.dataset.window === state.window);
 
-state.iface = PROTOCOLS.includes(localStorage.getItem('mg-iface'))
-  ? localStorage.getItem('mg-iface') : '';
+state.iface = '';
 renderProtocolControls();
 for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
 

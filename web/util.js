@@ -33,6 +33,7 @@ export const state = {
   // 默认 24 小时：1 小时窗口在空闲时段是空的，一进来看到空图会以为坏了
   window: '24h',
   logIds: new Set(), // 已渲染过的 request_log id，用来做增量 diff
+  protocolsReady: false,
 };
 
 /* ---------------------------------------------------------------- 格式化 */
