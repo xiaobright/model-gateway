@@ -106,7 +106,10 @@ export function pullRemoteModels(gid, requestKey, isCurrent, { onSuccess, onFail
 }
 
 function writeKey(token, name) {
-  return `${token?.seq || 0}:${token?.groupId || 0}:${name}`;
+  // The session sequence already isolates one editor.  Do not include the
+  // mutable group id: moving a group during an in-flight write must not make
+  // its finally block unable to release the old lock.
+  return `${token?.seq || 0}:${name}`;
 }
 
 export function beginModelWrites(token, names) {

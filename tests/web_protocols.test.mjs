@@ -16,6 +16,7 @@ import {
   isCurrentGroupEdit,
   pullRemoteModels,
   remoteModels,
+  updateGroupEdit,
 } from '../web/group-editor.js';
 
 const names = setProtocolMetadata([
@@ -95,6 +96,13 @@ assert.equal(beginModelWrites(writeToken, ['m']), false);
 endModelWrites(writeToken, ['m']);
 assert.equal(beginModelWrites(writeToken, ['m']), true);
 endModelWrites(writeToken, ['m']);
+
+const movingToken = beginGroupEdit(1, 10);
+assert.equal(beginModelWrites(movingToken, ['moving']), true);
+assert.equal(updateGroupEdit(movingToken, 2, 11), true);
+endModelWrites(movingToken, ['moving']);
+assert.equal(beginModelWrites(movingToken, ['moving']), true);
+endModelWrites(movingToken, ['moving']);
 globalThis.fetch = originalFetch;
 
 console.log('web protocol metadata behavior: ok');
