@@ -14,6 +14,12 @@ import {
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
+import { createRefreshQueue } from './async-state.js';
+import {
+  beginGroupEdit, currentGroupEdit, updateGroupEdit,
+  isCurrentGroupEdit, closeGroupEdit, remoteModels, remoteBusy, remoteDead,
+  pullRemoteModels, invalidateRemoteModels, beginModelWrites, endModelWrites,
+} from './group-editor.js';
 
 /* ---------------------------------------------------------------- 数据 */
 
@@ -58,54 +64,108 @@ async function refreshProtocols() {
   }
 }
 
-async function refreshConfig() {
-  const presets = await api('GET', '/admin/api/egress-presets').catch(() => null);
-  state.egressVps = presets ? presets.vps : null;
-  syncEgressPreset();
-  [state.upstreams, state.routes, state.failover] = await Promise.all([
-    api('GET', '/admin/api/upstreams'),
-    api('GET', '/admin/api/models'),
-    api('GET', '/admin/api/failover'),
-  ]);
-  views.renderRoutes();
-  views.renderUpstreams();   // 里面会把供应商弹窗的分组列表一起刷
-  syncPickerChecks();
+let failoverRequestSeq = 0;
+let liveRequestSeq = 0;
+let failoverAppliedSeq = 0;
+let liveAppliedSeq = 0;
+
+const configRefresh = createRefreshQueue(
+  async () => {
+    const presets = await api('GET', '/admin/api/egress-presets').catch(() => null);
+    const [upstreams, routes, failover] = await Promise.all([
+      api('GET', '/admin/api/upstreams'),
+      api('GET', '/admin/api/models'),
+      api('GET', '/admin/api/failover'),
+    ]);
+    return { presets, upstreams, routes, failover };
+  },
+  (data, args) => {
+    state.egressVps = data.presets ? data.presets.vps : null;
+    state.upstreams = data.upstreams;
+    state.routes = data.routes;
+    if (args.seq >= failoverAppliedSeq) {
+      failoverAppliedSeq = args.seq;
+      state.failover = data.failover;
+    }
+    syncEgressPreset();
+    views.renderRoutes();
+    views.renderUpstreams();
+    syncPickerChecks();
+  },
+);
+
+function refreshConfig() {
+  return configRefresh({ seq: ++failoverRequestSeq });
 }
 
-async function refreshStats() {
-  state.stats = await api('GET', '/admin/api/stats');
-  views.renderLive();
-  views.updateKpiLive();
+const statsRefresh = createRefreshQueue(
+  () => api('GET', '/admin/api/stats'),
+  (data, args) => {
+    if (args.seq < liveAppliedSeq) return;
+    liveAppliedSeq = args.seq;
+    state.stats = data;
+    views.renderLive();
+    views.updateKpiLive();
+  },
+);
+
+function refreshStats() {
+  return statsRefresh({ seq: ++liveRequestSeq });
 }
 
 /* skipSeries：切时间窗时由 animateWindowChange 负责在淡出淡入之间换图，
    这里就别先原地渲染一次，否则新数据会先闪一下再被淡出 */
-async function refreshOverview({ skipSeries = false } = {}) {
-  state.overview = await api('GET', `/admin/api/overview?window=${state.window}&top=8`);
-  views.renderKpis();
-  if (!skipSeries) views.renderSeries();
-  views.renderHealth();
-  views.renderHot();
-  views.renderRoutes();     // 路由卡上要显示"这个模型用了多少次"
-  views.renderUpstreams();  // 上游视图上要显示成功率 / P95
+const overviewRefresh = createRefreshQueue(
+  ({ window }) => api('GET', `/admin/api/overview?window=${window}&top=8`),
+  (data, args) => {
+    if (args.window !== state.window || args.seq < (state.overviewSeq || 0)) return;
+    state.overviewSeq = args.seq;
+    state.overview = data;
+    views.renderKpis();
+    if (!args.skipSeries) views.renderSeries();
+    views.renderHealth();
+    views.renderHot();
+    views.renderRoutes();
+    views.renderUpstreams();
+  },
+);
+
+function refreshOverview({ skipSeries = false } = {}) {
+  const seq = (state.overviewSeq || 0) + 1;
+  state.overviewSeq = seq;
+  return overviewRefresh({ window: state.window, skipSeries, seq });
 }
 
-async function refreshLog() {
-  const rows = await api('GET', '/admin/api/requests?limit=50');
-  views.renderLog(rows);
+const logRefresh = createRefreshQueue(
+  () => api('GET', '/admin/api/requests?limit=50'),
+  (rows) => views.renderLog(rows),
+);
+
+function refreshLog() {
+  return logRefresh();
 }
 
-/* 「实时」那一页：1 秒一刷。接口是纯内存的，不碰数据库。
-   降级开关和断路器状态也一起回来 —— 那两个开关就在这页上，不能比页面本身旧 15 秒。 */
-async function refreshInflight() {
-  const data = await api('GET', '/admin/api/inflight');
-  state.failover = { enabled: data.failover || {}, breakers: data.breakers || [] };
-  state.tokens = data.tokens || {};
-  // 侧栏那个胶囊平时走 3 秒的快轮，在这页上就跟着 1 秒的数走 ——
-  // 同一屏上「2 个进行中」和「4 进行中」对不上会让人以为哪个是坏的
-  state.stats = { ...(state.stats || {}), live: data.counts };
-  views.renderLive();
-  views.renderInflight(data);
+/* 「实时」那一页：1 秒一刷。接口是纯内存的，不碰数据库。共享的 failover/live 字段
+   用发起序号保护，较早返回的配置快照不能覆盖较晚的实时快照。 */
+const inflightRefresh = createRefreshQueue(
+  () => api('GET', '/admin/api/inflight'),
+  (data, args) => {
+    if (args.failoverSeq >= failoverAppliedSeq) {
+      failoverAppliedSeq = args.failoverSeq;
+      state.failover = { enabled: data.failover || {}, breakers: data.breakers || [] };
+      state.tokens = data.tokens || {};
+    }
+    if (args.liveSeq >= liveAppliedSeq) {
+      liveAppliedSeq = args.liveSeq;
+      state.stats = { ...(state.stats || {}), live: data.counts };
+      views.renderLive();
+      views.renderInflight(data);
+    }
+  },
+);
+
+function refreshInflight() {
+  return inflightRefresh({ failoverSeq: ++failoverRequestSeq, liveSeq: ++liveRequestSeq });
 }
 
 /* ---------------------------------------------------------------- 视图路由 */
@@ -491,8 +551,8 @@ function openGroup(upstreamId, gid) {
   const up = state.upstreams.find((u) => u.id === Number(upstreamId));
   if (!up) return toast('供应商不存在了，刷新一下', 'err');
   const g = gid === null ? null : (up.groups || []).find((x) => x.id === gid);
-  state.editingUp = up.id;
-  state.editingGroup = g ? g.id : null;
+  const token = beginGroupEdit(up.id, g ? g.id : null);
+  $('group-dialog').dataset.groupSession = String(token.seq);
 
   $('grp-title').textContent = g ? `编辑分组：${up.name} · ${g.name}` : `给「${up.name}」加分组`;
   $('grp-name').value = g ? g.name : '默认';
@@ -530,6 +590,11 @@ function openGroup(upstreamId, gid) {
 }
 
 async function saveGroup() {
+  const token = currentGroupEdit();
+  if (!token || !isCurrentGroupEdit(token)) return null;
+  const original = token.groupId === null ? null : groupOf(token.groupId);
+  const targetUpstream = token.upstreamId;
+  const targetGroup = token.groupId;
   const payload = {
     name: $('grp-name').value.trim(),
     protocol: $('grp-proto').value,
@@ -537,23 +602,37 @@ async function saveGroup() {
     enabled: $('grp-enabled').checked,
   };
   if (!payload.name) return toast('分组名不能为空', 'err');
-  if (state.editingGroup === null) {
-    const created = await api('POST', `/admin/api/upstreams/${state.editingUp}/groups`, payload);
-    state.editingGroup = created.id;
-    const owner = state.upstreams.find((x) => x.id === state.editingUp);
+  let movedTo = targetUpstream;
+  let created = null;
+  if (targetGroup === null) {
+    created = await api('POST', `/admin/api/upstreams/${targetUpstream}/groups`, payload);
+  } else {
+    const moveTo = Number($('grp-upstream').value);
+    if (moveTo && moveTo !== targetUpstream) {
+      payload.upstream_id = moveTo;
+      movedTo = moveTo;
+    }
+    await api('PUT', `/admin/api/groups/${targetGroup}`, payload);
+  }
+  await refreshConfig();
+  if (!isCurrentGroupEdit(token)) return null;
+  if (created) {
+    updateGroupEdit(token, targetUpstream, created.id);
+    const owner = state.upstreams.find((x) => x.id === targetUpstream);
     $('grp-title').textContent = `编辑分组：${owner ? owner.name : ''} · ${created.name}`;
     $('grp-import').hidden = false;
     $('grp-move-wrap').hidden = false;
     toast('已保存，接着挑模型', 'ok');
   } else {
-    const moveTo = Number($('grp-upstream').value);
-    if (moveTo && moveTo !== state.editingUp) payload.upstream_id = moveTo;
-    await api('PUT', `/admin/api/groups/${state.editingGroup}`, payload);
-    if (payload.upstream_id) state.editingUp = payload.upstream_id;
+    updateGroupEdit(token, movedTo, targetGroup);
     toast(payload.upstream_id ? '已保存并搬到新供应商下' : '已保存', 'ok');
   }
-  await refreshConfig();
+  if (original && (original.api_key !== payload.api_key
+    || original.protocol !== payload.protocol || original.upstream_id !== movedTo)) {
+    invalidateRemoteModels(targetGroup);
+  }
   renderPicker();
+  return currentGroupEdit()?.groupId ?? null;
 }
 
 /* ---------------------------------------------------------------- 分组里的模型
@@ -562,7 +641,7 @@ async function saveGroup() {
    「导入所选」也没有保存按钮。上面的组名 / 接口 / key 才是要保存的东西。
    已录入的排在前面（勾着），后面是这次拉取到、还没录入的。 */
 
-let pulled = [];   // 最近一次从上游拉到的模型名；换分组就清空
+let pulled = [];   // 当前分组弹窗最近一次拉到的模型名；换分组就清空
 
 const pickRow = (name, on) => `<label class="${on ? 'on' : ''}">
     <input type="checkbox" ${on ? 'checked' : ''} data-act="pick-toggle" data-name="${esc(name)}">
@@ -628,11 +707,13 @@ const visibleRows = (checked) =>
   [...$('grp-picker').querySelectorAll('label:not([hidden]) input[data-act="pick-toggle"]')]
     .filter((b) => b.checked === checked).map((b) => b.dataset.name);
 
-async function addModels(names) {
+async function addModels(names, token = currentGroupEdit()) {
   if (!names.length) return;
+  if (!token || !isCurrentGroupEdit(token) || token.groupId === null) return false;
   const r = await api('POST', '/admin/api/models/bulk-add', {
-    group_id: state.editingGroup, model_names: names,
+    group_id: token.groupId, model_names: names,
   });
+  if (!isCurrentGroupEdit(token)) return false;
   const skipped = r.skipped || [];
   // 撞上「已经在另一种接口下暴露」的名字只跳过它，剩下的照样进；但得说清是哪些
   if (skipped.length) {
@@ -641,16 +722,20 @@ async function addModels(names) {
       + `${skipped.length > 3 ? ' 等' : ''}已经在另一种接口下暴露了）`,
       'err',
     );
-    return;
+    return true;
   }
   toast(names.length === 1 ? `已加上 ${names[0]}` : `加上了 ${r.added} 个`, 'ok');
+  return true;
 }
 
 /** 取消勾选就是把这个模型在这个分组下的候选全去掉（可能有好几条真名）。
     去掉之后它一个候选都不剩时先问一句 —— 那等于把模型下线了 */
 async function removeModel(name) {
+  const token = currentGroupEdit();
+  if (!token || !isCurrentGroupEdit(token) || token.groupId === null) return false;
+  const gid = token.groupId;
   const row = state.routes.find((r) => r.model_name === name);
-  const mine = row ? row.candidates.filter((c) => c.group_id === state.editingGroup) : [];
+  const mine = row ? row.candidates.filter((c) => c.group_id === gid) : [];
   const elsewhere = row ? row.candidates.length - mine.length : 0;
   const many = mine.length > 1
     ? `这个分组下挂了它 <b>${mine.length}</b> 条映射（${mine.map((c) => esc(c.remote_model)).join('、')}），会一起去掉。<br><br>`
@@ -673,11 +758,12 @@ async function removeModel(name) {
     });
     if (!okay) return false;
   }
+  if (!isCurrentGroupEdit(token)) return false;
   await api(
     'DELETE',
-    `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${state.editingGroup}`,
+    `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${gid}`,
   );
-  return true;
+  return isCurrentGroupEdit(token);
 }
 
 /* ---------------------------------------------------------------- 路由弹窗 */
@@ -696,6 +782,7 @@ function openRoute(model, rid) {
     return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
   }
   state.editingCand = cand ? { model, rid } : null;
+  routeRemoteSeq += 1;
 
   $('route-title').textContent = cand ? `改候选：${model}` : (model ? `给「${model}」加候选` : '新增模型');
   $('rt-save').textContent = cand ? '保存' : '添加';
@@ -744,14 +831,12 @@ function orderHint() {
 /* 「上游那边的真实模型名」得跟分组对上 —— 同一个站两把 key 能看到的东西都不一样，
    靠记是记不住的。分组一选定就把那个分组能拉到的模型灌进 datalist，点输入框直接选；
    拉不动的站退回「这个分组已经用过的那些名字」，照样能填。 */
-const remoteCache = new Map();      // gid -> string[]
-const remoteBusy = new Set();
-const remoteDead = new Set();       // 拉过一次没成的，别每次开弹窗都再撞一遍
+let routeRemoteSeq = 0;
 
 function fillRemoteList(gid) {
   const hint = $('rt-remote-hint');
   if (!gid) { $('rt-remote-list').innerHTML = ''; hint.textContent = ''; return; }
-  const pulledNames = remoteCache.get(gid);
+  const pulledNames = remoteModels(gid);
   const names = [...new Set([...(pulledNames || []), ...remotesOfGroup(gid)])];
   $('rt-remote-list').innerHTML = names.map((n) => `<option value="${esc(n)}"></option>`).join('');
 
@@ -780,18 +865,17 @@ function takenRemotes(model, gid) {
 }
 
 async function pullRemoteList(gid) {
-  remoteBusy.add(gid);
+  const seq = routeRemoteSeq;
   $('rt-remote-hint').textContent = '正在拉这个分组的模型列表…';
-  try {
-    const data = await api('GET', `/admin/api/groups/${gid}/remote-models`);
-    remoteCache.set(gid, data.models);
-  } catch {
-    remoteDead.add(gid);          // 公益站三天两头连不上，静默降级就行，别弹提示条
-  } finally {
-    remoteBusy.delete(gid);
-    // 拉的过程里可能已经换了分组、或者把弹窗关了
-    if ($('route-dialog').open && Number($('rt-group').value) === gid) fillRemoteList(gid);
-  }
+  return pullRemoteModels(
+    gid,
+    `route:${seq}:${gid}`,
+    () => routeRemoteSeq === seq && Number($('rt-group').value) === gid,
+    {
+      onSuccess: () => { if ($('route-dialog').open) fillRemoteList(gid); },
+      onFinally: () => { if ($('route-dialog').open) fillRemoteList(gid); },
+    },
+  );
 }
 
 async function saveRoute() {
@@ -967,52 +1051,85 @@ const ACTIONS = {
   /* 拉取用的是**服务端存着的**那把 key。key 改了没保存就点拉取，拉的是旧 key，
      回来一个 401 让人一头雾水 —— 先把改动落库，再拉。 */
   'pull-models': async () => {
-    if (groupDirty()) await saveGroup();
-    $('grp-pull-status').textContent = '拉取中…';
-    try {
-      const data = await api('GET', `/admin/api/groups/${state.editingGroup}/remote-models`);
-      pulled = data.models;
-      remoteCache.set(state.editingGroup, data.models);
-      remoteDead.delete(state.editingGroup);
-      renderPicker();
-      const mine = modelsOfGroup(state.editingGroup);
-      const hit = pulled.filter((m) => mine.includes(m)).length;
-      $('grp-pull-status').textContent = `上游列出 ${pulled.length} 个，其中 ${hit} 个已录入`;
-    } catch (e) {
-      $('grp-pull-status').textContent = '';
-      throw e;
+    const token = currentGroupEdit();
+    if (!token || !isCurrentGroupEdit(token)) return;
+    if (groupDirty()) {
+      const saved = await saveGroup();
+      if (saved === null || !isCurrentGroupEdit(token)) return;
     }
+    const gid = token.groupId;
+    if (gid === null) return;
+    $('grp-pull-status').textContent = '拉取中…';
+    await pullRemoteModels(
+      gid,
+      `group:${token.seq}:${gid}`,
+      () => isCurrentGroupEdit(token),
+      {
+        onSuccess: (models) => {
+          pulled = models;
+          renderPicker();
+          const mine = modelsOfGroup(gid);
+          const hit = pulled.filter((m) => mine.includes(m)).length;
+          $('grp-pull-status').textContent = `上游列出 ${pulled.length} 个，其中 ${hit} 个已录入`;
+        },
+        onFailure: (error) => {
+          $('grp-pull-status').textContent = '';
+          toast(error.message, 'err');
+        },
+        onFinally: () => {
+          // 迟到的 finally 也只允许当前编辑会话改状态提示。
+          if (isCurrentGroupEdit(token) && !remoteModels(gid)) $('grp-pull-status').textContent = '';
+        },
+      },
+    );
   },
 
   /* 勾选即生效：勾上=加候选，取消=删候选。失败就把勾回滚到库里的真相。 */
   'pick-toggle': async ({ name }, el) => {
-    if (state.editingGroup === null) return;
+    const token = currentGroupEdit();
+    if (!token || !isCurrentGroupEdit(token)) return;
+    if (!beginModelWrites(token, [name])) return toast('这项正在保存，请稍后再试', 'err');
     const label = el.closest('label');
     label.classList.add('busy');
     try {
       if (el.checked) await addModels([name]);
       else await removeModel(name);
     } finally {
+      endModelWrites(token, [name]);
       label.classList.remove('busy');
-      await refreshConfig();      // 末尾的 syncPickerChecks 负责把勾选拉回真相
+      if (isCurrentGroupEdit(token)) {
+        await refreshConfig();      // 末尾的 syncPickerChecks 负责把勾选拉回真相
+      }
     }
   },
 
   'pick-all': async () => {
+    const token = currentGroupEdit();
+    if (!token || !isCurrentGroupEdit(token)) return;
     const names = visibleRows(false);
     if (!names.length) return toast('没有可加的了', 'ok');
-    await addModels(names);
-    await refreshConfig();
-    renderPicker();
+    if (!beginModelWrites(token, names)) return toast('有模型正在保存，请稍后再试', 'err');
+    try {
+      await addModels(names, token);
+      if (isCurrentGroupEdit(token)) {
+        await refreshConfig();
+        renderPicker();
+      }
+    } finally {
+      endModelWrites(token, names);
+    }
   },
 
   'pick-none': async () => {
+    const token = currentGroupEdit();
+    if (!token || !isCurrentGroupEdit(token)) return;
+    const gid = token.groupId;
     const names = visibleRows(true);
     if (!names.length) return toast('本来就一个都没勾', 'ok');
     // 在别的分组没有候选的模型会直接下线，这个后果得先说清楚
     const orphan = names.filter((n) => {
       const row = state.routes.find((r) => r.model_name === n);
-      return row && row.candidates.every((c) => c.group_id === state.editingGroup);
+      return row && row.candidates.every((c) => c.group_id === gid);
     });
     const okay = await confirmBox({
       title: '清空这个分组的模型',
@@ -1023,26 +1140,43 @@ const ACTIONS = {
       ok: '去掉',
     });
     if (!okay) return;
-    for (const name of names) {
-      await api(
-        'DELETE',
-        `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${state.editingGroup}`,
-      );
+    if (!isCurrentGroupEdit(token)) return;
+    if (!beginModelWrites(token, names)) return toast('有模型正在保存，请稍后再试', 'err');
+    try {
+      for (const name of names) {
+        await api(
+          'DELETE',
+          `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${gid}`,
+        );
+      }
+    } finally {
+      endModelWrites(token, names);
     }
-    await refreshConfig();
-    renderPicker();
+    if (isCurrentGroupEdit(token)) {
+      await refreshConfig();
+      renderPicker();
+    }
     toast(`去掉了 ${names.length} 个`, 'ok');
   },
 
   /* 上游不肯列全的时候（不少站的 /v1/models 就是残的）自己填一个 */
   'manual-add': async () => {
+    const token = currentGroupEdit();
+    if (!token || !isCurrentGroupEdit(token)) return;
     const name = $('grp-manual').value.trim();
     if (!name) return toast('填个模型 id', 'err');
-    if (modelsOfGroup(state.editingGroup).includes(name)) return toast('这个分组已经有它了', 'err');
-    await addModels([name]);
+    if (modelsOfGroup(token.groupId).includes(name)) return toast('这个分组已经有它了', 'err');
+    if (!beginModelWrites(token, [name])) return toast('这项正在保存，请稍后再试', 'err');
+    try {
+      await addModels([name], token);
+    } finally {
+      endModelWrites(token, [name]);
+    }
     $('grp-manual').value = '';
-    await refreshConfig();
-    renderPicker();
+    if (isCurrentGroupEdit(token)) {
+      await refreshConfig();
+      renderPicker();
+    }
   },
 
   'new-route': () => openRoute('', null),
@@ -1055,9 +1189,15 @@ const ACTIONS = {
      开关会连带把筛选也切掉（preset-fp 当初就踩过这个坑）。 */
   'toggle-failover': async ({ fo }, el) => {
     try {
-      state.failover = await api('POST', '/admin/api/failover', {
+      const result = await api('POST', '/admin/api/failover', {
         protocol: fo, enabled: el.checked,
       });
+      // A slower config/inflight GET may have started before this write.  Give
+      // the write a newer shared-state sequence so that old responses cannot
+      // flip the switch back visually.
+      const seq = ++failoverRequestSeq;
+      failoverAppliedSeq = seq;
+      state.failover = result;
     } catch (e) {
       el.checked = !el.checked;
       throw e;
@@ -1245,15 +1385,16 @@ $('grp-picker-filter').addEventListener('keydown', (ev) => {
 });
 
 /* 弹窗关掉后刷一次列表（Esc 关闭也走这里，所以挂在 close 上而不是关闭按钮上）。
-   这里**不清** state.editing / editingUp / editingGroup：close 是排成任务异步触发的，
-   会晚于紧接着打开的下一个弹窗跑 —— 清掉的话「建完供应商接着建分组」就会往
-   /upstreams/null/groups 发请求。这几个字段每次 open* 都会重设，留着旧值没人读得到。
-   分组弹窗另有一份 editingUp，所以它叠在供应商弹窗上面开着、甚至把分组搬到别的
-   供应商，也不会把底下那个弹窗的目标换掉。 */
+   编辑目标不再靠清空全局字段来表示失效，而由 group-editor 的会话序号管理。若旧
+   close 事件晚于紧接着打开的新弹窗，dialog.open 已经为真，不能把新会话一起作废。 */
 $('up-dialog').addEventListener('close', () => run(null, refreshConfig));
-$('group-dialog').addEventListener('close', () => run(null, refreshConfig));
+$('group-dialog').addEventListener('close', (ev) => {
+  if (!ev.target.open) closeGroupEdit(ev.target.dataset.groupSession);
+  run(null, refreshConfig);
+});
 
 // route-dialog 的 editingCand 同理：也只由 openRoute 负责重设，close 时不动
+$('route-dialog').addEventListener('close', () => { routeRemoteSeq += 1; });
 
 $('route-filter').addEventListener('input', (ev) => {
   state.filter = ev.target.value;

@@ -20,8 +20,8 @@ export const state = {
   filter: '',
   iface: '',         // 模型路由按接口筛选：'' | 'anthropic' | 'openai'
   proto: '',         // 转发记录的协议筛选：'' | 'anthropic' | 'openai'
-  // 下面这些是「当前打开的弹窗在编辑谁」。只由 openUpstream / openGroup / openRoute 设置，
-  // 弹窗关闭时故意不清（close 是异步任务，会晚于紧接着打开的下一个弹窗）
+  // 下面这些是「当前打开的弹窗在编辑谁」。分组目标由 group-editor 会话设置并配序号；
+  // 弹窗关闭时不清旧 id，迟到 close 不能让下一次新建请求打到 null。
   editing: null,      // 供应商弹窗的目标 id；openUpstream(null) = 新建供应商
   // 分组弹窗单独记自己的供应商：它可以叠在供应商弹窗之上开着，而「搬到别的供应商」
   // 会改这个值 —— 要是和 editing 共用，一搬就把底下那个弹窗的目标也换掉了
