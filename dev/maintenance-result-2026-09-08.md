@@ -8,7 +8,7 @@
 
 任务书 P1–P4 已完成。应用代码没有推倒重写，没有加入协议转换、新 API、跨接口同名模型规则或生产配置迁移。
 
-最终应用代码 SHA 为 `4b6929e`。完整测试通过 103 项；快速组与真实网络组互斥且合计覆盖全部 103 项。快速组实际为 33.70 秒，略高于任务书的 10–20 秒目标，主要成本已定位，没有通过减少断言、降低生产门槛或扩大 mock 范围来压缩时间。
+原验收应用代码 SHA 为 `4b6929e`。独立复审追加了刷新队列、路由编辑和模型写入锁的竞态修复，最新代码为 `cd55fb2`；完整测试仍通过 103 项，快速组与真实网络组互斥且合计覆盖全部 103 项。复审后的快速组最终实测为 47.79 秒，主要成本已定位，没有通过减少断言、降低生产门槛或扩大 mock 范围来压缩时间。
 
 ## 提交与工作树
 
@@ -47,7 +47,7 @@
 | `test_proxy` 21 项 | 18 项快速，3 项 network | 字节透传、头和鉴权、模型改写、usage、错误、SSE；network 保留真实流切换、断流和完成后挂连接 |
 | `test_inflight` 6 项 | 3 项快速，3 项 network | 实时登记、取消、请求轨迹、count_tokens 不计入；network 保留真实取消/流行为 |
 | `test_lifecycle` 7 项 | 快速、ASGI/MockTransport 和事件控制 | JSON/SSE 分块、三阶段取消、并发隔离 |
-| `test_egress` 8 项 | 3 项快速，5 项 network | 出口配置校验快速验证；代理、直连、探测和自签 TLS 经过真实 socket |
+| `test_egress` 8 项 | 5 项快速，3 项 network | 出口配置校验、直连不走系统代理和保存时 CA 校验快速验证；代理、探测和自签 TLS 端到端经过真实 socket |
 | `test_units` 6 项 | 5 项快速，1 项 network | SSE 观察器、取消边界；自签 TLS 信任/拒绝保留真实连接 |
 
 与 K1–K12 的对应证据集中在上述 `test_proxy`、`test_lifecycle`、`test_failover`、`test_stats`、`test_egress`、`test_units`、`test_admin` 和 `test_routing`；本轮没有删除行为断言。最近三次既有修复（故障切换/统计、迁移/取消）均由完整套件回归覆盖。
@@ -79,9 +79,9 @@ node tests/web_protocols.test.mjs
 
 | 集合 | 结果 | 实际耗时 | 最慢项目 |
 | --- | --- | ---: | --- |
-| 快速 `not network` | 93 passed，10 deselected | 33.70s | `test_token_ratio_is_learned_from_the_log` 4.03s；`test_direct_really_turns_the_system_proxy_off` 2.71s |
-| network | 10 passed，93 deselected | 59.96s | `test_probe_reports_which_door_works` 12.67s；完成事件后挂连接 7.79s；代理流量 7.47s |
-| 完整 | 103 passed，0 failed | 89.99s | 探测 11.63s；完成事件后挂连接 7.69s；代理流量 6.63s |
+| 快速 `not network` | 93 passed，10 deselected | 47.79s | `test_token_ratio_is_learned_from_the_log` 3.76s；`test_direct_really_turns_the_system_proxy_off` 3.69s |
+| network | 10 passed，93 deselected | 60.99s | `test_probe_reports_which_door_works` 12.79s；完成事件后挂连接 8.19s；代理流量 8.19s |
+| 完整 | 103 passed，0 failed | 96.79s | 探测 12.68s；完成事件后挂连接 8.36s；代理流量 7.26s |
 
 集合核对结果为：总数 103、快速 93、network 10、并集 103、交集 0、遗漏 0、额外 0。完整套件只有一个既有 `StarletteDeprecationWarning`：当前 Starlette 的 TestClient 提示未来应安装 `httpx2`；本轮没有升级依赖。
 
