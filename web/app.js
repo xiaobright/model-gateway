@@ -103,8 +103,8 @@ const configRefresh = createRefreshQueue(
   },
 );
 
-function refreshConfig() {
-  return configRefresh({ seq: ++failoverRequestSeq });
+function refreshConfig(options) {
+  return configRefresh({ seq: ++failoverRequestSeq }, options);
 }
 
 const statsRefresh = createRefreshQueue(
@@ -118,8 +118,8 @@ const statsRefresh = createRefreshQueue(
   },
 );
 
-function refreshStats() {
-  return statsRefresh({ seq: ++liveRequestSeq });
+function refreshStats(options) {
+  return statsRefresh({ seq: ++liveRequestSeq }, options);
 }
 
 /* skipSeries：切时间窗时由 animateWindowChange 负责在淡出淡入之间换图，
@@ -139,10 +139,10 @@ const overviewRefresh = createRefreshQueue(
   },
 );
 
-function refreshOverview({ skipSeries = false } = {}) {
+function refreshOverview({ skipSeries = false, allowIntermediate = false } = {}) {
   const seq = (state.overviewSeq || 0) + 1;
   state.overviewSeq = seq;
-  return overviewRefresh({ window: state.window, skipSeries, seq });
+  return overviewRefresh({ window: state.window, skipSeries, seq }, { allowIntermediate });
 }
 
 const logRefresh = createRefreshQueue(
@@ -150,8 +150,8 @@ const logRefresh = createRefreshQueue(
   (rows) => views.renderLog(rows),
 );
 
-function refreshLog() {
-  return logRefresh();
+function refreshLog(options) {
+  return logRefresh({}, options);
 }
 
 /* 「实时」那一页：1 秒一刷。接口是纯内存的，不碰数据库。共享的 failover/live 字段
@@ -173,8 +173,11 @@ const inflightRefresh = createRefreshQueue(
   },
 );
 
-function refreshInflight() {
-  return inflightRefresh({ failoverSeq: ++failoverRequestSeq, liveSeq: ++liveRequestSeq });
+function refreshInflight(options) {
+  return inflightRefresh(
+    { failoverSeq: ++failoverRequestSeq, liveSeq: ++liveRequestSeq },
+    options,
+  );
 }
 
 /* ---------------------------------------------------------------- 视图路由 */
@@ -1432,13 +1435,17 @@ window.addEventListener('hashchange', () => {
 const ticking = () => document.visibilityState === 'visible' && !document.querySelector('dialog[open]');
 
 // 快轮只取活跃流：3 秒一次，让"进行中的请求"真的是实时的
-setInterval(() => { if (ticking()) run(null, refreshStats); }, 3000);
+setInterval(() => {
+  if (ticking()) run(null, () => refreshStats({ allowIntermediate: true }));
+}, 3000);
 
 /* 「实时」页只在自己显示时轮询，1 秒一次 —— 那个接口是纯内存的，不碰数据库。
    秒数不靠轮询走字：本地每 200ms 按「这条什么时候开始的」重算一遍，
    否则要么一秒跳一格，要么得把轮询压到 200ms 去。 */
 setInterval(() => {
-  if (ticking() && state.view === 'live') run(null, refreshInflight);
+  if (ticking() && state.view === 'live') {
+    run(null, () => refreshInflight({ allowIntermediate: true }));
+  }
 }, 1000);
 
 setInterval(() => {
@@ -1450,7 +1457,11 @@ setInterval(() => {
 setInterval(() => {
   if (!ticking()) return;
   run(null, async () => {
-    await Promise.all([refreshOverview(), refreshLog(), refreshConfig()]);
+    await Promise.all([
+      refreshOverview({ allowIntermediate: true }),
+      refreshLog({ allowIntermediate: true }),
+      refreshConfig({ allowIntermediate: true }),
+    ]);
   });
 }, 15000);
 

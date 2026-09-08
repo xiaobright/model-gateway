@@ -57,6 +57,23 @@ loads[1].resolve('new');
 await Promise.all([oldRefresh, newRefresh]);
 assert.deepEqual(applied, ['new']);
 
+const pollApplied = [];
+const pollLoads = [];
+const pollRefresh = createRefreshQueue(
+  async (args) => new Promise((resolve) => pollLoads.push({ args, resolve })),
+  (value) => pollApplied.push(value),
+);
+const firstPoll = pollRefresh({ name: 'poll-1' }, { allowIntermediate: true });
+const secondPoll = pollRefresh({ name: 'poll-2' }, { allowIntermediate: true });
+await tick();
+pollLoads[0].resolve('poll-1');
+while (pollLoads.length < 2) await tick();
+await tick();
+assert.deepEqual(pollApplied, ['poll-1']);
+pollLoads[1].resolve('poll-2');
+await Promise.all([firstPoll, secondPoll]);
+assert.deepEqual(pollApplied, ['poll-1', 'poll-2']);
+
 const originalFetch = globalThis.fetch;
 let resolveFetch;
 globalThis.fetch = () => new Promise((resolve) => { resolveFetch = resolve; });

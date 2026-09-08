@@ -31,7 +31,7 @@ export function createRefreshQueue(load, apply) {
           // its snapshot is newer.  Keep every waiter pending until that
           // snapshot has been applied; resolving here makes a post-write
           // caller observe completion before the UI has caught up.
-          if (pending) continue;
+          if (pending && !pending.allowIntermediate) continue;
           apply(value, job.args, job.version);
           settle(job.version, null, value);
         } catch (error) {
@@ -48,9 +48,16 @@ export function createRefreshQueue(load, apply) {
     }
   }
 
-  return function refresh(args = {}) {
+  return function refresh(args = {}, { allowIntermediate = false } = {}) {
     const version = ++sequence;
-    pending = { args, version };
+    // Pollers may keep scheduling while a slow read is in flight.  Preserve a
+    // queued barrier from a manual/write-triggered refresh so a later poll
+    // cannot make that caller observe an older snapshot.
+    pending = {
+      args,
+      version,
+      allowIntermediate: Boolean(allowIntermediate) && pending?.allowIntermediate !== false,
+    };
     const promise = new Promise((resolve, reject) => waiters.push({ version, resolve, reject }));
     pump();
     return promise;
