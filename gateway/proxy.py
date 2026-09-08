@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import time
+import urllib.request
 from typing import AsyncIterator
 
 import httpx
@@ -84,15 +85,23 @@ MODEL_CREATED_AT = "2025-01-01T00:00:00Z"
 
 router = APIRouter()
 
-_clients: dict[str, httpx.AsyncClient] = {}
+_clients: dict[object, httpx.AsyncClient] = {}
 _client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _system_proxy_signature() -> tuple[tuple[str, str], ...]:
+    """快照 httpx 会读取的系统代理配置，避免开关切换后继续复用旧 client。"""
+    return tuple(sorted(
+        (str(key).lower(), str(value))
+        for key, value in urllib.request.getproxies().items()
+    ))
 
 
 async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
     """按「出口」复用 client，省掉每个请求一次 TLS 握手（对远端公益站是几百 ms 的差别）。
 
-    一个出口一个 client：代理是建 client 时定的，没法按请求换。出口最多也就三五种，
-    池子小得可以忽略。
+    同一个出口和同一份系统代理配置复用一个 client。代理是建 client 时定的，没法按请求
+    换；系统代理开关变化后用新的配置签名建新 client。出口最多也就三五种，池子小得可以忽略。
     """
     global _client_loop
     loop = asyncio.get_running_loop()
@@ -101,12 +110,16 @@ async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
         # loop，留着就是泄漏一批连接和 fd —— 而且它们已经没人能用了
         await aclose_client()
         _client_loop = loop
-    client = _clients.get(egress)
+    cache_key: object = (
+        (EGRESS_SYSTEM, _system_proxy_signature())
+        if egress == EGRESS_SYSTEM else egress
+    )
+    client = _clients.get(cache_key)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(
             timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS, **client_args(egress)
         )
-        _clients[egress] = client
+        _clients[cache_key] = client
     return client
 
 

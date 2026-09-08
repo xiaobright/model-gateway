@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import urllib.request
 
 import httpx
 import pytest
@@ -111,6 +112,24 @@ def test_cancelling_as_headers_arrive_closes_the_response():
         with pytest.raises(asyncio.CancelledError):
             await task
         assert response.is_closed
+
+    asyncio.run(run())
+
+
+def test_system_proxy_change_rebuilds_the_cached_client(monkeypatch):
+    """系统代理开关改变后，跟随系统的出口不能继续沿用旧直连 client。"""
+    from gateway import proxy
+
+    current = {}
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: dict(current))
+
+    async def run():
+        await proxy.aclose_client()
+        direct = await proxy.get_client()
+        current.update({"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"})
+        proxied = await proxy.get_client()
+        assert proxied is not direct
+        await proxy.aclose_client()
 
     asyncio.run(run())
 
