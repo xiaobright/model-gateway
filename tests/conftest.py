@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from starlette.testclient import TestClient
 
-from helpers import free_port, wait_server_started
+import helpers
 
 
 @pytest.fixture()
-def gateway(tmp_path, monkeypatch):
+def gateway(tmp_path, monkeypatch, request):
     from gateway import config, failover, inflight
+    from gateway import proxy as proxy_mod
     from gateway import stats as stats_mod
+    from gateway.app import create_app
     from gateway.server import start_server_thread
 
     data_dir = tmp_path / "data"
@@ -27,10 +30,63 @@ def gateway(tmp_path, monkeypatch):
     inflight.reset()
     stats_mod.reset()
 
-    port = free_port()
+    use_network = request.node.get_closest_marker("network") is not None
+    helpers.IN_PROCESS_UPSTREAMS = not use_network
+
+    if not use_network:
+        async def get_client(egress=""):
+            client = proxy_mod._clients.get(egress)
+            if client is None or client.is_closed:
+                client = httpx.AsyncClient(
+                    transport=httpx.MockTransport(helpers.fake_upstream_request),
+                    timeout=proxy_mod.PROXY_TIMEOUT,
+                    trust_env=False,
+                )
+                proxy_mod._clients[egress] = client
+            return client
+
+        monkeypatch.setattr(proxy_mod, "get_client", get_client)
+
+        async def fetch_remote_models(base_url, api_key, header_override="", protocol="openai", egress=""):
+            # The production helper creates its own socket client.  Reuse the
+            # same in-process transport as forwarding while keeping its URL,
+            # headers, status, and JSON validation behavior intact.
+            from gateway import upstream as upstream_mod
+
+            client = await get_client(egress)
+            url = upstream_mod.models_url(base_url)
+            resp = await client.get(
+                url,
+                headers=upstream_mod.build_headers(api_key, header_override, protocol),
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"{url} 返回 {resp.status_code}: {resp.text[:300]}")
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                raise RuntimeError(f"{url} 返回的不是 JSON: {resp.text[:200]}") from exc
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                raise RuntimeError(f"{url} 的响应里没有 data 数组")
+            return tuple(str(m["id"]) for m in data if isinstance(m, dict) and "id" in m)
+
+        monkeypatch.setattr(
+            "gateway.upstream.fetch_remote_models", fetch_remote_models
+        )
+        with TestClient(
+            create_app(),
+            base_url="http://127.0.0.1",
+            headers={"user-agent": "python-httpx"},
+        ) as client:
+            yield client
+        helpers._FAKE_UPSTREAMS.clear()
+        helpers.IN_PROCESS_UPSTREAMS = False
+        return
+
+    port = helpers.free_port()
     server, thread = start_server_thread(port)
     try:
-        wait_server_started(server, thread)
+        helpers.wait_server_started(server, thread)
         base_url = f"http://127.0.0.1:{port}"
         # trust_env=False：全程都是回环地址，绝不能让系统代理（Clash 之类）插一脚
         with httpx.Client(base_url=base_url, timeout=15.0, trust_env=False) as client:
@@ -38,3 +94,4 @@ def gateway(tmp_path, monkeypatch):
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+        helpers.IN_PROCESS_UPSTREAMS = False

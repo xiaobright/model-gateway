@@ -8,11 +8,6 @@ import pytest
 from helpers import PROXY_CERT, PROXY_KEY, free_port, MockProxy, MockUpstream, add_upstream, add_route
 
 
-# 这一整组都要等真实的 connect 超时 / 冷却期满，没法靠 mock 加速 ——
-# 日常跑 pytest -m "not slow" 可以先跳过它们
-pytestmark = pytest.mark.slow
-
-
 # ================================================================ 出口（每个站从哪扇门出去）
 #
 # 现实里同一台机器上「有的站必须走代理、有的站必须别走代理」是常态：公益站按 IP 屏蔽，
@@ -44,6 +39,7 @@ def test_disabling_a_provider_does_not_reset_its_egress(gateway):
         assert changed.status_code == 200 and changed.json()["egress"] == "direct"
 
 
+@pytest.mark.network
 def test_egress_sends_that_site_through_the_proxy(gateway):
     """填了代理的站，字节真的从那扇门出去；没填的站照旧不走。"""
     with MockProxy() as px, MockUpstream("siteA") as a, MockUpstream("siteB") as b:
@@ -99,6 +95,7 @@ def test_egress_only_takes_proxy_urls(gateway):
         assert resp.status_code == 400 and "http://" in resp.text
 
 
+@pytest.mark.network
 def test_probe_reports_which_door_works(gateway):
     """「测一下」：同一个站从每扇门各打一次。这个问题只能实测，猜不出来。"""
     with MockProxy() as px, MockUpstream("siteA") as a:
@@ -120,6 +117,7 @@ def test_probe_reports_which_door_works(gateway):
         assert by_label["直连"]["ok"] is True
 
 
+@pytest.mark.network
 def test_egress_ca_pin_works_end_to_end(gateway):
     """保存带 #ca 的出口，转发字节真的从那扇自签 TLS 门过。"""
     with MockProxy(certfile=PROXY_CERT, keyfile=PROXY_KEY) as px, MockUpstream("siteA") as a:

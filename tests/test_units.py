@@ -115,6 +115,7 @@ def test_cancelling_as_headers_arrive_closes_the_response():
     asyncio.run(run())
 
 
+@pytest.mark.network
 def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
     """#ca= 把自签代理的证书钉进信任列表；不钉就过不了 TLS —— 这正是它的用处。
 

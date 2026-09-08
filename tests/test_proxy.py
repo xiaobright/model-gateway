@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+import pytest
 
 from helpers import wait_for_row, MockUpstream, add_upstream, add_group, provider_id, add_route, route_id, msg, parse_sse_events
 
 
+@pytest.mark.network
 def test_import_models_and_switch_without_interrupting_stream(gateway):
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA")
@@ -138,6 +140,7 @@ def test_connect_failure_is_logged_as_502(gateway):
     assert row["status"] == 502 and row["note"] == "connect_failed"
 
 
+@pytest.mark.network
 def test_client_disconnect_mid_stream_is_recorded_and_gateway_survives(gateway):
     """客户端中途断开不能让转发协程炸掉，也不能漏掉这条记录。"""
     with MockUpstream("siteA") as a:
@@ -155,6 +158,7 @@ def test_client_disconnect_mid_stream_is_recorded_and_gateway_survives(gateway):
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
 
 
+@pytest.mark.network
 def test_client_leaving_after_completion_event_is_not_flagged(gateway):
     """上游发完完成事件却不收连接、客户端拿到就走 —— 这是正常收尾，不能记成客户端断开。"""
     with MockUpstream("siteA") as a:

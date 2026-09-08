@@ -29,6 +29,41 @@ PROXY_CERT = str(Path(__file__).parent / "fixture" / "proxy-cert.pem")
 PROXY_KEY = str(Path(__file__).parent / "fixture" / "proxy-key.pem")
 
 
+# The default test fixture runs the gateway in-process.  MockUpstream keeps the
+# same public shape (a stable base_url and mutable failure state), but routes
+# requests to its FastAPI app through httpx.MockTransport instead of opening a
+# listening socket.  Network-marked tests flip this flag off and use the real
+# uvicorn server below.
+IN_PROCESS_UPSTREAMS = False
+_FAKE_UPSTREAMS: dict[int, object] = {}
+
+
+async def fake_upstream_request(request: httpx.Request) -> httpx.Response:
+    upstream = _FAKE_UPSTREAMS.get(request.url.port or 0)
+    if upstream is None:
+        raise httpx.ConnectError(
+            f"no in-process upstream for {request.url!s}", request=request
+        )
+    if getattr(upstream, "sick", {}).get("hang_body"):
+        status = getattr(upstream, "sick", {}).get("status") or 503
+
+        class HangingBody(httpx.AsyncByteStream):
+            def __init__(self) -> None:
+                self.closed = asyncio.Event()
+
+            async def __aiter__(self):
+                yield b""
+                await self.closed.wait()
+
+            async def aclose(self) -> None:
+                self.closed.set()
+
+        return httpx.Response(
+            status, headers={"content-type": "application/json"}, stream=HangingBody()
+        )
+    return await httpx.ASGITransport(app=upstream.app).handle_async_request(request)
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -67,8 +102,12 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             return None
         if sick.get("hang_body"):
             async def never() -> object:
-                await asyncio.Event().wait()
+                # Send one empty body message so ASGITransport exposes the
+                # response headers, then keep the body open.  Real sockets
+                # expose headers before this wait naturally; the empty
+                # message preserves that distinction in the in-process path.
                 yield b""
+                await asyncio.Event().wait()
 
             return StreamingResponse(never(), status_code=code, media_type="application/json")
         return JSONResponse({"error": {"message": f"{name} is sick", "code": code}}, status_code=code)
@@ -311,9 +350,10 @@ class MockUpstream:
         # 运行中可翻转的「病历」：设了 status 就一律回那个码，用来演故障与恢复；
         # missing 里的模型名一律回 404，用来演「这个站把某个模型 id 下掉了」
         self.sick: dict = {"status": None, "missing": set()}
+        self.app = build_upstream_app(name, self.sick)
         self._server = uvicorn.Server(
             uvicorn.Config(
-                build_upstream_app(name, self.sick), host="127.0.0.1", port=self.port, log_level="error"
+                self.app, host="127.0.0.1", port=self.port, log_level="error"
             )
         )
         self._thread = threading.Thread(target=self._server.run, daemon=True)
@@ -330,11 +370,17 @@ class MockUpstream:
         self.sick["missing"] = set()
 
     def __enter__(self) -> "MockUpstream":
+        if IN_PROCESS_UPSTREAMS:
+            _FAKE_UPSTREAMS[self.port] = self
+            return self
         self._thread.start()
         wait_server_started(self._server, self._thread)
         return self
 
     def __exit__(self, *exc: object) -> None:
+        if IN_PROCESS_UPSTREAMS:
+            _FAKE_UPSTREAMS.pop(self.port, None)
+            return
         self._server.should_exit = True
         self._thread.join(timeout=5)
 

@@ -10,11 +10,6 @@ from helpers import (
 )
 
 
-# 这一整组都要等真实的 connect 超时 / 冷却期满，没法靠 mock 加速 ——
-# 日常跑 pytest -m "not slow" 可以先跳过它们
-pytestmark = pytest.mark.slow
-
-
 # ================================================================ 自动降级
 #
 # 只在 Anthropic 接口默认开着：那边全是坏得勤的中转站。OpenAI 那边除了一个公益站

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from helpers import MockUpstream, add_upstream, add_route, two_anthropic_sites, msg, wait_inflight
 
 
@@ -12,6 +14,7 @@ from helpers import MockUpstream, add_upstream, add_route, two_anthropic_sites, 
 
 
 
+@pytest.mark.network
 def test_inflight_lists_the_running_request(gateway):
     """这页要能回答：现在在打哪个上游、什么阶段、等了多久、下游是谁。"""
     with MockUpstream("siteA") as a:
@@ -44,6 +47,7 @@ def test_inflight_lists_the_running_request(gateway):
         assert after["counts"] == {"requests": 0, "streams": 0}
 
 
+@pytest.mark.network
 def test_manual_cancel_closes_a_real_stream_and_gateway_stays_usable(gateway):
     """真实 HTTP 连接也要及时收尾，不能只在登记表里把那条请求藏起来。"""
     with MockUpstream("siteA") as upstream:
@@ -106,6 +110,7 @@ def test_inflight_registers_nothing_for_an_unconfigured_model(gateway):
 
 
 
+@pytest.mark.network
 def test_inflight_uses_the_token_counts_upstream_reported(gateway):
     """Anthropic 把输入 token 放在流开头的 message_start 里，所以第一块字节到手时
     就已经有真数了，不用再按包大小估。输出 token 要等末尾的 message_delta。"""
