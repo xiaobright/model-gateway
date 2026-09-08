@@ -28,13 +28,17 @@ export function createRefreshQueue(load, apply) {
         try {
           const value = await load(job.args, job.version);
           // If another refresh was queued while this request was in flight,
-          // its snapshot is newer.  Finish the old caller but never paint the
-          // stale value before the pending read applies.
-          if (!pending) apply(value, job.args, job.version);
+          // its snapshot is newer.  Keep every waiter pending until that
+          // snapshot has been applied; resolving here makes a post-write
+          // caller observe completion before the UI has caught up.
+          if (pending) continue;
+          apply(value, job.args, job.version);
           settle(job.version, null, value);
         } catch (error) {
-          // 最后一次有效值由 apply 保留；本轮调用者仍要知道这次读取失败，才能重试。
-          settle(job.version, error);
+          // A stale read may fail while its replacement is already queued.
+          // Let the replacement decide the waiters' result instead of making
+          // a write-triggered refresh reject before its required reread.
+          if (!pending) settle(job.version, error);
         }
       }
     } finally {

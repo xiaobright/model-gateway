@@ -45,9 +45,14 @@ const refresh = createRefreshQueue(
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const oldRefresh = refresh({ name: 'old' });
 const newRefresh = refresh({ name: 'new' });
+let oldResolved = false;
+oldRefresh.then(() => { oldResolved = true; });
 await tick();
 loads[0].resolve('old');
 while (loads.length < 2) await tick();
+await tick();
+assert.equal(oldResolved, false);
+assert.deepEqual(applied, []);
 loads[1].resolve('new');
 await Promise.all([oldRefresh, newRefresh]);
 assert.deepEqual(applied, ['new']);

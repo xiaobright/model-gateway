@@ -44,7 +44,7 @@
 | `test_routing` 10 项 | 快速、临时 SQLite/进程内 API | 首选/备用、禁用、排序、删除兜底、斜杠模型名、单接口模型规则 |
 | `test_stats` 6 项 | 快速、临时 SQLite | 缓存口径、HTTP 错误、思维链过滤、token 比例与健康统计 |
 | `test_failover` 11 项 | 快速、MockTransport 和可控测试状态 | 尝试顺序、站级/模型级失败、冷却、次数、状态请求限制、手动清冷却 |
-| `test_proxy` 21 项 | 17 项快速，4 项 network | 字节透传、头和鉴权、模型改写、usage、错误、SSE；network 保留真实流切换、断流、完成后挂连接和分块边界 |
+| `test_proxy` 21 项 | 18 项快速，3 项 network | 字节透传、头和鉴权、模型改写、usage、错误、SSE；network 保留真实流切换、断流和完成后挂连接 |
 | `test_inflight` 6 项 | 3 项快速，3 项 network | 实时登记、取消、请求轨迹、count_tokens 不计入；network 保留真实取消/流行为 |
 | `test_lifecycle` 7 项 | 快速、ASGI/MockTransport 和事件控制 | JSON/SSE 分块、三阶段取消、并发隔离 |
 | `test_egress` 8 项 | 3 项快速，5 项 network | 出口配置校验快速验证；代理、直连、探测和自签 TLS 经过真实 socket |
@@ -54,7 +54,7 @@
 
 真实网络场景保留位置：
 
-1. `test_proxy.py`：流中切换、客户端中途断开、完成事件后客户端离开、拆分完成标记。
+1. `test_proxy.py`：流中切换、客户端中途断开、完成事件后客户端离开；拆分完成标记在快速组用 MockTransport 验证。
 2. `test_inflight.py`：真实流登记、实时取消和后续网关可用性。
 3. `test_egress.py`：真实代理流量、直连不走系统代理、探测和自签 TLS CA。
 4. `test_units.py`：真实 TLS CA pin 通过/不信任失败。

@@ -888,7 +888,8 @@ async function pullRemoteList(gid) {
 }
 
 async function saveRoute() {
-  const cand = state.editingCand;
+  const seq = routeRemoteSeq;
+  const cand = state.editingCand ? { ...state.editingCand } : null;
   const model = $('rt-model').value.trim();
   if (!model) return toast('模型名不能为空', 'err');
   // 勾了 1M 就把后缀写进真实模型名：网关转发时摘掉它、换成 anthropic-beta 头
@@ -905,8 +906,12 @@ async function saveRoute() {
       model_name: model, group_id: gid, remote_model: remote,
     });
   }
-  $('route-dialog').close();
   await refreshConfig();
+  // The request belongs to the captured candidate.  If the dialog was closed
+  // and reopened while it was in flight, its result must not close or toast
+  // the newer editor session.
+  if (routeRemoteSeq !== seq) return;
+  $('route-dialog').close();
   toast(cand ? '已保存' : '已添加', 'ok');
 }
 
