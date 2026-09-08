@@ -87,8 +87,6 @@
           <h2>模型路由</h2><span class="count" id="route-count"></span>
           <span class="grow"></span>
           <span class="seg" id="seg-iface" role="group" aria-label="按接口筛选">
-            <button type="button" class="seg-item" data-iface="anthropic">Anthropic</button>
-            <button type="button" class="seg-item" data-iface="openai">OpenAI</button>
             <button type="button" class="seg-item is-on" data-iface="">全部</button>
           </span>
           <span class="fo-box" id="failover-box"></span>
@@ -182,9 +180,8 @@
         <span class="grow"></span>
         <span class="seg" id="seg-proto" role="group" aria-label="按协议筛选">
           <button type="button" class="seg-item is-on" data-proto="">全部</button>
-          <button type="button" class="seg-item" data-proto="anthropic">Anthropic</button>
-          <button type="button" class="seg-item" data-proto="openai">OpenAI</button>
         </span>
+        <span id="protocol-status" class="dim" aria-live="polite"></span>
         <label class="checkline">
           <input type="checkbox" id="log-follow" checked><span id="follow-hint">自动跟随新记录</span>
         </label>

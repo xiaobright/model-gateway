@@ -76,6 +76,11 @@ class FailoverIn(BaseModel):
     enabled: bool
 
 
+class CloneIn(BaseModel):
+    # 兼容当前只有两种接口时的无请求体调用；有多个目标时必须明确指定。
+    protocol: str | None = None
+
+
 def _validate_protocol(protocol: str) -> str:
     clean = protocol.strip().lower()
     if clean not in protocols.NAMES:
@@ -189,6 +194,12 @@ def get_upstreams() -> list[dict[str, Any]]:
     for group in db.list_groups():
         by_upstream[group.upstream_id].append(group)
     return [_serialize_upstream(u, by_upstream[u.id]) for u in db.list_upstreams()]
+
+
+@router.get("/protocols")
+def get_protocols() -> dict[str, list[dict[str, object]]]:
+    """前端用的只读协议投影，不暴露描述符里的函数、key 或上游配置。"""
+    return {"protocols": protocols.public_metadata()}
 
 
 _DUP_BASE = (
@@ -355,11 +366,20 @@ def put_group(group_id: int, payload: GroupIn) -> dict[str, Any]:
 
 
 @router.post("/groups/{group_id}/clone")
-def post_clone_group(group_id: int) -> dict[str, Any]:
+def post_clone_group(group_id: int, payload: CloneIn | None = None) -> dict[str, Any]:
     """把这把 key 复制到另一种接口上。有些站一把 key 两种接口都能用，而接口是分组的属性，
     手动再填一遍 key 很烦。"""
     source = _require_group(group_id)
-    other = next(p for p in protocols.NAMES if p != source.protocol)
+    other = payload.protocol.strip().lower() if payload and payload.protocol else ""
+    if not other:
+        choices = [p for p in protocols.NAMES if p != source.protocol]
+        if len(choices) != 1:
+            raise HTTPException(400, "有多个可复制的目标接口，请明确指定 protocol")
+        other = choices[0]
+    else:
+        other = _validate_protocol(other)
+        if other == source.protocol:
+            raise HTTPException(400, "复制目标接口必须与来源不同")
     try:
         created = db.create_group(
             source.upstream_id, source.name, other, source.api_key, source.enabled

@@ -299,6 +299,68 @@ def test_cloning_a_group_copies_the_key_to_the_other_interface(gateway):
         assert {g["name"] for g in detail["groups"]} == {"默认"}, "同名不同接口"
 
 
+def test_protocol_metadata_is_a_safe_display_projection(gateway):
+    data = gateway.get("/admin/api/protocols")
+    assert data.status_code == 200
+    assert data.json() == {
+        "protocols": [
+            {
+                "name": "anthropic",
+                "label": "Anthropic Messages",
+                "path": "/v1/messages",
+                "client": "Claude Code",
+                "supports_1m": True,
+            },
+            {
+                "name": "openai",
+                "label": "OpenAI Responses",
+                "path": "/v1/responses",
+                "client": "Codex",
+                "supports_1m": False,
+            },
+        ]
+    }
+
+
+def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway, monkeypatch):
+    from dataclasses import replace
+    from gateway import protocols
+
+    third = replace(
+        protocols.OPENAI,
+        name="test-third",
+        label="Test Third",
+        path="/test/third",
+        client="Test Client",
+    )
+    all_protocols = {**protocols.ALL, third.name: third}
+    monkeypatch.setattr(protocols, "ALL", all_protocols)
+    monkeypatch.setattr(protocols, "NAMES", tuple(all_protocols))
+
+    with MockUpstream("siteA") as a:
+        group_id = add_upstream(gateway, a, "siteA")
+        missing = gateway.post(f"/admin/api/groups/{group_id}/clone")
+        assert missing.status_code == 400 and "明确" in missing.json()["detail"]
+
+        same = gateway.post(
+            f"/admin/api/groups/{group_id}/clone", json={"protocol": "openai"}
+        )
+        assert same.status_code == 400 and "不同" in same.json()["detail"]
+
+        invalid = gateway.post(
+            f"/admin/api/groups/{group_id}/clone", json={"protocol": "missing"}
+        )
+        assert invalid.status_code == 400
+
+        copied = gateway.post(
+            f"/admin/api/groups/{group_id}/clone", json={"protocol": "test-third"}
+        )
+        assert copied.status_code == 200
+        assert (copied.json()["protocol"], copied.json()["api_key"]) == (
+            "test-third", "key-siteA"
+        )
+
+
 @pytest.mark.parametrize("version, missing", [(0, True), (3, True), (4, True), (0, False), (4, False)])
 def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatch, version, missing):
     """未打号、正常 v3、误打 v4 的老库都要补列；完整的新库不应迁移或备份。"""

@@ -212,20 +212,41 @@ export const groupsOfIface = (upstream, iface) =>
 export const supportsIface = (upstream, iface) =>
   !iface || (upstream.supports || []).includes(iface);
 
-/* 接口 = 一条请求走哪种线格式，也就是它打进来的那个路径。两处显示用同一套词，
-   不再有「侧」和「协议」两套说法。
+/* 接口 = 一条请求走哪种线格式，也就是它打进来的那个路径。列表由后端描述符的只读投影
+   在启动时填入；下面几个映射仍是给现有调用点用的派生值，不再在前端另登记协议 ID。 */
+export let PROTO_INFO = Object.create(null);
+export let PROTOCOLS = [];
+export let PROTO_LABEL = Object.create(null);
+export let PROTO_PATH = Object.create(null);
+export let PROTO_CLIENT = Object.create(null);
 
-   加一种协议只改 PROTO_INFO 这一处 —— 下面几个是给现有调用点用的派生常量，别单独往里
-   加东西。这份名单必须和网关侧 gateway/protocols.py 里的描述符对上：那边漏一个，
-   这边就会出现一个点了选不了的接口。 */
-export const PROTO_INFO = {
-  anthropic: { label: 'Anthropic', path: '/v1/messages', client: 'Claude Code' },
-  openai: { label: 'OpenAI', path: '/v1/responses', client: 'Codex' },
-};
-export const PROTOCOLS = Object.keys(PROTO_INFO);
-export const PROTO_LABEL = Object.fromEntries(PROTOCOLS.map((p) => [p, PROTO_INFO[p].label]));
-export const PROTO_PATH = Object.fromEntries(PROTOCOLS.map((p) => [p, PROTO_INFO[p].path]));
-export const PROTO_CLIENT = Object.fromEntries(PROTOCOLS.map((p) => [p, PROTO_INFO[p].client]));
+export function setProtocolMetadata(items) {
+  if (!Array.isArray(items) || !items.length) throw new Error('协议列表为空');
+  const info = Object.create(null);
+  for (const item of items) {
+    if (!item || typeof item.name !== 'string' || !item.name.trim()
+      || typeof item.label !== 'string' || !item.label.trim()
+      || typeof item.path !== 'string' || !item.path.trim()
+      || typeof item.client !== 'string' || !item.client.trim()) {
+      throw new Error('协议元数据不完整');
+    }
+    const name = item.name.trim().toLowerCase();
+    if (info[name]) throw new Error(`协议重复：${name}`);
+    info[name] = {
+      label: item.label,
+      path: item.path,
+      client: item.client,
+      supports_1m: Boolean(item.supports_1m),
+    };
+  }
+  const names = Object.keys(info);
+  PROTO_INFO = info;
+  PROTOCOLS = names;
+  PROTO_LABEL = Object.fromEntries(names.map((p) => [p, info[p].label]));
+  PROTO_PATH = Object.fromEntries(names.map((p) => [p, info[p].path]));
+  PROTO_CLIENT = Object.fromEntries(names.map((p) => [p, info[p].client]));
+  return names;
+}
 
 /* 1M 上下文是「上游真名」上的一个后缀（`名字[1m]`）：网关转发时摘掉它、换成
    anthropic-beta 头。这里只管在界面和存储之间来回翻译，规则和 gateway/naming.py 对齐。 */

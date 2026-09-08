@@ -10,12 +10,53 @@ import {
   $, state, api, toast, confirmBox, run, esc,
   modelsOfGroup, modelsOfUpstream, groupLabel, upstreamOfGroup, groupOf, remotesOfGroup,
   supportsIface, groupsOfIface, splitOneM, withOneM,
-  PROTO_LABEL, PROTO_PATH, PROTO_CLIENT, PROTOCOLS,
+  PROTO_LABEL, PROTO_PATH, PROTO_CLIENT, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
 
 /* ---------------------------------------------------------------- 数据 */
+
+let protocolLoading = false;
+
+function renderProtocolControls() {
+  const make = (attr) => `<button type="button" class="seg-item" ${attr}="">全部</button>`
+    + PROTOCOLS.map((p) => `<button type="button" class="seg-item" ${attr}="${esc(p)}">`
+      + `${esc(PROTO_LABEL[p])}</button>`).join('');
+  $('seg-iface').innerHTML = make('data-iface');
+  $('seg-proto').innerHTML = make('data-proto');
+  for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
+  for (const b of $('seg-proto').children) b.classList.toggle('is-on', b.dataset.proto === state.proto);
+  $('protocol-status').textContent = '';
+}
+
+function protocolStatus(message, retry = false) {
+  const host = $('protocol-status');
+  if (!host) return;
+  host.textContent = message;
+  if (retry) {
+    host.insertAdjacentHTML('beforeend',
+      ' <button type="button" class="btn btn-ghost btn-sm" data-act="retry-protocols">重试</button>');
+  }
+}
+
+async function refreshProtocols() {
+  if (protocolLoading) return;
+  protocolLoading = true;
+  try {
+    const data = await api('GET', '/admin/api/protocols');
+    setProtocolMetadata(data && data.protocols);
+    state.protocolsReady = true;
+    renderProtocolControls();
+    views.renderRoutes();
+    views.renderUpstreams();
+  } catch (e) {
+    protocolStatus(PROTOCOLS.length ? `协议选项刷新失败：${e.message}` : '协议选项加载失败', true);
+    throw e;
+  } finally {
+    protocolLoading = false;
+  }
+}
 
 async function refreshConfig() {
   const presets = await api('GET', '/admin/api/egress-presets').catch(() => null);
@@ -121,6 +162,7 @@ async function setWindow(w) {
 /* 两个都是纯前端筛选，不重新拉数据。
    data-iface 在模型路由的分段上，data-proto 在转发记录的分段上，各自独立不会撞。 */
 function setIface(v) {
+  v = PROTOCOLS.includes(v) ? v : '';
   if (v === state.iface) return;
   state.iface = v;
   localStorage.setItem('mg-iface', v);
@@ -129,6 +171,7 @@ function setIface(v) {
 }
 
 function setProto(p) {
+  p = PROTOCOLS.includes(p) ? p : '';
   if (p === state.proto) return;
   state.proto = p;
   for (const b of $('seg-proto').children) b.classList.toggle('is-on', b.dataset.proto === p);
@@ -444,6 +487,7 @@ function fillIfaceSelect(selectId, value) {
 }
 
 function openGroup(upstreamId, gid) {
+  if (!PROTOCOLS.length) return toast('协议选项还没加载完成，请稍后重试', 'err');
   const up = state.upstreams.find((u) => u.id === Number(upstreamId));
   if (!up) return toast('供应商不存在了，刷新一下', 'err');
   const g = gid === null ? null : (up.groups || []).find((x) => x.id === gid);
@@ -642,10 +686,11 @@ async function removeModel(name) {
    「接口」在这里只是个过滤器 —— 真正决定模型走哪种接口的是它候选所在分组的接口。
    候选用它自己的 route_id 指：同一个分组下可以挂同一个模型的好几条真名。 */
 function openRoute(model, rid) {
+  if (!PROTOCOLS.length) return toast('协议选项还没加载完成，请稍后重试', 'err');
   const row = model ? state.routes.find((r) => r.model_name === model) : null;
   const cand = row && rid ? row.candidates.find((c) => c.route_id === rid) : null;
   // 已有模型的接口已经定了；新增时跟当前分段（分段在「全部」就默认 OpenAI）
-  const iface = row ? row.protocol : (state.iface || 'openai');
+  const iface = row ? row.protocol : (state.iface || PROTOCOLS[0]);
   const pool = upstreamsFor(iface);
   if (!pool.length) {
     return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
@@ -796,6 +841,12 @@ const ACTIONS = {
 
   'show-access': showAccess,
 
+  'retry-protocols': async () => {
+    await refreshProtocols();
+    await refreshConfig();
+    toast('协议选项已恢复', 'ok');
+  },
+
   'go-live': () => showView('live'),
 
   'cancel-call': async ({ id }) => {
@@ -857,8 +908,12 @@ const ACTIONS = {
     if (up) openGroup(up.id, Number(gid));
   },
 
-  'clone-group': async ({ gid }) => {
-    const created = await api('POST', `/admin/api/groups/${gid}/clone`);
+  'clone-group': async ({ gid, protocol }) => {
+    const created = await api(
+      'POST',
+      `/admin/api/groups/${gid}/clone`,
+      protocol ? { protocol } : undefined,
+    );
     await refreshConfig();
     toast(`已复制成 ${PROTO_LABEL[created.protocol]} 接口的分组「${created.name}」`, 'ok');
     openGroup(created.upstream_id, created.id);
@@ -1250,7 +1305,9 @@ $('endpoint').textContent = `${location.origin}/v1`;
 views.initLogFollow();   // 「自动跟随新记录」的勾选状态变化时补插攒下的行
 for (const b of $('seg-window').children) b.classList.toggle('is-on', b.dataset.window === state.window);
 
-state.iface = localStorage.getItem('mg-iface') || '';
+state.iface = PROTOCOLS.includes(localStorage.getItem('mg-iface'))
+  ? localStorage.getItem('mg-iface') : '';
+renderProtocolControls();
 for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
 
 const initial = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
@@ -1258,6 +1315,7 @@ currentView = '';
 showView(initial);
 
 run(null, async () => {
+  await refreshProtocols();
   await Promise.all([refreshConfig(), refreshOverview(), refreshStats()]);
   await refreshLog();
 });

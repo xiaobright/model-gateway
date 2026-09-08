@@ -267,11 +267,12 @@ RATIO_MIN_ROWS = 20        # 样本少于这个数就用兜底常数，别拿三
 RATIO_MAX_SPREAD = 6.0     # p90/p10 超过这个就是「字节数压根预测不了 token」，不给估值
 RATIO_TTL = 60.0           # 学出来的标尺缓存这么久：那个接口 1 秒一刷，不该每次全表扫
 
-# 兜底值。上行取自真库两千条记录的中位数；下行是中英混排正文的经验值（一个 token
-# 三个字节上下），等攒够没有思维链的记录就会被真实测量顶掉
+# 兜底值在协议描述符里登记。上行取自真库两千条记录的中位数；下行是中英混排正文的
+# 经验值，等攒够没有思维链的记录就会被真实测量顶掉。未配置的协议不擅自套用别人的值。
 RATIO_FALLBACK: dict[str, tuple[float, float]] = {
-    "anthropic": (6.7, 3.0),
-    "openai": (4.9, 3.0),
+    proto.name: proto.ratio_fallback
+    for proto in protocols.ALL.values()
+    if proto.ratio_fallback is not None
 }
 
 _ratio_cache: tuple[float, dict[str, dict[str, float]]] = (0.0, {})

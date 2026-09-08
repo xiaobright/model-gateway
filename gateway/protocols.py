@@ -5,9 +5,9 @@
 （`upstream_groups.protocol`）：那把 key 走哪种接口。两者在 `db.resolve_route()`
 里汇合 —— 模型名 + 请求协议，找出该用哪个分组。
 
-真正随协议变的只有四件事，全在下面的描述符里：结束标记、usage 字段位置、鉴权头、
-以及网关自己产生错误时的错误体形状。要再加一种协议（比如 chat-completions），
-写一个描述符 + 一条路由即可。
+真正随协议变的细节，以及管理页需要展示的元数据，都在下面的描述符里：结束标记、usage
+字段位置、鉴权头、错误体形状、客户端提示和能力标记。要再加一种直通格式，仍需写描述符、
+显式路由和对应行为测试；本模块不负责格式转换。
 """
 
 from __future__ import annotations
@@ -179,6 +179,9 @@ def anthropic_auth(api_key: str) -> dict[str, str]:
 @dataclass(frozen=True, slots=True)
 class Protocol:
     name: str
+    label: str
+    path: str
+    client: str
     # SSE 的事件名和独立 data 行。不能把它们当普通字符串在正文里搜索。
     end_event_types: tuple[str, ...]
     end_data_markers: tuple[str, ...]
@@ -200,10 +203,16 @@ class Protocol:
     defaults: dict[str, str] = field(default_factory=dict)
     # 非空表示这个协议用这个头传 beta 开关（1M 上下文就走它）
     beta_header: str = ""
+    # 与协议登记放在一起，供 failover/stats 派生默认设置，避免再维护平行名单。
+    default_failover: bool = False
+    ratio_fallback: tuple[float, float] | None = None
 
 
 OPENAI = Protocol(
     name="openai",
+    label="OpenAI Responses",
+    path="/v1/responses",
+    client="Codex",
     end_event_types=("response.completed",),
     end_data_markers=("[DONE]",),
     extract_usage=openai_usage,
@@ -213,10 +222,14 @@ OPENAI = Protocol(
     error_body=openai_error,
     auth_headers=openai_auth,
     fingerprint={"user-agent": "codex_cli_rs", "originator": "codex_cli_rs"},
+    ratio_fallback=(4.9, 3.0),
 )
 
 ANTHROPIC = Protocol(
     name="anthropic",
+    label="Anthropic Messages",
+    path="/v1/messages",
+    client="Claude Code",
     end_event_types=("message_stop",),
     # [DONE] 是给「OpenAI 转 Anthropic」那类中转站留的，它们有时会在末尾多发一行
     end_data_markers=("[DONE]",),
@@ -229,12 +242,33 @@ ANTHROPIC = Protocol(
     fingerprint={"user-agent": "claude-cli/2.0.0 (external, cli)", "x-app": "cli"},
     defaults={"anthropic-version": "2023-06-01"},
     beta_header="anthropic-beta",
+    default_failover=True,
+    ratio_fallback=(6.7, 3.0),
 )
 
-# 协议名只有这两个地方之一在登记：描述符自己。别处一律从 NAMES 派生，
+# 协议名只在描述符这里登记。别处一律从 NAMES 派生，
 # 漏改一处就会「新协议在转发侧存在、在下拉里没有」这种半吊子状态
 ALL: dict[str, Protocol] = {p.name: p for p in (ANTHROPIC, OPENAI)}
 NAMES: tuple[str, ...] = tuple(ALL)
+
+
+def public_metadata() -> list[dict[str, object]]:
+    """Return only the stable display projection used by the admin UI.
+
+    Keep keys, callables, and protocol-specific implementation details out of
+    this response.  ``supports_1m`` is deliberately derived from the same
+    beta-header setting used by forwarding.
+    """
+    return [
+        {
+            "name": proto.name,
+            "label": proto.label,
+            "path": proto.path,
+            "client": proto.client,
+            "supports_1m": bool(proto.beta_header),
+        }
+        for proto in ALL.values()
+    ]
 
 
 def by_name(name: str) -> Protocol:

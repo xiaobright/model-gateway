@@ -43,12 +43,13 @@ RETRY_STATUS = frozenset(
 # key 是好的、站是通的，所以不记失败、不进冷却，见 note_fail 的调用点。
 MODEL_STATUS = frozenset({404})
 
-# 开关按接口分开存：Claude 侧全是中转站、坏得勤，值得自动降级；
-# GPT 侧只有 站A 是公益站，其余要花钱的站「花钱图稳定」，得手动确认。
-# 这里的键是协议名，漏写的一种按「关」处理 —— 新的线格式不该在没人点过头之前
-# 就开始自动换站
+# 开关按接口分开存。默认值属于协议描述符；漏写的一种按「关」处理 —— 新的线格式不该
+# 在没人点过头之前就开始自动换站。
 _KEY = "failover.{0}"
-_DEFAULT_ON = {"anthropic": "on", "openai": "off"}
+_DEFAULT_ON = {
+    proto.name: ("on" if proto.default_failover else "off")
+    for proto in protocols.ALL.values()
+}
 
 
 def enabled(protocol: str) -> bool:
@@ -173,4 +174,3 @@ def next_index(candidates: Sequence[db.Route], start: int, dead_groups: set[int]
         if candidates[i].group_id not in dead_groups:
             return i
     return -1
-

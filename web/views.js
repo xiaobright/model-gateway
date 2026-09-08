@@ -229,6 +229,16 @@ function multiGroupIds() {
   return new Set(state.upstreams.filter((u) => (u.groups || []).length > 1).map((u) => u.id));
 }
 
+function cloneButtons(group) {
+  if (!group || !group.api_key) return '';
+  const targets = PROTOCOLS.filter((p) => p !== group.protocol);
+  return targets.map((p) =>
+    `<button type="button" class="btn btn-ghost btn-sm" data-act="clone-group"`
+      + ` data-gid="${group.id}" data-protocol="${esc(p)}">`
+      + `复制这把 key 到 ${esc(PROTO_LABEL[p] || p)}</button>`
+  ).join(' ');
+}
+
 /* 一个分组下可以挂同一个模型的好几条候选（各指一个不同的上游真名），这时候光写
    「供应商 · 分组」两个圆片长得一模一样，所以 showRemote 会强制把真名显示出来。 */
 function chipHtml(model, c, showGroup, showRemote, activeRouteId) {
@@ -632,7 +642,6 @@ export function renderUpGroups() {
   $('up-add-group').dataset.uid = String(u.id);
 
   const only = groups.length === 1 ? groups[0] : null;
-  const other = only && only.protocol === 'anthropic' ? 'openai' : 'anthropic';
   $('up-groups').innerHTML = groups.map((g) => {
     const n = modelsOfGroup(g.id).length;
     const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
@@ -653,10 +662,10 @@ export function renderUpGroups() {
   // 一把 key 两种接口都能用的站不少，而接口是分组的属性，所以给个一键复制
   const clone = $('up-clone-group');
   if (clone) clone.remove();
-  if (only && only.api_key) {
+  const cloneHtml = cloneButtons(only);
+  if (cloneHtml) {
     $('up-add-group').insertAdjacentHTML('afterend',
-      `<button type="button" class="btn btn-ghost btn-sm" id="up-clone-group"
-               data-act="clone-group" data-gid="${only.id}">复制这把 key 到 ${PROTO_LABEL[other]}</button>`);
+      `<span id="up-clone-group" class="field-row" style="display:inline-flex;gap:6px">${cloneHtml}</span>`);
   }
 }
 
@@ -722,10 +731,7 @@ export function renderUpstreams() {
     for (const g of groups) rows.push(groupRow(u, g));
     // 一把 key 两种接口都能用的站不少，而接口是分组的属性，所以给个一键复制
     const only = groups.length === 1 ? groups[0] : null;
-    const other = only && only.protocol === 'anthropic' ? 'openai' : 'anthropic';
-    const clone = only && only.api_key
-      ? `<button class="btn btn-ghost btn-sm" data-act="clone-group" data-gid="${only.id}">`
-        + `复制这把 key 到 ${PROTO_LABEL[other]}</button>` : '';
+    const clone = cloneButtons(only);
     rows.push(`<tr class="grp-row"><td colspan="7">
       <button class="btn btn-ghost btn-sm" data-act="new-group" data-uid="${u.id}">＋ 添加分组</button>
       ${clone}
