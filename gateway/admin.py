@@ -89,6 +89,13 @@ class FailoverIn(BaseModel):
     enabled: bool
 
 
+class ProtocolSwitchIn(BaseModel):
+    """全局停用 / 启用一种接口。停用后它像不存在一样：隐藏、拒绝转发，但配置都留着。"""
+
+    protocol: str = Field(min_length=1)
+    enabled: bool
+
+
 class StandaloneSearchTargetIn(BaseModel):
     # None means restore the normal per-model candidate chain.
     group_id: int | None = Field(default=None, gt=0)
@@ -209,11 +216,9 @@ def _require_group(group_id: int) -> db.Group:
 
 
 def _one_upstream(upstream_id: int) -> dict[str, Any]:
-    return _serialize_upstream(
-        _require_upstream(upstream_id),
-        list(db.list_groups(upstream_id)),
-        db.all_group_models(),
-    )
+    disabled = db.disabled_protocols()
+    groups = [g for g in db.list_groups(upstream_id) if g.protocol not in disabled]
+    return _serialize_upstream(_require_upstream(upstream_id), groups, db.all_group_models())
 
 
 # ---------------------------------------------------------------- 供应商
@@ -221,19 +226,45 @@ def _one_upstream(upstream_id: int) -> dict[str, Any]:
 
 @router.get("/upstreams")
 def get_upstreams() -> list[dict[str, Any]]:
+    disabled = db.disabled_protocols()
     by_upstream: dict[int, list[db.Group]] = defaultdict(list)
     for group in db.list_groups():
         by_upstream[group.upstream_id].append(group)
     models_by_group = db.all_group_models()
-    return [
-        _serialize_upstream(u, by_upstream[u.id], models_by_group) for u in db.list_upstreams()
-    ]
+    out = []
+    for u in db.list_upstreams():
+        groups = by_upstream[u.id]
+        visible = [g for g in groups if g.protocol not in disabled]
+        # 只有被停用协议分组的站整个藏起来；没有分组的站照旧显示（还要建第一个分组）
+        if groups and not visible:
+            continue
+        out.append(_serialize_upstream(u, visible, models_by_group))
+    return out
 
 
 @router.get("/protocols")
 def get_protocols() -> dict[str, list[dict[str, object]]]:
     """前端用的只读协议投影，不暴露描述符里的函数、key 或上游配置。"""
     return {"protocols": protocols.public_metadata()}
+
+
+def _protocol_switches() -> dict[str, dict[str, bool]]:
+    disabled = db.disabled_protocols()
+    return {"enabled": {p: p not in disabled for p in protocols.NAMES}}
+
+
+@router.get("/protocol-switches")
+def get_protocol_switches() -> dict[str, dict[str, bool]]:
+    """每种接口的全局开关状态。停用只是隐藏 + 拒绝转发，描述符和配置都还在。"""
+    return _protocol_switches()
+
+
+@router.post("/protocol-switches")
+def post_protocol_switch(payload: ProtocolSwitchIn) -> dict[str, dict[str, bool]]:
+    protocol = _validate_protocol(payload.protocol)
+    db.set_protocol_enabled(protocol, payload.enabled)
+    log(f"PROTOCOL {protocol} -> {'enabled' if payload.enabled else 'disabled'}")
+    return _protocol_switches()
 
 
 _DUP_BASE = (
@@ -382,7 +413,10 @@ def put_standalone_search_target(payload: StandaloneSearchTargetIn) -> dict[str,
 @router.get("/upstreams/{upstream_id}/groups")
 def get_groups(upstream_id: int) -> list[dict[str, Any]]:
     _require_upstream(upstream_id)
-    return [_serialize_group(g) for g in db.list_groups(upstream_id)]
+    disabled = db.disabled_protocols()
+    return [
+        _serialize_group(g) for g in db.list_groups(upstream_id) if g.protocol not in disabled
+    ]
 
 
 @router.post("/upstreams/{upstream_id}/groups")
@@ -511,9 +545,12 @@ def remove_group_model(
 
 @router.get("/models")
 def get_model_routes() -> list[dict[str, Any]]:
+    disabled = db.disabled_protocols()
     cooling = {b["group_id"]: b for b in failover.snapshot()}
     grouped: dict[str, dict[str, Any]] = {}
     for row in db.list_routes():
+        if row["protocol"] in disabled:
+            continue
         group = grouped.setdefault(
             row["model_name"],
             {
@@ -744,7 +781,12 @@ def remove_model_route(
 
 @router.get("/requests")
 def get_requests(limit: int = 50) -> list[dict[str, Any]]:
-    return list(db.recent_requests(max(1, min(limit, 200))))
+    rows = db.recent_requests(max(1, min(limit, 200)))
+    disabled = db.disabled_protocols()
+    if disabled:
+        # 停用的接口在管理页里像不存在一样，历史记录也一起藏起来
+        rows = tuple(r for r in rows if (r.get("protocol") or "") not in disabled)
+    return list(rows)
 
 
 @router.delete("/requests")

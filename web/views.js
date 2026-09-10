@@ -4,7 +4,7 @@
    - 所有列表更新都走增量：无变化就不碰 DOM，避免动画乱闪 */
 
 import {
-  $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft,
+  $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft, protocolOn,
   catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
@@ -288,7 +288,7 @@ function failoverSwitches(list) {
 
 function failoverBox() {
   const box = $('failover-box');
-  if (box) box.innerHTML = failoverSwitches(state.iface ? [state.iface] : PROTOCOLS);
+  if (box) box.innerHTML = failoverSwitches(state.iface ? [state.iface] : PROTOCOLS.filter(protocolOn));
 }
 
 const EMPTY_BY_IFACE = {
@@ -524,7 +524,7 @@ export function renderInflight(data) {
     ? `${counts.requests} 个进行中${counts.streams ? ` · ${counts.streams} 流式` : ''}`
     : '空闲';
   $('badge-live').textContent = counts.requests ? String(counts.requests) : '';
-  $('live-failover').innerHTML = failoverSwitches(PROTOCOLS);
+  $('live-failover').innerHTML = failoverSwitches(PROTOCOLS.filter(protocolOn));
   renderBreakers(data);
 
   const live = data.calls || [];

@@ -9,9 +9,9 @@
 import {
   $, state, api, toast, confirmBox, run, esc,
   catalogOfGroup, catalogOfUpstream, routeCountOfGroup, routeCountOfUpstream,
-  groupLabel, upstreamOfGroup, groupOf,
+  groupLabel, upstreamOfGroup, groupOf, protocolOn,
   supportsIface, groupsOfIface, splitOneM, withOneM,
-  PROTO_LABEL, PROTO_PATH, PROTO_CLIENT, PROTOCOLS, setProtocolMetadata,
+  PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
@@ -26,9 +26,28 @@ import {
 
 let protocolLoading = false;
 
+/* 接口开关：只渲染启用的那些。停用的接口不出现在筛选器里，列表里也没有它的东西 */
+function renderProtocolSwitches() {
+  const host = $('proto-switches');
+  if (!host) return;
+  host.innerHTML = PROTOCOLS.map((p) => {
+    const on = protocolOn(p);
+    const name = PROTO_SHORT[p] || p;
+    const tip = on
+      ? `停用后：${name} 的模型、分组和只有它的站都隐藏，请求被拒绝。配置保留，随时可再打开`
+      : `重新启用 ${name}`;
+    return `<label class="fo-item${on ? '' : ' is-off'}" title="${esc(tip)}">
+      <span>${esc(name)}</span>
+      <input type="checkbox" class="switch" data-act="toggle-protocol"
+             data-proto="${esc(p)}" ${on ? 'checked' : ''} aria-label="启用 ${esc(name)} 接口">
+    </label>`;
+  }).join('');
+}
+
 function renderProtocolControls() {
+  const enabled = PROTOCOLS.filter(protocolOn);
   const make = (attr) => `<button type="button" class="seg-item" ${attr}="">全部</button>`
-    + PROTOCOLS.map((p) => `<button type="button" class="seg-item" ${attr}="${esc(p)}">`
+    + enabled.map((p) => `<button type="button" class="seg-item" ${attr}="${esc(p)}">`
       + `${esc(PROTO_LABEL[p])}</button>`).join('');
   $('seg-iface').innerHTML = make('data-iface');
   $('seg-proto').innerHTML = make('data-proto');
@@ -39,7 +58,10 @@ function renderProtocolControls() {
 
 // Preserve the current new-model default when OpenAI is registered; a test or
 // future deployment with another first protocol still gets a valid choice.
-const defaultProtocol = () => PROTOCOLS.includes('openai') ? 'openai' : PROTOCOLS[0];
+const defaultProtocol = () => {
+  const enabled = PROTOCOLS.filter(protocolOn);
+  return enabled.includes('openai') ? 'openai' : (enabled[0] || PROTOCOLS[0]);
+};
 
 function protocolStatus(message, retry = false) {
   const host = $('protocol-status');
@@ -55,15 +77,23 @@ async function refreshProtocols() {
   if (protocolLoading) return;
   protocolLoading = true;
   try {
-    const data = await api('GET', '/admin/api/protocols');
+    const [data, switches] = await Promise.all([
+      api('GET', '/admin/api/protocols'),
+      api('GET', '/admin/api/protocol-switches').catch(() => null),
+    ]);
     const firstLoad = !state.protocolsReady;
     setProtocolMetadata(data && data.protocols);
+    if (switches && switches.enabled) state.protocolEnabled = switches.enabled;
     state.protocolsReady = true;
     if (firstLoad) {
       const saved = localStorage.getItem('mg-iface') || '';
-      state.iface = PROTOCOLS.includes(saved) ? saved : '';
+      state.iface = PROTOCOLS.includes(saved) && protocolOn(saved) ? saved : '';
     }
+    // 当前筛选可能指向一个刚被停用的接口，拉回「全部」
+    if (state.iface && !protocolOn(state.iface)) state.iface = '';
+    if (state.proto && !protocolOn(state.proto)) state.proto = '';
     renderProtocolControls();
+    renderProtocolSwitches();
     views.renderRoutes();
     views.renderUpstreams();
   } catch (e) {
@@ -1186,6 +1216,28 @@ const ACTIONS = {
   'new-route': () => openRoute('', null),
   'add-candidate': ({ model }) => openRoute(model, null),
   'edit-candidate': ({ model, rid }) => openRoute(model, Number(rid)),
+
+  /* 接口全局开关：停用后这种接口的模型 / 分组 / 只有它的站都隐藏，转发直接拒绝。
+     只影响展示与转发，描述符和配置都留着，打开就回来。 */
+  'toggle-protocol': async ({ proto }, el) => {
+    try {
+      const data = await api('POST', '/admin/api/protocol-switches', {
+        protocol: proto, enabled: el.checked,
+      });
+      state.protocolEnabled = data.enabled || state.protocolEnabled;
+    } catch (e) {
+      el.checked = !el.checked;
+      throw e;
+    }
+    if (state.iface && !protocolOn(state.iface)) setIface('');
+    if (state.proto && !protocolOn(state.proto)) setProto('');
+    renderProtocolControls();
+    renderProtocolSwitches();
+    state.logIds.clear();   // 转发记录整表重画，别留下停用协议的旧行
+    await Promise.all([refreshConfig(), refreshOverview(), refreshStats(), refreshLog()]);
+    const name = PROTO_SHORT[proto] || PROTO_LABEL[proto] || proto;
+    toast(`${name} 接口已${el.checked ? '启用' : '停用'}`, 'ok');
+  },
 
   /* 自动降级开关。按接口分开：Claude 侧的中转站坏得勤、值得自动换；
      GPT 侧除了 站A 都是要花钱的站，花钱图稳定，得手动确认。

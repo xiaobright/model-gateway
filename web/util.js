@@ -34,7 +34,13 @@ export const state = {
   window: '24h',
   logIds: new Set(), // 已渲染过的 request_log id，用来做增量 diff
   protocolsReady: false,
+  // 接口全局开关（/admin/api/protocol-switches）：停用的接口在界面上像不存在一样。
+  // 空对象 = 全部启用，协议列表还没加载完时别把界面藏空
+  protocolEnabled: {},
 };
+
+/** 接口是否启用。没拿到开关状态时按启用处理，避免首屏把东西全藏起来。 */
+export const protocolOn = (p) => state.protocolEnabled[p] !== false;
 
 /* ---------------------------------------------------------------- 格式化 */
 
@@ -220,6 +226,7 @@ export const supportsIface = (upstream, iface) =>
 export let PROTO_INFO = Object.create(null);
 export let PROTOCOLS = [];
 export let PROTO_LABEL = Object.create(null);
+export let PROTO_SHORT = Object.create(null);
 export let PROTO_PATH = Object.create(null);
 export let PROTO_CLIENT = Object.create(null);
 
@@ -235,8 +242,11 @@ export function setProtocolMetadata(items) {
     }
     const name = item.name.trim().toLowerCase();
     if (info[name]) throw new Error(`协议重复：${name}`);
+    const label = item.label.trim();
     info[name] = {
-      label: item.label,
+      label,
+      // 接口开关用的一行短名；后端没给就退回完整标签
+      short: typeof item.short === 'string' && item.short.trim() ? item.short.trim() : label,
       path: item.path,
       client: item.client,
       supports_1m: Boolean(item.supports_1m),
@@ -246,6 +256,7 @@ export function setProtocolMetadata(items) {
   PROTO_INFO = info;
   PROTOCOLS = names;
   PROTO_LABEL = Object.fromEntries(names.map((p) => [p, info[p].label]));
+  PROTO_SHORT = Object.fromEntries(names.map((p) => [p, info[p].short]));
   PROTO_PATH = Object.fromEntries(names.map((p) => [p, info[p].path]));
   PROTO_CLIENT = Object.fromEntries(names.map((p) => [p, info[p].client]));
   return names;

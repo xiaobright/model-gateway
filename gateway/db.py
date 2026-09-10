@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -1205,17 +1206,19 @@ def protocol_of_model(model_name: str) -> str:
 
 
 def exposed_models(protocol: str = "") -> tuple[str, ...]:
+    """对下游暴露的模型清单。停用的接口不算暴露 —— 客户端不该看见调不动的名字。"""
     query = (
-        "SELECT DISTINCT m.model_name FROM model_routes m"
+        "SELECT DISTINCT m.model_name, g.protocol FROM model_routes m"
         " JOIN upstream_groups g ON g.id = m.group_id"
     )
     args: tuple = ()
     if protocol:
         query += " WHERE g.protocol=?"
         args = (protocol,)
+    disabled = disabled_protocols()
     with _conn() as conn:
         rows = conn.execute(query + " ORDER BY m.model_name", args).fetchall()
-    return tuple(r["model_name"] for r in rows)
+    return tuple(r["model_name"] for r in rows if r["protocol"] not in disabled)
 
 
 def _reattach_active(conn: sqlite3.Connection, model_name: str) -> None:
@@ -1293,6 +1296,41 @@ def set_setting(key: str, value: str) -> None:
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+
+# ---------------------------------------------------------------- 接口全局开关
+#
+# 停用一种接口 = 假装它不存在：下游模型、该接口的分组、只有该接口的站都从管理页隐藏，
+# 转发入口直接拒绝。支持（描述符、分组、历史记录）都留着，随时可以再打开。
+# 存「停用了哪些」而不是「启用了哪些」：新加一种协议默认就是启用的，不用补迁移。
+
+_DISABLED_PROTOCOLS_KEY = "disabled_protocols"
+
+
+def disabled_protocols() -> frozenset[str]:
+    raw = get_setting(_DISABLED_PROTOCOLS_KEY, "")
+    if not raw:
+        return frozenset()
+    try:
+        values = json.loads(raw)
+    except ValueError:
+        return frozenset()
+    if not isinstance(values, list):
+        return frozenset()
+    return frozenset(str(v) for v in values if isinstance(v, str))
+
+
+def protocol_enabled(protocol: str) -> bool:
+    return protocol not in disabled_protocols()
+
+
+def set_protocol_enabled(protocol: str, enabled: bool) -> None:
+    current = set(disabled_protocols())
+    if enabled:
+        current.discard(protocol)
+    else:
+        current.add(protocol)
+    set_setting(_DISABLED_PROTOCOLS_KEY, json.dumps(sorted(current)))
 
 
 def clear_request_log() -> int:

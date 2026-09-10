@@ -383,6 +383,11 @@ body::after {
   border-top: 1px solid var(--hair);
 }
 
+/* 接口全局开关：停用一种接口 = 隐藏它的模型 / 分组 / 只有它的站，并拒绝转发 */
+.side-proto { display: flex; flex-direction: column; gap: 7px; }
+.side-proto .fo-item { justify-content: space-between; font-size: 11.5px; }
+.side-proto .fo-item.is-off { opacity: .55; }
+
 /* ============================================================ 主视区与视差推移 */
 .main {
   min-width: 0;

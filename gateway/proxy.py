@@ -399,6 +399,11 @@ async def forward(
     转发记录、不计入活跃流，否则它会把「累计转发」和模型热度冲得没法看。
     """
     endpoint = request.url.path
+    # 全局停用的接口在转发入口就拒绝：不解析请求体、不碰上游、不写记录，客户端拿到的
+    # 和「这个模型没配过」一样是 404。配置都还在，管理页打开开关即恢复。
+    if not db.protocol_enabled(proto.name):
+        log(f"POST {endpoint} -> 404 ({proto.name} 接口已全局停用)")
+        return _error(proto, 404, f"{proto.label} 接口已全局停用，请在管理页的接口开关里启用")
     body = await request.body()
     try:
         payload = json.loads(body)

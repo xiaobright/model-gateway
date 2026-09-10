@@ -5,6 +5,7 @@ import {
   PROTO_INFO,
   PROTO_LABEL,
   PROTO_PATH,
+  PROTO_SHORT,
   PROTOCOLS,
   setProtocolMetadata,
 } from '../web/util.js';
@@ -20,8 +21,8 @@ import {
 } from '../web/group-editor.js';
 
 const names = setProtocolMetadata([
-  { name: 'anthropic', label: 'Anthropic Messages', path: '/v1/messages', client: 'Claude Code', supports_1m: true },
-  { name: 'openai', label: 'OpenAI Responses', path: '/v1/responses', client: 'Codex', supports_1m: false },
+  { name: 'anthropic', label: 'Anthropic Messages', short: 'Anthropic', path: '/v1/messages', client: 'Claude Code', supports_1m: true },
+  { name: 'openai', label: 'OpenAI Responses', short: 'OpenAI', path: '/v1/responses', client: 'Codex', supports_1m: false },
   { name: 'test-third', label: 'Test Third', path: '/test/third', client: 'Test Client', supports_1m: false },
 ]);
 
@@ -29,6 +30,8 @@ assert.deepEqual(names, ['anthropic', 'openai', 'test-third']);
 assert.deepEqual(PROTOCOLS, names);
 assert.equal(PROTO_INFO['test-third'].label, 'Test Third');
 assert.equal(PROTO_LABEL['test-third'], 'Test Third');
+assert.equal(PROTO_SHORT['anthropic'], 'Anthropic');
+assert.equal(PROTO_SHORT['test-third'], 'Test Third', '没给 short 就退回完整标签');
 assert.equal(PROTO_PATH['test-third'], '/test/third');
 assert.equal(PROTO_CLIENT['test-third'], 'Test Client');
 

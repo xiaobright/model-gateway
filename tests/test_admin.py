@@ -344,6 +344,7 @@ def test_protocol_metadata_is_a_safe_display_projection(gateway):
             {
                 "name": "anthropic",
                 "label": "Anthropic Messages",
+                "short": "Anthropic",
                 "path": "/v1/messages",
                 "client": "Claude Code",
                 "supports_1m": True,
@@ -351,12 +352,84 @@ def test_protocol_metadata_is_a_safe_display_projection(gateway):
             {
                 "name": "openai",
                 "label": "OpenAI Responses",
+                "short": "OpenAI",
                 "path": "/v1/responses",
                 "client": "Codex",
                 "supports_1m": False,
             },
         ]
     }
+
+
+def test_disabling_a_protocol_hides_routes_groups_sites_and_blocks_calls(gateway):
+    with MockUpstream("claude-only") as a, MockUpstream("both") as b:
+        g_a = add_upstream(gateway, a, "claude-only", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+
+        g_b_an = add_upstream(gateway, b, "both", "anthropic")
+        g_b_oa = add_group(
+            gateway, provider_id(gateway, "both"), "openai", name="gpt", api_key="key-both"
+        )
+        add_route(gateway, "opus-b", g_b_an, "claude-opus-4-1")
+        add_route(gateway, "gpt-test", g_b_oa)
+
+        off = gateway.post(
+            "/admin/api/protocol-switches", json={"protocol": "anthropic", "enabled": False}
+        )
+        assert off.status_code == 200, off.text
+        assert off.json()["enabled"]["anthropic"] is False
+
+        assert {m["model_name"] for m in gateway.get("/admin/api/models").json()} == {"gpt-test"}
+
+        ups = {u["name"]: u for u in gateway.get("/admin/api/upstreams").json()}
+        assert "claude-only" not in ups, "只有被停用协议的站整个隐藏"
+        assert [g["protocol"] for g in ups["both"]["groups"]] == ["openai"]
+
+        assert {m["id"] for m in gateway.get("/v1/models").json()["data"]} == {"gpt-test"}
+        assert gateway.post("/v1/messages", json=msg("opus")).status_code == 404
+        assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
+
+        # 打开开关就原样回来：配置一直留着
+        gateway.post(
+            "/admin/api/protocol-switches", json={"protocol": "anthropic", "enabled": True}
+        )
+        assert {m["model_name"] for m in gateway.get("/admin/api/models").json()} == {
+            "opus", "opus-b", "gpt-test",
+        }
+        assert {u["name"] for u in gateway.get("/admin/api/upstreams").json()} == {
+            "claude-only", "both",
+        }
+        assert gateway.post("/v1/messages", json=msg("opus")).status_code == 200
+
+
+def test_disabled_protocol_is_hidden_from_stats_and_log(gateway):
+    from gateway import db
+
+    def logged(model: str, protocol: str) -> None:
+        db.insert_request(
+            client="test", model=model, upstream="siteA", status=200, stream=False,
+            req_bytes=10, resp_bytes=20, duration_ms=30, input_tokens=5, output_tokens=5,
+            cached_tokens=0, note="ok", protocol=protocol,
+        )
+
+    logged("claude-x", "anthropic")
+    logged("gpt-x", "openai")
+    assert gateway.get("/admin/api/stats").json()["requests"] == 2
+    assert {r["model"] for r in gateway.get("/admin/api/requests").json()} == {"claude-x", "gpt-x"}
+
+    gateway.post("/admin/api/protocol-switches", json={"protocol": "anthropic", "enabled": False})
+    assert gateway.get("/admin/api/stats").json()["requests"] == 1
+    assert [r["model"] for r in gateway.get("/admin/api/requests").json()] == ["gpt-x"]
+    overview = gateway.get("/admin/api/overview?window=24h").json()
+    assert overview["totals"]["requests"] == 1
+    assert {m["model"] for m in overview["models"]} == {"gpt-x"}
+
+
+def test_protocol_switch_rejects_unknown_protocol(gateway):
+    bad = gateway.post(
+        "/admin/api/protocol-switches", json={"protocol": "nope", "enabled": False}
+    )
+    assert bad.status_code == 400
 
 
 def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway, monkeypatch):

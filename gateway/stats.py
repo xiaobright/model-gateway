@@ -112,9 +112,14 @@ def _buckets(window: str) -> tuple[int, int, int]:
     return start, bucket, (now - start) // bucket + 1
 
 
-# 三个聚合都允许传入已取好的行，overview 里拉一次复用给三个，省两次全表读
+# 三个聚合都允许传入已取好的行，overview 里拉一次复用给三个，省两次全表读。
+# 全局停用的接口在这里就滤掉：它的历史记录也一起消失，管理页不会为死掉的站报健康度。
 def _all_rows() -> tuple[dict, ...]:
-    return db.recent_requests(db.LOG_KEEP_ROWS)
+    rows = db.recent_requests(db.LOG_KEEP_ROWS)
+    disabled = db.disabled_protocols()
+    if not disabled:
+        return rows
+    return tuple(row for row in rows if (row.get("protocol") or "") not in disabled)
 
 
 # ---------------------------------------------------------------- 时间线

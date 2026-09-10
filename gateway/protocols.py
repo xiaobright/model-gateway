@@ -199,6 +199,8 @@ class Protocol:
     label: str
     path: str
     client: str
+    # 管理页接口开关上用的一行短名（"Anthropic" / "OpenAI"）
+    short: str
     # SSE 的事件名和独立 data 行。不能把它们当普通字符串在正文里搜索。
     end_event_types: tuple[str, ...]
     end_data_markers: tuple[str, ...]
@@ -230,6 +232,7 @@ OPENAI = Protocol(
     label="OpenAI Responses",
     path="/v1/responses",
     client="Codex",
+    short="OpenAI",
     end_event_types=("response.completed",),
     end_data_markers=("[DONE]",),
     extract_usage=openai_usage,
@@ -247,6 +250,7 @@ ANTHROPIC = Protocol(
     label="Anthropic Messages",
     path="/v1/messages",
     client="Claude Code",
+    short="Anthropic",
     end_event_types=("message_stop",),
     # [DONE] 是给「OpenAI 转 Anthropic」那类中转站留的，它们有时会在末尾多发一行
     end_data_markers=("[DONE]",),
@@ -280,6 +284,7 @@ def public_metadata() -> list[dict[str, object]]:
         {
             "name": proto.name,
             "label": proto.label,
+            "short": proto.short or proto.label,
             "path": proto.path,
             "client": proto.client,
             "supports_1m": bool(proto.beta_header),
