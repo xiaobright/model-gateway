@@ -41,6 +41,43 @@ def test_remote_model_pull_and_manual_add_default_remote_name(gateway):
         ).status_code == 409
 
 
+def test_upstream_catalog_is_separate_from_downstream_exposure(gateway):
+    """登记上游模型只进目录，不自动暴露下游；删下游候选也不该把上游记录带走。"""
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA")
+
+        added = gateway.post(
+            f"/admin/api/groups/{g}/models", json={"model_names": ["deepseek", "deepseek-v3"]}
+        )
+        assert added.status_code == 200, added.text
+        assert added.json()["added"] == 2
+
+        def group_models() -> list[str]:
+            return gateway.get("/admin/api/upstreams").json()[0]["groups"][0]["models"]
+
+        assert group_models() == ["deepseek", "deepseek-v3"]
+        assert gateway.get("/admin/api/models").json() == [], "登记上游模型不产生下游候选"
+
+        rid = add_route(gateway, "luna", g, "deepseek")
+        assert group_models() == ["deepseek", "deepseek-v3"], "上游列显示真名，不显示下游名 luna"
+
+        assert gateway.delete(f"/admin/api/models?route_id={rid}").status_code == 200
+        assert group_models() == ["deepseek", "deepseek-v3"], "删下游候选不能删掉上游模型"
+
+        add_route(gateway, "luna", g, "deepseek")
+        dropped = gateway.delete(f"/admin/api/groups/{g}/models?remote_model=deepseek")
+        assert dropped.status_code == 200
+        assert dropped.json()["routes_removed"] == 1
+        assert group_models() == ["deepseek-v3"]
+        assert gateway.get("/admin/api/models").json() == [], "上游模型下掉后，指向它的候选一起下线"
+
+
+def test_catalog_delete_of_unknown_model_is_404(gateway):
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA")
+        assert gateway.delete(f"/admin/api/groups/{g}/models?remote_model=nope").status_code == 404
+
+
 def test_request_log_can_be_cleared(gateway):
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
@@ -361,9 +398,10 @@ def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway,
         )
 
 
-@pytest.mark.parametrize("version, missing", [(0, True), (3, True), (4, True), (0, False), (4, False)])
+@pytest.mark.parametrize("version, missing", [(0, True), (3, True), (4, True), (0, False), (5, False)])
 def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatch, version, missing):
-    """未打号、正常 v3、误打 v4 的老库都要补列；完整的新库不应迁移或备份。"""
+    """未打号、正常 v3、误打 v4 的老库都要补列；完整的新库不应迁移或备份。
+    完整基线是 v5 —— v4 即使 cache_creation 列齐全，也要补 group_models 目录迁移。"""
     import sqlite3
 
     from gateway import config, db

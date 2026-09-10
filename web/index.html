@@ -6,7 +6,6 @@
 <title>Model Gateway 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css?v=9">
-<link rel="stylesheet" href="/static/orbit.css?v=9">
 </head>
 <body>
 <div class="blob blob-1"></div>
@@ -29,9 +28,6 @@
       <span class="nav-marker" id="nav-marker" aria-hidden="true"></span>
       <button type="button" class="nav-item" data-view="overview" aria-current="page">
         <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">概览</span>
-      </button>
-      <button type="button" class="nav-item" data-view="orbit">
-        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">编排</span>
       </button>
       <button type="button" class="nav-item" data-view="live">
         <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">实时</span>
@@ -95,7 +91,6 @@
           </span>
           <span class="fo-box" id="failover-box"></span>
           <input type="search" class="search" id="route-filter" placeholder="筛选模型名…" aria-label="筛选模型名">
-          <button class="btn btn-ghost btn-sm" data-act="go-orbit" title="打开气泡编排画布">气泡编排</button>
           <button class="btn btn-sm" data-act="new-route">新增模型</button>
         </div>
         <p class="card-hint">点候选圆片即把该模型切到那一条（高亮的是当前生效的，也是自动降级的起点）。
@@ -125,40 +120,6 @@
           <div class="card-body" id="hot-list"></div>
         </section>
       </div>
-    </section>
-
-    <!-- ---------- 编排：所有模型共享一个连续、可滚动的液态工作区 ---------- -->
-    <section class="view liquid-view" data-view="orbit" hidden>
-      <div class="orbit-heading">
-        <div><div class="orbit-eyebrow">ROUTING STUDIO</div><div class="orbit-title"><h2>液态编排</h2><span id="orbit-count"></span></div></div>
-        <div class="orbit-heading-actions">
-          <button type="button" class="orbit-tool" data-orbit="motion" aria-pressed="true" aria-label="暂停液体动效">◌ <span>动效开启</span></button>
-          <button type="button" class="orbit-tool" data-act="go-overview">列表模式</button>
-          <button type="button" class="orbit-tool orbit-tool-primary" data-act="new-route">＋ 新建模型</button>
-        </div>
-      </div>
-      <div class="orbit-toolbar">
-        <div class="orbit-mode" role="group" aria-label="拖放操作">
-          <button type="button" data-orbit="mode" data-mode="copy" aria-pressed="true">复制融合</button>
-          <button type="button" data-orbit="mode" data-mode="move" aria-pressed="false">移动融合</button>
-        </div>
-        <label class="orbit-search"><span aria-hidden="true">⌕</span><input id="orbit-search" type="search" placeholder="寻找模型或上游" aria-label="寻找模型或上游"></label>
-        <div class="orbit-legend"><span><i></i>当前通路</span><span><i class="is-cool"></i>冷却</span><span><i class="is-off"></i>停用</span></div>
-      </div>
-      <section class="orbit-workbench" aria-label="液态路由工作区">
-        <div class="orbit-source-bar"><span class="orbit-source-label">上游源</span><div id="orbit-sources"></div></div>
-        <div class="orbit-canvas" id="orbit-canvas" tabindex="0" aria-label="可滚动的模型编排画布">
-          <div class="orbit-world" id="orbit-world">
-            <svg id="orbit-threads" class="orbit-threads" aria-hidden="true"></svg>
-            <canvas id="orbit-surface" aria-hidden="true"></canvas>
-            <div class="orbit-stage" id="orbit-stage"></div>
-            <button type="button" class="orbit-new-pool" id="orbit-new-pool" data-orbit="new-model"><span>＋</span><strong>汇成一个新模型</strong><small>把气泡拖到这里，拆分或复制为新模型</small></button>
-          </div>
-          <div class="orbit-empty" id="orbit-empty" hidden></div>
-        </div>
-        <aside class="orbit-inspector" id="orbit-inspector" aria-label="路由详情" hidden></aside>
-        <div class="orbit-footer"><span id="orbit-hint" role="status" aria-live="polite">小气泡跨模型融合，大气泡携带整组候选。按住 Alt 临时移动。</span><span class="orbit-footer-note">双击候选切换上游 · Esc 取消</span></div>
-      </section>
     </section>
 
     <!-- ---------- 实时 ---------- -->
@@ -201,7 +162,7 @@
         <div class="card-body scroll-x">
           <table class="tbl-upstreams">
             <thead><tr>
-              <th style="width:172px">供应商</th><th>Base URL（站根）</th><th style="width:20%">已录入模型</th>
+              <th style="width:172px">供应商</th><th>Base URL（站根）</th><th style="width:20%">上游模型</th>
               <th style="width:110px">实测格式</th>
               <th style="width:96px" class="num">成功率 / P95</th>
               <th style="width:54px">启用</th><th style="width:122px"></th>
@@ -346,11 +307,12 @@
       </div>
       <p class="card-hint" id="grp-proto-hint" hidden style="margin:12px 0 0"></p>
 
-      <!-- 模型列表是即时生效的：勾上=加候选，取消=删候选，和上面那些要保存的字段分开 -->
+      <!-- 上游模型目录是即时生效的：勾上=登记，取消=从目录去掉，和上面那些要保存的字段分开 -->
       <div id="grp-import" hidden>
-        <div class="dlg-section divider">这个分组里的模型 <span class="tag" id="grp-mcount"></span></div>
+        <div class="dlg-section divider">这个分组的上游模型 <span class="tag" id="grp-mcount"></span></div>
         <p class="dim" style="font-size:12px;margin:0 0 9px">
-          勾上 / 取消<b>立刻生效</b>，不用点保存。上面的组名、接口、Key 才要保存。</p>
+          勾上 / 取消<b>立刻生效</b>，不用点保存 —— 这里登记的是这个站能调到的上游模型，
+          要不要对下游暴露在「模型路由」里单独做。上面的组名、接口、Key 才要保存。</p>
         <div class="field-row">
           <button type="button" class="btn btn-ghost btn-sm" data-act="pull-models">拉取模型列表</button>
           <button type="button" class="btn btn-ghost btn-sm" data-act="pick-all">全选</button>

@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS upstream_groups(
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
   UNIQUE(upstream_id, protocol, name)
 );
+-- 上游模型目录：这个分组能看到、能调到的上游真名。它和「下游暴露」（model_routes）
+-- 是两件事 —— 拉一份模型列表只是登记这个站有什么，不代表要对外暴露；删掉一条下游映射
+-- 也不该把「这个站有这个模型」这件事忘掉。
+CREATE TABLE IF NOT EXISTS group_models(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL REFERENCES upstream_groups(id) ON DELETE CASCADE,
+  remote_model TEXT NOT NULL,
+  UNIQUE(group_id, remote_model)
+);
 CREATE TABLE IF NOT EXISTS model_routes({_ROUTE_COLUMNS});
 CREATE TABLE IF NOT EXISTS request_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +104,8 @@ LOG_KEEP_ROWS = 2000
 #   2 = 有分组，但接口标记还挂在供应商上，候选还是 (模型, 分组) 复合主键
 #   3 = 接口在分组上，候选有自增 id
 #   4 = request_log 记录 Anthropic 的缓存创建 token
-SCHEMA_VERSION = 4
+#   5 = 上游模型目录（group_models）与下游候选分开
+SCHEMA_VERSION = 5
 
 # 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
 BACKUP_KEEP = 3
@@ -313,6 +323,15 @@ def _migrate_route_ids(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE model_routes_pre_id")
 
 
+def _migrate_group_models(conn: sqlite3.Connection) -> None:
+    """把已有的下游候选回填成上游模型目录：每条候选的 (分组, 上游真名) 就是那个分组
+    已经登记过的一个上游模型。老库没有这一层，但「这个站有这个模型」这件事本来就藏在
+    候选里，回填之后目录是完整的，不会因为「还没暴露」而显示成空。"""
+    conn.execute("""
+        INSERT OR IGNORE INTO group_models(group_id, remote_model)
+        SELECT DISTINCT group_id, remote_model FROM model_routes""")
+
+
 _GROUPS_REBUILD = """
 CREATE TABLE upstream_groups_new(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -508,6 +527,8 @@ def _upgrade(path, stage: int) -> None:
         _normalize_base_urls(conn)
         _backfill_log_protocol(conn)
         _warn_mixed_models(conn)
+        # stage 4 -> 5：上游模型目录从现有候选回填；目录表由 init_db 的建表脚本先建好
+        _migrate_group_models(conn)
         # 重建过表之后再补一次：DROP COLUMN 之类可能把刚补上的列又弄丢，
         # 漏一个的代价是启动之后到处报 no such column。这个检查是幂等的
         _add_missing_columns(conn)
@@ -696,6 +717,74 @@ def delete_group(group_id: int) -> bool:
             _reattach_active(conn, row["model_name"])
         return True
 
+# ---------------------------------------------------------------- 上游模型目录
+
+
+def list_group_models(group_id: int) -> tuple[str, ...]:
+    """这个分组登记过的上游真名，按登记顺序。"""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT remote_model FROM group_models WHERE group_id=? ORDER BY id", (group_id,)
+        ).fetchall()
+    return tuple(r["remote_model"] for r in rows)
+
+
+def all_group_models() -> dict[int, tuple[str, ...]]:
+    """一次拿全：分组 id -> 上游真名列表。列表接口一次序列化整个上游树时用。"""
+    out: dict[int, list[str]] = {}
+    with _conn() as conn:
+        for row in conn.execute(
+            "SELECT group_id, remote_model FROM group_models ORDER BY group_id, id"
+        ):
+            out.setdefault(row["group_id"], []).append(row["remote_model"])
+    return {gid: tuple(names) for gid, names in out.items()}
+
+
+def add_group_models(group_id: int, remote_models: Iterable[str]) -> int:
+    """登记上游模型。重复的忽略，返回真正加上的条数。
+
+    只写目录，不碰下游候选 —— 拉一份模型列表是「记下这个站有什么」，
+    要不要对外暴露是另一件事。"""
+    added = 0
+    with _conn() as conn:
+        for raw in remote_models:
+            name = (raw or "").strip()
+            if not name:
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO group_models(group_id, remote_model) VALUES(?,?)",
+                (group_id, name),
+            )
+            added += cur.rowcount
+    return added
+
+
+def delete_group_model(group_id: int, remote_model: str) -> tuple[int, int]:
+    """从目录里去掉一个上游模型。指向它的下游映射会一起下线（它们已经无处可去），
+    返回 (删掉的目录条数, 连带删掉的候选条数)。"""
+    with _conn() as conn:
+        removed = conn.execute(
+            "DELETE FROM group_models WHERE group_id=? AND remote_model=?",
+            (group_id, remote_model),
+        ).rowcount
+        if not removed:
+            return 0, 0
+        affected = [
+            row["model_name"]
+            for row in conn.execute(
+                "SELECT DISTINCT model_name FROM model_routes WHERE group_id=? AND remote_model=?",
+                (group_id, remote_model),
+            )
+        ]
+        routes = conn.execute(
+            "DELETE FROM model_routes WHERE group_id=? AND remote_model=?",
+            (group_id, remote_model),
+        ).rowcount
+        for name in affected:
+            _reattach_active(conn, name)
+        return removed, routes
+
+
 # ---------------------------------------------------------------- 模型候选
 
 
@@ -792,6 +881,12 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
             "SELECT COALESCE(MAX(priority), -1) + 1 AS p FROM model_routes WHERE model_name=?",
             (model_name,),
         ).fetchone()["p"]
+        # 暴露一个下游模型时顺手把上游真名登记进目录：它必然是这个站的一个上游模型，
+        # 不登记的话上游站点那列会漏掉它
+        conn.execute(
+            "INSERT OR IGNORE INTO group_models(group_id, remote_model) VALUES(?,?)",
+            (group_id, remote_model),
+        )
         cur = conn.execute(
             "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
             " VALUES(?,?,?,?,?)",
@@ -868,6 +963,7 @@ def transfer_model_routes(
 def update_model_route(route_id: int, remote_model: str) -> bool:
     """只改「上游那边的真实模型名」。1M 开关也是它 —— 存成 `名字[1m]` 后缀。"""
     with _conn() as conn:
+        row = conn.execute("SELECT group_id FROM model_routes WHERE id=?", (route_id,)).fetchone()
         try:
             cur = conn.execute(
                 "UPDATE model_routes SET remote_model=? WHERE id=?", (remote_model, route_id)
@@ -875,6 +971,12 @@ def update_model_route(route_id: int, remote_model: str) -> bool:
         except sqlite3.IntegrityError as exc:
             # 改成了同分组里另一条候选已经用着的真名，那两条就完全一样了
             raise DuplicateRemote(remote_model) from exc
+        if row is not None and cur.rowcount:
+            # 改出来的新真名也是这个站的上游模型，登记一下；旧名保留在目录里
+            conn.execute(
+                "INSERT OR IGNORE INTO group_models(group_id, remote_model) VALUES(?,?)",
+                (row["group_id"], remote_model),
+            )
         return cur.rowcount > 0
 
 

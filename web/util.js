@@ -168,27 +168,6 @@ export async function run(el, fn) {
 
 export const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-/* 候选是挂在**分组**上的：同一个站的两把 key 能看到的模型不一样，所以「录入了哪些模型」
-   既有分组维度，也有供应商维度（它下面所有分组的并集）。 */
-export const modelsOfGroup = (gid) =>
-  state.routes.filter((r) => r.candidates.some((c) => c.group_id === gid)).map((r) => r.model_name);
-
-export const modelsOfUpstream = (uid) =>
-  state.routes.filter((r) => r.candidates.some((c) => c.upstream_id === uid)).map((r) => r.model_name);
-
-/** 这个分组已经用过的「上游真名」（去掉 [1m] 后缀）。拉不动的站至少还能从这里下拉选。 */
-export const remotesOfGroup = (gid) => {
-  const out = new Set();
-  for (const r of state.routes) {
-    for (const c of r.candidates) {
-      if (c.group_id !== gid) continue;
-      const bare = splitOneM(c.remote_model).bare;
-      if (bare) out.add(bare);
-    }
-  }
-  return [...out];
-};
-
 export const upstreamOfGroup = (gid) =>
   state.upstreams.find((u) => (u.groups || []).some((g) => g.id === gid)) || null;
 
@@ -196,6 +175,29 @@ export const groupOf = (gid) => {
   const up = upstreamOfGroup(gid);
   return up ? (up.groups.find((g) => g.id === gid) || null) : null;
 };
+
+/* 上游模型目录：这个分组登记过、能调到的上游真名（分组序列化时带出来的 `models`）。
+   它和「下游暴露」（state.routes）是两件事：拉一份模型列表只是登记这个站有什么，
+   删掉一条下游映射也不该把「这个站有这个模型」这件事一起忘掉。 */
+export const catalogOfGroup = (gid) => {
+  const grp = groupOf(gid);
+  return grp ? [...(grp.models || [])] : [];
+};
+
+export const catalogOfUpstream = (uid) => {
+  const up = state.upstreams.find((u) => u.id === uid);
+  if (!up) return [];
+  const seen = new Set();
+  for (const g of up.groups || []) for (const m of g.models || []) seen.add(m);
+  return [...seen];
+};
+
+/* 下游候选的条数。接口锁和删除确认问的是「暴露了几条」，不是「登记了几个」。 */
+export const routeCountOfGroup = (gid) =>
+  state.routes.reduce((n, r) => n + r.candidates.filter((c) => c.group_id === gid).length, 0);
+
+export const routeCountOfUpstream = (uid) =>
+  state.routes.reduce((n, r) => n + r.candidates.filter((c) => c.upstream_id === uid).length, 0);
 
 /** 「供应商 · 分组」。只有一个分组时省掉分组名，不然满屏都是「· 默认」 */
 export function groupLabel(gid) {

@@ -225,12 +225,23 @@ def model_top(limit: int = 8, rows: Iterable[dict] | None = None) -> list[dict[s
 # ---------------------------------------------------------------- 概览合批
 
 
+def _rows_in_window(window: str, rows: Iterable[dict]) -> tuple[dict, ...]:
+    """把记录裁到当前时间窗。时间线自己按桶过滤，但卡片 / 健康 / 热度也要用同一口径 ——
+    否则切到 1 小时，卡片还显示 7 天的累计值，三档看起来一模一样。"""
+    start, _bucket, _count = _buckets(window)
+    return tuple(
+        row for row in rows
+        if (epoch := _epoch(row["ts"] or "")) is not None and epoch >= start
+    )
+
+
 def overview(window: str = DEFAULT_WINDOW, top: int = 8) -> dict[str, Any]:
-    """概览视图一次拿全，省掉前端三次往返。"""
-    rows = _all_rows()
+    """概览视图一次拿全，省掉前端三次往返。所有聚合都只看当前时间窗。"""
+    all_rows = _all_rows()
+    rows = _rows_in_window(window, all_rows)
     stats = request_stats(rows)
     return {
-        "series": series(window, rows),
+        "series": series(window, all_rows),
         "upstreams": upstream_health(rows),
         "models": model_top(top, rows),
         "live": live(),

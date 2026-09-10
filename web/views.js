@@ -5,7 +5,7 @@
 
 import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft,
-  modelsOfGroup, modelsOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
+  catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -30,7 +30,7 @@ function kpiSkeleton() {
       <div class="kpi-spark" data-spark="live"></div>
     </div>
     <div class="kpi">
-      <div class="kpi-label">累计转发</div>
+      <div class="kpi-label">转发次数</div>
       <div class="kpi-value"><span data-num="req">0</span><span class="unit">次</span></div>
       <div class="kpi-note" data-note="req"></div>
       <div class="kpi-spark" data-spark="req"></div>
@@ -95,7 +95,7 @@ export function renderKpis() {
     + (t.saved ? ` · 救回 <b>${fmtInt(t.saved)}</b>` : ''));
 
   setNum('p95', (t.p95 || 0) / 1000, (v) => v.toFixed(1) + 's');
-  setNote('p95', '最近 2000 条请求的耗时分位');
+  setNote('p95', '所选时间窗内的耗时分位');
 
   const hit = Math.round((t.cache_hit_rate || 0) * 1000) / 10;
   setNum('hit', hit, (v) => v.toFixed(1));
@@ -612,7 +612,7 @@ function modelTags(names) {
 }
 
 function groupRow(u, g) {
-  const names = modelsOfGroup(g.id);
+  const names = catalogOfGroup(g.id);
   const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
     + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${PROTO_LABEL[g.protocol] || '?'}</span>`;
   return `<tr class="grp-row">
@@ -643,7 +643,7 @@ export function renderUpGroups() {
 
   const only = groups.length === 1 ? groups[0] : null;
   $('up-groups').innerHTML = groups.map((g) => {
-    const n = modelsOfGroup(g.id).length;
+    const n = catalogOfGroup(g.id).length;
     const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
       + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${PROTO_LABEL[g.protocol] || '?'}</span>`;
     return `<div class="ug-row">
@@ -717,7 +717,7 @@ export function renderUpstreams() {
         <div class="up-sub">${ifaceTags(u)}<span class="tag">${groups.length} 组</span></div>
       </td>
       <td class="mono dim truncate" title="${esc(u.base_url)}">${esc(u.base_url)}${egressTag(u)}</td>
-      <td>${modelTags(modelsOfUpstream(u.id))}</td>
+      <td>${modelTags(catalogOfUpstream(u.id))}</td>
       <td class="nowrap">${protoTags(h)}</td>
       <td class="num nowrap">${stat}</td>
       <td><input type="checkbox" class="switch" ${u.enabled ? 'checked' : ''}

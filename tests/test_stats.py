@@ -134,6 +134,41 @@ def test_token_ratio_is_learned_from_the_log(gateway):
     assert gateway.get("/admin/api/inflight").json()["tokens"]["anthropic"]["down"] == 0.0
 
 
+def test_overview_totals_health_and_models_respect_the_window(gateway):
+    """卡片 / 健康 / 热度都得跟时间线一个口径，否则切 1h 看到的还是全量累计值。"""
+    import time
+
+    from gateway import db
+
+    now = int(time.time())
+
+    def logged(age_s: int, model: str) -> None:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - age_s))
+        with db._conn() as conn:
+            conn.execute(
+                "INSERT INTO request_log(ts, client, model, upstream, status, stream,"
+                " req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens,"
+                " cached_tokens, note, protocol) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, "test", model, "siteA", 200, 0, 10, 20, 100, 10, 5, 0, "ok", "openai"),
+            )
+
+    logged(30, "recent")            # 1 小时窗内
+    logged(3 * 3600, "today")       # 24 小时窗内，不在 1 小时
+    logged(3 * 24 * 3600, "week")   # 7 天窗内，不在 24 小时
+
+    hour = gateway.get("/admin/api/overview?window=1h").json()
+    day = gateway.get("/admin/api/overview?window=24h").json()
+    week = gateway.get("/admin/api/overview?window=7d").json()
+
+    assert hour["totals"]["requests"] == 1
+    assert day["totals"]["requests"] == 2
+    assert week["totals"]["requests"] == 3
+    assert [m["model"] for m in hour["models"]] == ["recent"]
+    assert {m["model"] for m in week["models"]} == {"recent", "today", "week"}
+    assert hour["upstreams"][0]["n"] == 1
+    assert week["upstreams"][0]["n"] == 3
+
+
 def test_thinking_is_counted_apart_from_the_text(gateway):
     """思维链要单独认出来：发下来的是总结，计费按完整的算，所以「收到的」明显小于「计费的」。"""
     with MockUpstream("siteA") as a:

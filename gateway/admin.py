@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections import defaultdict
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -65,6 +65,12 @@ class RouteTransferIn(BaseModel):
 
 class BulkAddIn(BaseModel):
     group_id: int
+    model_names: tuple[str, ...] = Field(min_length=1)
+
+
+class GroupModelsIn(BaseModel):
+    """登记上游模型（只进目录，不产生下游候选）。"""
+
     model_names: tuple[str, ...] = Field(min_length=1)
 
 
@@ -156,7 +162,7 @@ def _validate_egress(raw: str) -> str:
     return egress
 
 
-def _serialize_group(g: db.Group) -> dict[str, Any]:
+def _serialize_group(g: db.Group, models: Iterable[str] = ()) -> dict[str, Any]:
     return {
         "id": g.id,
         "upstream_id": g.upstream_id,
@@ -164,12 +170,18 @@ def _serialize_group(g: db.Group) -> dict[str, Any]:
         "protocol": g.protocol,
         "api_key": g.api_key,
         "enabled": g.enabled,
+        # 上游模型目录：这个分组登记过、能调到的上游真名。和「下游暴露」是两回事，
+        # 前端用它画「已录入模型」和分组弹窗里的勾选列表。
+        "models": list(models),
     }
 
 
-def _serialize_upstream(u: db.Upstream, groups: list[db.Group]) -> dict[str, Any]:
+def _serialize_upstream(
+    u: db.Upstream, groups: list[db.Group], models_by_group: dict[int, tuple[str, ...]] | None = None
+) -> dict[str, Any]:
     """分组一起带出来：前端的可展开行和「供应商 → 分组」两级选择器都要用，省一次往返。
     supports 是分组接口的去重，前端拿它过滤「这个模型能选哪些供应商」。"""
+    models_by_group = models_by_group or {}
     return {
         "id": u.id,
         "name": u.name,
@@ -178,7 +190,7 @@ def _serialize_upstream(u: db.Upstream, groups: list[db.Group]) -> dict[str, Any
         "header_override": u.header_override,
         "egress": u.egress,
         "supports": [p for p in protocols.NAMES if any(g.protocol == p for g in groups)],
-        "groups": [_serialize_group(g) for g in groups],
+        "groups": [_serialize_group(g, models_by_group.get(g.id, ())) for g in groups],
     }
 
 
@@ -197,7 +209,11 @@ def _require_group(group_id: int) -> db.Group:
 
 
 def _one_upstream(upstream_id: int) -> dict[str, Any]:
-    return _serialize_upstream(_require_upstream(upstream_id), list(db.list_groups(upstream_id)))
+    return _serialize_upstream(
+        _require_upstream(upstream_id),
+        list(db.list_groups(upstream_id)),
+        db.all_group_models(),
+    )
 
 
 # ---------------------------------------------------------------- 供应商
@@ -208,7 +224,10 @@ def get_upstreams() -> list[dict[str, Any]]:
     by_upstream: dict[int, list[db.Group]] = defaultdict(list)
     for group in db.list_groups():
         by_upstream[group.upstream_id].append(group)
-    return [_serialize_upstream(u, by_upstream[u.id]) for u in db.list_upstreams()]
+    models_by_group = db.all_group_models()
+    return [
+        _serialize_upstream(u, by_upstream[u.id], models_by_group) for u in db.list_upstreams()
+    ]
 
 
 @router.get("/protocols")
@@ -463,6 +482,28 @@ async def get_remote_models(group_id: int) -> dict[str, Any]:
         # fetch_remote_models 自己抛的（非 200 / 不是 JSON / 没有 data 数组），消息里已经带了地址
         raise HTTPException(502, f"拉取失败: {exc}") from exc
     return {"models": list(models)}
+
+
+# 上游模型目录：登记 / 移除这个分组能调到的上游真名。它和下面的「模型路由」分开 ——
+# 拉一份模型列表只回答「这个站有什么」，要不要对下游暴露由模型路由决定。
+@router.post("/groups/{group_id}/models")
+def post_group_models(group_id: int, payload: GroupModelsIn) -> dict[str, Any]:
+    _require_group(group_id)
+    added = db.add_group_models(group_id, payload.model_names)
+    return {"added": added, "models": list(db.list_group_models(group_id))}
+
+
+@router.delete("/groups/{group_id}/models")
+def remove_group_model(
+    group_id: int, remote_model: str = Query(min_length=1, description="上游那边的真实模型名")
+) -> dict[str, Any]:
+    _require_group(group_id)
+    removed, routes = db.delete_group_model(group_id, remote_model)
+    if not removed:
+        raise HTTPException(404, f"这个分组的目录里没有「{remote_model}」")
+    if routes:
+        log(f"CATALOG remove {remote_model!r} from group {group_id}: {routes} downstream route(s) dropped")
+    return {"ok": True, "removed": removed, "routes_removed": routes}
 
 
 # ---------------------------------------------------------------- 模型路由

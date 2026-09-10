@@ -8,13 +8,13 @@
 
 import {
   $, state, api, toast, confirmBox, run, esc,
-  modelsOfGroup, modelsOfUpstream, groupLabel, upstreamOfGroup, groupOf, remotesOfGroup,
+  catalogOfGroup, catalogOfUpstream, routeCountOfGroup, routeCountOfUpstream,
+  groupLabel, upstreamOfGroup, groupOf,
   supportsIface, groupsOfIface, splitOneM, withOneM,
   PROTO_LABEL, PROTO_PATH, PROTO_CLIENT, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
-import { initOrbit, renderOrbit, renderOrbitActivity, leaveOrbit } from './orbit.js';
 import { createRefreshQueue } from './async-state.js';
 import {
   beginGroupEdit, currentGroupEdit, updateGroupEdit,
@@ -100,7 +100,6 @@ const configRefresh = createRefreshQueue(
     syncEgressPreset();
     views.renderRoutes();
     views.renderUpstreams();
-    renderOrbit();
     syncPickerChecks();
   },
 );
@@ -138,7 +137,6 @@ const overviewRefresh = createRefreshQueue(
     views.renderHot();
     views.renderRoutes();
     views.renderUpstreams();
-    renderOrbit();
   },
 );
 
@@ -172,7 +170,6 @@ const inflightRefresh = createRefreshQueue(
       state.stats = { ...(state.stats || {}), live: data.counts };
       views.renderLive();
       views.renderInflight(data);
-      renderOrbitActivity(data);
     }
   },
 );
@@ -186,11 +183,10 @@ function refreshInflight(options) {
 
 /* ---------------------------------------------------------------- 视图路由 */
 
-const VIEWS = ['overview', 'orbit', 'live', 'upstreams', 'log'];
+const VIEWS = ['overview', 'live', 'upstreams', 'log'];
 let currentView = '';
 
 function paintView(name) {
-  document.body.classList.toggle('is-orbit', name === 'orbit');
   for (const sec of document.querySelectorAll('.view')) {
     sec.hidden = sec.dataset.view !== name;
   }
@@ -201,8 +197,6 @@ function paintView(name) {
     else btn.removeAttribute('aria-current');
   }
   moveMarker($('nav-marker'), document.querySelector(`.nav-item[data-view="${name}"]`));
-  // 画布要等这一节真的显示出来才量得到尺寸，所以放在 unhide 之后
-  if (name === 'orbit') requestAnimationFrame(renderOrbit);
   requestAnimationFrame(() => {
     initSpotlightAndTilt();
     refreshLightTargets();   // 换视图后哪些卡片可见、在哪，都变了
@@ -214,13 +208,12 @@ function showView(name) {
   const cur = VIEWS.indexOf(currentView);
   if (next < 0 || next === cur) return;
   const dir = cur < 0 || next > cur ? 'down' : 'up';
-  if (currentView === 'orbit') leaveOrbit();
   currentView = name;
   state.view = name;
   withViewTransition(dir, () => paintView(name));
   history.replaceState(null, '', '#' + name);
   if (name === 'log') run(null, refreshLog);
-  if (name === 'live' || name === 'orbit') run(null, refreshInflight);
+  if (name === 'live') run(null, refreshInflight);
 }
 
 /* ---------------------------------------------------------------- 时间窗 */
@@ -586,13 +579,13 @@ function openGroup(upstreamId, gid) {
   fillIfaceSelect('grp-proto', g ? g.protocol
     : (have.length === 1 && missing ? missing : (state.iface || defaultProtocol())));
 
-  // 有候选就不给改接口了：候选是「这个模型在哪个接口下暴露」的唯一记录（后端也会拒）
-  const taken = g ? modelsOfGroup(g.id).length : 0;
+  // 有下游候选就不给改接口了：候选是「这个模型在哪个接口下暴露」的唯一记录（后端也会拒）
+  const taken = g ? routeCountOfGroup(g.id) : 0;
   $('grp-proto').disabled = taken > 0;
   $('grp-proto-hint').hidden = taken === 0;
   if (taken) {
-    $('grp-proto-hint').innerHTML = `这个分组下有 <b>${taken}</b> 个模型，接口锁住了 ——`
-      + ' 要换接口就给另一种接口新建一个分组，别把已录入的模型悄悄换成另一种线格式。';
+    $('grp-proto-hint').innerHTML = `这个分组下有 <b>${taken}</b> 条下游候选，接口锁住了 ——`
+      + ' 要换接口就给另一种接口新建一个分组，别把已暴露的模型悄悄换成另一种线格式。';
   }
 
   fillUpstreamSelect('grp-upstream', state.upstreams);
@@ -655,11 +648,11 @@ async function saveGroup() {
   return currentGroupEdit()?.groupId ?? null;
 }
 
-/* ---------------------------------------------------------------- 分组里的模型
+/* ---------------------------------------------------------------- 分组里的上游模型
 
-   这一段是「所见即所存」：勾选框的状态就是库里的候选，勾上/取消当场发请求，没有
-   「导入所选」也没有保存按钮。上面的组名 / 接口 / key 才是要保存的东西。
-   已录入的排在前面（勾着），后面是这次拉取到、还没录入的。 */
+   这一段管的是**上游模型目录**（这个分组能调到的上游真名），不是下游暴露。
+   勾选框的状态就是目录里的登记，勾上/取消当场发请求，没有「导入所选」也没有保存按钮。
+   要不要对外暴露在「模型路由」里单独做 —— 这里只回答「这个站有什么」。 */
 
 let pulled = [];   // 当前分组弹窗最近一次拉到的模型名；换分组就清空
 
@@ -673,16 +666,16 @@ function renderPicker() {
   const host = $('grp-picker');
   if (gid === null) { host.innerHTML = ''; return; }
 
-  const mine = modelsOfGroup(gid);
+  const mine = catalogOfGroup(gid);
   const owned = new Set(mine);
   const rest = pulled.filter((m) => !owned.has(m));
 
-  const head = `<div class="pick-sep">这个分组里的 ${mine.length} 个</div>`;
+  const head = `<div class="pick-sep">这个分组的上游模型 ${mine.length} 个</div>`;
   const body = mine.length
     ? mine.map((m) => pickRow(m, true)).join('')
     : '<div class="dim" style="padding:4px 6px;font-size:12px">还没有。点「拉取模型列表」，或者手动填一个。</div>';
   const tail = rest.length
-    ? `<div class="pick-sep">上游还有 ${rest.length} 个没录入</div>${rest.map((m) => pickRow(m, false)).join('')}`
+    ? `<div class="pick-sep">上游还有 ${rest.length} 个没登记</div>${rest.map((m) => pickRow(m, false)).join('')}`
     : '';
 
   host.innerHTML = head + body + tail;
@@ -694,7 +687,7 @@ function renderPicker() {
 function syncPickerChecks() {
   const gid = state.editingGroup;
   if (gid === null || !$('group-dialog').open) return;
-  const owned = new Set(modelsOfGroup(gid));
+  const owned = new Set(catalogOfGroup(gid));
   for (const box of $('grp-picker').querySelectorAll('input[data-act="pick-toggle"]')) {
     box.checked = owned.has(box.dataset.name);
     box.closest('label').classList.toggle('on', box.checked);
@@ -712,7 +705,7 @@ function applyPickerFilter() {
     for (const sep of host.querySelectorAll('.pick-sep')) sep.hidden = false;
     return;
   }
-  // 过滤到一个不剩的那节连小标题一起收起，别留个「上游还有 42 个没录入」的空壳
+  // 过滤到一个不剩的那节连小标题一起收起，别留个「上游还有 42 个没登记」的空壳
   let sep = null;
   let seen = 0;
   const settle = () => { if (sep) sep.hidden = seen === 0; };
@@ -727,61 +720,43 @@ const visibleRows = (checked) =>
   [...$('grp-picker').querySelectorAll('label:not([hidden]) input[data-act="pick-toggle"]')]
     .filter((b) => b.checked === checked).map((b) => b.dataset.name);
 
+/** 登记上游模型：只写目录，不产生下游候选。 */
 async function addModels(names, token = currentGroupEdit()) {
   if (!names.length) return;
   if (!token || !isCurrentGroupEdit(token) || token.groupId === null) return false;
-  const r = await api('POST', '/admin/api/models/bulk-add', {
-    group_id: token.groupId, model_names: names,
-  });
+  const r = await api('POST', `/admin/api/groups/${token.groupId}/models`, { model_names: names });
   if (!isCurrentGroupEdit(token)) return false;
-  const skipped = r.skipped || [];
-  // 撞上「已经在另一种接口下暴露」的名字只跳过它，剩下的照样进；但得说清是哪些
-  if (skipped.length) {
-    toast(
-      `加上了 ${r.added} 个，跳过 ${skipped.length} 个（${skipped.slice(0, 3).join('、')}`
-      + `${skipped.length > 3 ? ' 等' : ''}已经在另一种接口下暴露了）`,
-      'err',
-    );
-    return true;
-  }
-  toast(names.length === 1 ? `已加上 ${names[0]}` : `加上了 ${r.added} 个`, 'ok');
+  toast(names.length === 1 ? `已登记上游模型 ${names[0]}` : `登记了 ${r.added} 个上游模型`, 'ok');
   return true;
 }
 
-/** 取消勾选就是把这个模型在这个分组下的候选全去掉（可能有好几条真名）。
-    去掉之后它一个候选都不剩时先问一句 —— 那等于把模型下线了 */
+/** 取消勾选 = 从这个分组的目录里去掉这个上游模型。指向它的下游映射已经无处可去，
+    会一起下线 —— 先问一句说清楚。 */
 async function removeModel(name) {
   const token = currentGroupEdit();
   if (!token || !isCurrentGroupEdit(token) || token.groupId === null) return false;
   const gid = token.groupId;
-  const row = state.routes.find((r) => r.model_name === name);
-  const mine = row ? row.candidates.filter((c) => c.group_id === gid) : [];
-  const elsewhere = row ? row.candidates.length - mine.length : 0;
-  const many = mine.length > 1
-    ? `这个分组下挂了它 <b>${mine.length}</b> 条映射（${mine.map((c) => esc(c.remote_model)).join('、')}），会一起去掉。<br><br>`
-    : '';
-  if (row && elsewhere === 0) {
+  const refs = [];
+  for (const row of state.routes) {
+    if (row.candidates.some((c) => c.group_id === gid && c.remote_model === name)) {
+      refs.push(row.model_name);
+    }
+  }
+  if (refs.length) {
+    const many = refs.length > 5 ? `${refs.slice(0, 5).map(esc).join('、')} 等` : refs.map(esc).join('、');
     const okay = await confirmBox({
-      title: '这是它最后的候选',
-      body: many
-        + `<b>${esc(name)}</b> 只在这个分组里有候选，取消勾选等于把这个模型下线，`
-        + '下游再调它就是 404。<br><br>只是想换个站的话，先在「模型路由」里给它加一个别的候选。',
-      ok: '下线它',
-    });
-    if (!okay) return false;
-  } else if (mine.length > 1) {
-    const okay = await confirmBox({
-      title: '一起去掉这几条',
-      body: many + '它在别的分组还有候选，流量会自动落到那边。',
-      ok: '去掉',
-      danger: false,
+      title: '连同下游映射一起下线',
+      body: `上游模型 <b>${esc(name)}</b> 还有 <b>${refs.length}</b> 条下游映射（${many}），`
+        + '去掉它会把这些候选一起下线。<br><br>只是不想暴露、还想留在这个站的目录里的话，'
+        + '去「模型路由」里删掉对应候选即可。',
+      ok: '一起下线',
     });
     if (!okay) return false;
   }
   if (!isCurrentGroupEdit(token)) return false;
   await api(
     'DELETE',
-    `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${gid}`,
+    `/admin/api/groups/${gid}/models?remote_model=${encodeURIComponent(name)}`,
   );
   return isCurrentGroupEdit(token);
 }
@@ -857,7 +832,7 @@ function fillRemoteList(gid) {
   const hint = $('rt-remote-hint');
   if (!gid) { $('rt-remote-list').innerHTML = ''; hint.textContent = ''; return; }
   const pulledNames = remoteModels(gid);
-  const names = [...new Set([...(pulledNames || []), ...remotesOfGroup(gid)])];
+  const names = [...new Set([...(pulledNames || []), ...catalogOfGroup(gid)])];
   $('rt-remote-list').innerHTML = names.map((n) => `<option value="${esc(n)}"></option>`).join('');
 
   // 加候选时，同一个分组下已经挂着的那几条真名不能再重复（后端会 409），先说清楚
@@ -958,8 +933,6 @@ const ACTIONS = {
   },
 
   'go-live': () => showView('live'),
-  'go-orbit': () => showView('orbit'),
-  'go-overview': () => showView('overview'),
 
   'cancel-call': async ({ id }) => {
     const result = await api('POST', `/admin/api/inflight/${Number(id)}/cancel`);
@@ -999,7 +972,7 @@ const ACTIONS = {
   'del-upstream': async ({ uid }) => {
     const id = Number(uid);
     const u = state.upstreams.find((x) => x.id === id);
-    const n = modelsOfUpstream(id).length;
+    const n = routeCountOfUpstream(id);
     const groups = (u.groups || []).length;
     const okay = await confirmBox({
       title: '删除供应商',
@@ -1048,7 +1021,7 @@ const ACTIONS = {
     const id = Number(gid);
     const g = groupOf(id);
     const up = upstreamOfGroup(id);
-    const n = modelsOfGroup(id).length;
+    const n = routeCountOfGroup(id);
     const last = up && (up.groups || []).length === 1;
     const okay = await confirmBox({
       title: '删除分组',
@@ -1096,9 +1069,9 @@ const ACTIONS = {
         onSuccess: (models) => {
           pulled = models;
           renderPicker();
-          const mine = modelsOfGroup(gid);
+          const mine = catalogOfGroup(gid);
           const hit = pulled.filter((m) => mine.includes(m)).length;
-          $('grp-pull-status').textContent = `上游列出 ${pulled.length} 个，其中 ${hit} 个已录入`;
+          $('grp-pull-status').textContent = `上游列出 ${pulled.length} 个，其中 ${hit} 个已登记`;
         },
         onFailure: (error) => {
           $('grp-pull-status').textContent = '';
@@ -1112,7 +1085,7 @@ const ACTIONS = {
     );
   },
 
-  /* 勾选即生效：勾上=加候选，取消=删候选。失败就把勾回滚到库里的真相。 */
+  /* 勾选即生效：勾上=登记上游模型，取消=从目录里去掉。失败就把勾回滚到库里的真相。 */
   'pick-toggle': async ({ name }, el) => {
     const token = currentGroupEdit();
     if (!token || !isCurrentGroupEdit(token)) return;
@@ -1127,6 +1100,7 @@ const ACTIONS = {
       label.classList.remove('busy');
       if (isCurrentGroupEdit(token)) {
         await refreshConfig();      // 末尾的 syncPickerChecks 负责把勾选拉回真相
+        renderPicker();             // 勾掉的项要落到「没登记」那节（或消失），不能留在已登记里
       }
     }
   },
@@ -1154,17 +1128,19 @@ const ACTIONS = {
     const gid = token.groupId;
     const names = visibleRows(true);
     if (!names.length) return toast('本来就一个都没勾', 'ok');
-    // 在别的分组没有候选的模型会直接下线，这个后果得先说清楚
-    const orphan = names.filter((n) => {
-      const row = state.routes.find((r) => r.model_name === n);
-      return row && row.candidates.every((c) => c.group_id === gid);
-    });
+    // 指向这些上游模型的下游映射会一起下线，这个后果得先说清楚
+    const refs = new Set();
+    for (const row of state.routes) {
+      for (const c of row.candidates) {
+        if (c.group_id === gid && names.includes(c.remote_model)) refs.add(row.model_name);
+      }
+    }
     const okay = await confirmBox({
-      title: '清空这个分组的模型',
-      body: `要把 <b>${names.length}</b> 个模型从这个分组里去掉。`
-        + (orphan.length
-          ? `<br><br>其中 <b>${orphan.length}</b> 个只有这一个候选，去掉就等于下线，下游再调是 404。`
-          : '<br><br>它们在别的分组还有候选，流量会自动落到那边。'),
+      title: '清空这个分组的上游模型',
+      body: `要把 <b>${names.length}</b> 个上游模型从这个分组的目录里去掉。`
+        + (refs.size
+          ? `<br><br>其中 <b>${refs.size}</b> 条下游映射指向它们，会一起下线。`
+          : '<br><br>它们还没有被下游暴露，去掉只是不再登记。'),
       ok: '去掉',
     });
     if (!okay) return;
@@ -1174,7 +1150,7 @@ const ACTIONS = {
       for (const name of names) {
         await api(
           'DELETE',
-          `/admin/api/models?model_name=${encodeURIComponent(name)}&group_id=${gid}`,
+          `/admin/api/groups/${gid}/models?remote_model=${encodeURIComponent(name)}`,
         );
       }
     } finally {
@@ -1193,7 +1169,7 @@ const ACTIONS = {
     if (!token || !isCurrentGroupEdit(token)) return;
     const name = $('grp-manual').value.trim();
     if (!name) return toast('填个模型 id', 'err');
-    if (modelsOfGroup(token.groupId).includes(name)) return toast('这个分组已经有它了', 'err');
+    if (catalogOfGroup(token.groupId).includes(name)) return toast('这个分组已经有它了', 'err');
     if (!beginModelWrites(token, [name])) return toast('这项正在保存，请稍后再试', 'err');
     try {
       await addModels([name], token);
@@ -1453,7 +1429,7 @@ setInterval(() => {
    秒数不靠轮询走字：本地每 200ms 按「这条什么时候开始的」重算一遍，
    否则要么一秒跳一格，要么得把轮询压到 200ms 去。 */
 setInterval(() => {
-  if (ticking() && (state.view === 'live' || state.view === 'orbit')) {
+  if (ticking() && state.view === 'live') {
     run(null, () => refreshInflight({ allowIntermediate: true }));
   }
 }, 1000);
@@ -1485,13 +1461,6 @@ for (const b of $('seg-window').children) b.classList.toggle('is-on', b.dataset.
 state.iface = '';
 renderProtocolControls();
 for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
-
-/* 编排复用配置刷新队列和删除确认；写完之后 refreshConfig() 同时更新列表与画布。 */
-initOrbit({
-  editUpstream: (id) => openUpstream(id),
-  refreshConfig: () => refreshConfig(),
-  confirmRemove: confirmBox,
-});
 
 const initial = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
 currentView = '';
