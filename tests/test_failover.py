@@ -67,7 +67,7 @@ def test_failover_is_off_on_openai(gateway):
         a.fail_with(503)
 
         assert gateway.get("/admin/api/failover").json()["enabled"] == {
-            "anthropic": True, "openai": False,
+            "anthropic": True, "openai": False, "openai-chat": False,
         }
         resp = gateway.post("/v1/responses", json={"model": "gpt-test"})
         assert resp.status_code == 503, "没开降级就该把上游的 503 原样透传下去"

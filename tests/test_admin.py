@@ -324,10 +324,11 @@ def test_group_protocol_is_locked_once_it_has_candidates(gateway):
 
 
 def test_cloning_a_group_copies_the_key_to_the_other_interface(gateway):
-    """一把 key 两种接口都能用的站不少，而接口是分组的属性，手动再填一遍 key 很烦。"""
+    """一把 key 两种接口都能用的站不少，而接口是分组的属性，手动再填一遍 key 很烦。
+    有三种接口之后，「复制到另一种」必须点名目标。"""
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA", "openai")
-        clone = gateway.post(f"/admin/api/groups/{g_a}/clone")
+        clone = gateway.post(f"/admin/api/groups/{g_a}/clone", json={"protocol": "anthropic"})
         assert clone.status_code == 200, clone.text
         assert (clone.json()["protocol"], clone.json()["api_key"]) == ("anthropic", "key-siteA")
 
@@ -355,6 +356,14 @@ def test_protocol_metadata_is_a_safe_display_projection(gateway):
                 "short": "OpenAI",
                 "path": "/v1/responses",
                 "client": "Codex",
+                "supports_1m": False,
+            },
+            {
+                "name": "openai-chat",
+                "label": "OpenAI Chat Completions",
+                "short": "OpenAI Chat",
+                "path": "/v1/chat/completions",
+                "client": "OpenAI SDK",
                 "supports_1m": False,
             },
         ]

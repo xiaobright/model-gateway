@@ -2,16 +2,18 @@
 
 多公益站上游聚合网关：把多个上游站点统一成一个入口，每个模型可单独指定当前使用的上游，切换时进行中的流不中断，新请求立即路由到新上游。
 
-透传 OpenAI 和 Anthropic 两种格式，**不做格式转换** —— 下游打哪个路径，就原样转发到上游同名的路径：
+透传 OpenAI Responses、OpenAI Chat Completions 和 Anthropic Messages 三种格式，**不做格式转换** ——
+下游打哪个路径，就原样转发到上游同名的路径：
 
 | 下游路径 | 上游路径 | 谁在用 |
 | --- | --- | --- |
 | `/v1/responses` | `<站根>/v1/responses` | Codex（OpenAI Responses API） |
 | `/v1/responses/compact` | `<站根>/v1/responses/compact` | Responses 独立 compaction |
 | `/v1/alpha/search` | `<站根>/v1/alpha/search` | Codex custom provider standalone web search |
+| `/v1/chat/completions` | `<站根>/v1/chat/completions` | OpenAI SDK / 各种 Chat Completions 客户端 |
 | `/v1/messages` | `<站根>/v1/messages` | Claude Code（Anthropic Messages API） |
 | `/v1/messages/count_tokens` | `<站根>/v1/messages/count_tokens` | Claude Code 用它算上下文占用 |
-| `/v1/models` | — | 聚合清单，一份 JSON 同时满足两种形状 |
+| `/v1/models` | — | 聚合清单，一份 JSON 同时满足各家形状 |
 
 一条请求走哪种协议，由**它打进来的路径**决定，跟站点无关。站点那一侧的对应物是**分组**：
 那把 key 走哪种接口。
@@ -55,7 +57,7 @@ python -m venv .venv
 - **分组**（一把 key + 一种接口）：同一个站常常给你两把 key，各自能拉到的模型还不一样；
   而 Claude 那把和 GPT 那把往往也是两把不同的 key。所以**接口挂在分组上**，
   分组各自维护自己的 `api_key`、`protocol` 和模型列表。切换、停用都到分组一级
-- **接口**（`anthropic` / `openai`）：一条请求走哪种线格式。给某个 Anthropic 模型挑上游时，
+- **接口**（`anthropic` / `openai` / `openai-chat`）：一条请求走哪种线格式。给某个 Anthropic 模型挑上游时，
   只列有 Anthropic 分组的供应商
 
 模型属于哪个接口**不单独存**：它等于自己候选所在分组的接口。代价是同一个模型名的所有候选

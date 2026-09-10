@@ -400,7 +400,7 @@ function showAccess() {
 
   $('access-body').innerHTML = `
     <div class="dlg-section">Codex / OpenAI 兼容客户端</div>
-    ${copyRow('API 地址（填到 <code>/v1</code> 为止）', `${origin}/v1`)}
+    ${copyRow('API 地址（填到 <code>/v1</code> 为止；Responses 与 Chat Completions 都从这里走）', `${origin}/v1`)}
     <div class="dlg-section divider">Claude Code</div>
     ${copyRow('<b>ANTHROPIC_BASE_URL</b>：不要带 <code>/v1</code>，它自己会拼 <code>/v1/messages</code>', origin)}
     <div class="access-row">

@@ -221,6 +221,53 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             }
         )
 
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> object:
+        if (bad := sick_now()) is not None:
+            return bad
+        body = json.loads((await request.body()) or b"{}")
+        if (gone := unknown(body.get("model", ""))) is not None:
+            return gone
+        if body.get("fail"):
+            return JSONResponse({"error": {"message": "quota exhausted"}}, status_code=429)
+        if body.get("stream"):
+            mode = body.get("mode", "")
+
+            async def gen():
+                for _ in range(4):
+                    await asyncio.sleep(0.02)
+                    chunk = {"choices": [{"index": 0, "delta": {"content": "chunk"}}]}
+                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+                if mode == "thinking":
+                    think = {"choices": [{"index": 0, "delta": {"reasoning_content": "想了很久"}}]}
+                    yield f"data: {json.dumps(think)}\n\n".encode()
+                last = {
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150,
+                        "prompt_tokens_details": {"cached_tokens": 80},
+                    },
+                }
+                yield f"data: {json.dumps(last)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(gen(), media_type="text/event-stream")
+        return JSONResponse({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": body.get("model", ""),
+            "upstream": name,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150,
+                "prompt_tokens_details": {"cached_tokens": 80},
+            },
+        })
+
     @app.post("/v1/messages")
     async def messages(request: Request) -> object:
         if (bad := sick_now()) is not None:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from helpers import MockUpstream, add_upstream, add_group, provider_id, add_route, cands, route_id, msg
+from helpers import (
+    MockUpstream, add_upstream, add_group, provider_id, add_route, cands, route_id, msg,
+    wait_for_row,
+)
 
 
 def test_delete_active_candidate_reattaches_remaining(gateway):
@@ -182,6 +185,49 @@ def test_editing_a_candidate_into_a_duplicate_is_409(gateway):
         )
         assert clash.status_code == 409 and "claude-opus-4-1" in clash.json()["detail"]
         assert len(cands(gateway, "opus")) == 2, "冲突的改动不能落库"
+
+
+def test_chat_completions_is_a_third_protocol(gateway):
+    """Chat Completions 是第三种直通格式：路由、usage、模型绑定都按它自己的来。"""
+    with MockUpstream("siteA") as a:
+        g_chat = add_upstream(gateway, a, "siteA", "openai-chat")
+        add_route(gateway, "chat-model", g_chat, "gpt-test")
+
+        body = {"model": "chat-model", "messages": [{"role": "user", "content": "hi"}]}
+        resp = gateway.post("/v1/chat/completions", json=body)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["choices"][0]["message"]["content"] == "hi"
+
+        row = wait_for_row(gateway)
+        assert row["protocol"] == "openai-chat"
+        assert (row["input_tokens"], row["output_tokens"], row["cached_tokens"]) == (120, 30, 80)
+
+        # 模型清单里有它，但跨接口调用仍然 404
+        assert "chat-model" in {m["id"] for m in gateway.get("/v1/models").json()["data"]}
+        wrong = gateway.post("/v1/responses", json={"model": "chat-model"})
+        assert wrong.status_code == 404
+        assert "openai-chat" in wrong.json()["error"]["message"]
+
+        # 同名的候选不能挂到别的接口上
+        g_oa = add_group(gateway, provider_id(gateway, "siteA"), "openai", name="gpt", api_key="k")
+        dup = gateway.post("/admin/api/models", json={"model_name": "chat-model", "group_id": g_oa})
+        assert dup.status_code == 409
+
+
+def test_chat_completions_stream_uses_done_marker_and_usage(gateway):
+    with MockUpstream("siteA") as a:
+        g_chat = add_upstream(gateway, a, "siteA", "openai-chat")
+        add_route(gateway, "chat-model", g_chat, "gpt-test")
+
+        body = {"model": "chat-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+        resp = gateway.post("/v1/chat/completions", json=body)
+        assert resp.status_code == 200
+        assert "data: [DONE]" in resp.text
+
+        row = wait_for_row(gateway)
+        assert row["note"] == "ok", "[DONE] 要能被认成正常收尾"
+        assert (row["input_tokens"], row["output_tokens"]) == (120, 30)
+        assert row["stream"] == 1
 
 
 def test_unchecking_a_model_removes_every_mapping_in_that_group(gateway):

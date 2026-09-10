@@ -903,6 +903,12 @@ async def count_tokens_proxy(request: Request) -> StreamingResponse | JSONRespon
     return await forward(request, protocols.ANTHROPIC, "/messages/count_tokens", record=False)
 
 
+@router.post("/v1/chat/completions", response_model=None)
+@router.post("/chat/completions", response_model=None)
+async def chat_completions_proxy(request: Request) -> StreamingResponse | JSONResponse:
+    return await forward(request, protocols.CHAT, "/chat/completions")
+
+
 @router.get("/v1/models")
 @router.get("/models")
 async def models_list(request: Request) -> JSONResponse:

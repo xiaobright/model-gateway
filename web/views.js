@@ -295,6 +295,8 @@ const EMPTY_BY_IFACE = {
   anthropic: 'Anthropic 接口下还没有模型。先在「上游站点」给某个站加一个 Anthropic 分组'
     + '（填 Claude Code 那把 key），拉取模型列表导入，或者点右上角「新增模型」自己起名字。',
   openai: 'OpenAI 接口下还没有模型。去「上游站点」展开某个分组，用「拉取模型列表」导入。',
+  'openai-chat': 'Chat Completions 接口下还没有模型。去「上游站点」展开某个分组，'
+    + '用「拉取模型列表」导入，或者点右上角「新增模型」自己起名字。',
 };
 
 export function renderRoutes() {

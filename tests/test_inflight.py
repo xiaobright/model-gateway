@@ -38,7 +38,7 @@ def test_inflight_lists_the_running_request(gateway):
         assert call["client"] == "Codex CLI" and call["stream"] is True
         assert call["meta"] is False and call["trail"] == []
         assert seen["counts"] == {"requests": 1, "streams": 1}
-        assert seen["failover"] == {"anthropic": True, "openai": False}
+        assert seen["failover"] == {"anthropic": True, "openai": False, "openai-chat": False}
 
         # 流走完就转进「刚结束」，再留 90 秒 —— 不然降级轨迹只在活着的那几秒里存在
         after = wait_inflight(gateway, lambda d: not d["calls"])

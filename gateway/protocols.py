@@ -24,6 +24,9 @@ Usage = tuple[int | None, int | None, int | None, int | None]
 
 _IN = re.compile(rb'"input_tokens":\s*(\d+)')
 _OUT = re.compile(rb'"output_tokens":\s*(\d+)')
+# Chat Completions 用另一套字段名（prompt/completion），缓存数仍叫 cached_tokens
+_PROMPT = re.compile(rb'"prompt_tokens":\s*(\d+)')
+_COMPLETION = re.compile(rb'"completion_tokens":\s*(\d+)')
 _CACHED = re.compile(rb'"cached_tokens":\s*(\d+)')
 _CACHE_READ = re.compile(rb'"cache_read_input_tokens":\s*(\d+)')
 _CACHE_CREATE = re.compile(rb'"cache_creation_input_tokens":\s*(\d+)')
@@ -40,6 +43,10 @@ _ANTHROPIC_THINK = _string_field("thinking")
 # Responses API 的正文、推理摘要、工具参数都走 "delta":"…"（对象形式的 delta 不匹配）
 _OPENAI_TEXT = _string_field("delta")
 _OPENAI_THINK = re.compile(rb"reasoning_summary")
+# Chat Completions 的正文在 delta.content；思维链字段各站不统一（DeepSeek 用
+# reasoning_content，有的站叫 reasoning），两个都认
+_CHAT_TEXT = _string_field("content")
+_CHAT_THINK = re.compile(rb'"(?:reasoning_content|reasoning)":\s*"((?:[^"\\]|\\.)*)"')
 
 
 def _last(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
@@ -62,6 +69,15 @@ def openai_usage(head: bytes, tail: bytes) -> Usage:
     return _last(_IN, tail), _last(_OUT, tail), _last(_CACHED, tail), None
 
 
+def chat_usage(head: bytes, tail: bytes) -> Usage:
+    """Chat Completions 的 usage 在流最后一块（或非流式整个 JSON）里。
+
+    OpenAI 官方流式要请求带 `stream_options.include_usage` 才报 usage；兼容站大多默认
+    也报。网关不替客户端改请求体，没报就退回按字节估。
+    """
+    return _last(_PROMPT, head, tail), _last(_COMPLETION, head, tail), _last(_CACHED, head, tail), None
+
+
 def anthropic_usage(head: bytes, tail: bytes) -> Usage:
     """Messages API 的 usage 被拆在流的两头。
 
@@ -79,6 +95,11 @@ def anthropic_usage(head: bytes, tail: bytes) -> Usage:
 
 def openai_context(usage: Usage) -> int:
     """整个上下文有多少 token。Responses API 的 input_tokens 已经含了 cached_tokens。"""
+    return usage[0] or 0
+
+
+def chat_context(usage: Usage) -> int:
+    """Chat Completions 的 prompt_tokens 同样已经含了 cached_tokens（后者是它的明细）。"""
     return usage[0] or 0
 
 
@@ -106,6 +127,12 @@ def anthropic_content(chunk: bytes) -> tuple[int, bool]:
 def openai_content(chunk: bytes) -> tuple[int, bool]:
     """Responses API 同理。推理摘要也是「发来的是摘要、计费按完整的算」。"""
     return _total(_OPENAI_TEXT, chunk), bool(_OPENAI_THINK.search(chunk))
+
+
+def chat_content(chunk: bytes) -> tuple[int, bool]:
+    """Chat Completions 的正文是 delta.content；思维链单独算并打标。"""
+    think = _total(_CHAT_THINK, chunk)
+    return _total(_CHAT_TEXT, chunk) + think, think > 0
 
 
 def _text_size(value: object) -> int:
@@ -155,6 +182,26 @@ def openai_json_content(payload: dict) -> tuple[int, bool]:
                 )
         elif kind == "function_call":
             size += _text_size(item.get("arguments"))
+    return size, thinking
+
+
+def chat_json_content(payload: dict) -> tuple[int, bool]:
+    """非流式 Chat Completions：正文在 choices[].message.content，思维链在它的兄弟字段。"""
+    size, thinking = 0, False
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list):
+        return size, thinking
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        size += _text_size(message.get("content"))
+        think = message.get("reasoning_content") or message.get("reasoning")
+        if isinstance(think, str) and think:
+            thinking = True
+            size += _text_size(think)
     return size, thinking
 
 
@@ -267,9 +314,27 @@ ANTHROPIC = Protocol(
     ratio_fallback=(6.7, 3.0),
 )
 
+CHAT = Protocol(
+    name="openai-chat",
+    label="OpenAI Chat Completions",
+    path="/v1/chat/completions",
+    client="OpenAI SDK",
+    short="OpenAI Chat",
+    # 流式的结束标记是 data: [DONE]，没有独立的 event 名
+    end_event_types=(),
+    end_data_markers=("[DONE]",),
+    extract_usage=chat_usage,
+    context_tokens=chat_context,
+    count_content=chat_content,
+    count_json_content=chat_json_content,
+    error_body=openai_error,
+    auth_headers=openai_auth,
+    ratio_fallback=(4.9, 3.0),
+)
+
 # 协议名只在描述符这里登记。别处一律从 NAMES 派生，
 # 漏改一处就会「新协议在转发侧存在、在下拉里没有」这种半吊子状态
-ALL: dict[str, Protocol] = {p.name: p for p in (ANTHROPIC, OPENAI)}
+ALL: dict[str, Protocol] = {p.name: p for p in (ANTHROPIC, OPENAI, CHAT)}
 NAMES: tuple[str, ...] = tuple(ALL)
 
 
