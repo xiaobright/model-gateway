@@ -187,8 +187,28 @@ def _client_label(ua: str) -> str:
     return ua.split("/")[0].strip()[:24] or "unknown"
 
 
-def _maybe_capture_headers(request: Request) -> None:
-    """调试用：放一个 data/capture.flag，下一个请求的头会被 dump 出来（敏感头打码）。"""
+def _capability_summary(payload: dict) -> str:
+    """为排查工具/压缩兼容性记录脱敏摘要，不落请求参数或输入内容。"""
+    parts: list[str] = []
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        names = []
+        for item in tools[:16]:
+            if isinstance(item, dict):
+                names.append(str(item.get("type") or item.get("name") or "?"))
+            else:
+                names.append("?")
+        suffix = ",".join(names)
+        if len(tools) > 16:
+            suffix += ",..."
+        parts.append(f"tools={len(tools)}[{suffix}]")
+    if "context_management" in payload:
+        parts.append("context_management=present")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _maybe_capture_headers(request: Request, payload: dict, body_len: int) -> None:
+    """调试用：放一个 data/capture.flag，下一请求的头和形状会被脱敏记录。"""
     flag = config.DATA_DIR / "capture.flag"
     if not flag.exists():
         return
@@ -196,14 +216,145 @@ def _maybe_capture_headers(request: Request) -> None:
         k: ("<redacted>" if k.lower() in REDACT_ON_CAPTURE else v)
         for k, v in request.headers.items()
     }
+    input_types: dict[str, int] = {}
+    input_value = payload.get("input")
+    input_items = input_value if isinstance(input_value, list) else [input_value]
+    for item in input_items:
+        item_type = item.get("type", "?") if isinstance(item, dict) else type(item).__name__
+        input_types[str(item_type)] = input_types.get(str(item_type), 0) + 1
+    shape = {
+        "path": request.url.path,
+        "body_bytes": body_len,
+        "top_level_keys": sorted(str(key) for key in payload),
+        "input_item_types": input_types,
+        "tools_count": len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
+        "has_context_management": "context_management" in payload,
+        "content_encoding": request.headers.get("content-encoding", ""),
+        "codex_beta_features": request.headers.get("x-codex-beta-features", ""),
+    }
     try:
         (config.DATA_DIR / "captured_headers.json").write_text(
             json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        (config.DATA_DIR / "captured_request_shape.json").write_text(
+            json.dumps(shape, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
         flag.unlink()
-        log("captured real client headers to data/captured_headers.json")
+        log("captured real client headers and request shape to data/captured_*.json")
     except OSError:
         pass
+
+
+def _compaction_capture_requested(path: str) -> bool:
+    """Whether the one-shot compaction observation flag is armed."""
+    return path.endswith("/responses") or path.endswith("/responses/compact")
+
+
+def _has_compaction_trigger(payload: dict) -> bool:
+    input_items = payload.get("input")
+    if not isinstance(input_items, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "compaction_trigger"
+        for item in input_items
+    )
+
+
+def _probe_request_shape(payload: dict) -> dict[str, object]:
+    """Return only the request shape needed to diagnose client-side compaction."""
+    input_value = payload.get("input")
+    input_items = input_value if isinstance(input_value, list) else [input_value]
+    input_types: dict[str, int] = {}
+    for item in input_items:
+        item_type = item.get("type", "?") if isinstance(item, dict) else type(item).__name__
+        key = str(item_type)
+        input_types[key] = input_types.get(key, 0) + 1
+    return {
+        "top_level_keys": sorted(str(key) for key in payload),
+        "input_item_types": input_types,
+        "tools_count": len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
+        "has_context_management": "context_management" in payload,
+        "has_compaction_trigger": _has_compaction_trigger(payload),
+    }
+
+
+def _probe_response_types(value: object, counts: dict[str, int] | None = None) -> dict[str, int]:
+    """Count JSON ``type`` fields without retaining response content."""
+    result = counts if counts is not None else {}
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if isinstance(kind, str):
+            result[kind] = result.get(kind, 0) + 1
+        for child in value.values():
+            _probe_response_types(child, result)
+    elif isinstance(value, list):
+        for child in value:
+            _probe_response_types(child, result)
+    return result
+
+
+def _write_compaction_capture(
+    *,
+    request: Request,
+    payload: dict,
+    route: db.Route,
+    remote_model: str,
+    status: int,
+    stream: bool,
+    req_bytes: int,
+    resp_bytes: int,
+    elapsed: float,
+    observations: list[dict[str, object]],
+    response_event_types: dict[str, int] | None = None,
+    response_payload_types: dict[str, int] | None = None,
+) -> None:
+    """Write a count-only probe record, including negative evidence.
+
+    Keep the flag armed after an ordinary response so a later automatic
+    compaction can still be captured. A positive record is never overwritten by
+    subsequent ordinary turns.
+    """
+    flag = config.DATA_DIR / "compaction_capture.flag"
+    if not flag.exists():
+        return
+    capture_path = config.DATA_DIR / "compaction_capture.json"
+    if not observations and capture_path.exists():
+        try:
+            old = json.loads(capture_path.read_text(encoding="utf-8"))
+            if isinstance(old, dict) and old.get("found") is True:
+                return
+        except (OSError, ValueError, TypeError):
+            pass
+    capture = {
+        "captured_at_unix": time.time(),
+        "path": request.url.path,
+        "model": str(payload.get("model") or ""),
+        "remote_model": remote_model,
+        "upstream": route.upstream.name,
+        "group": route.group_name,
+        "status": status,
+        "stream": stream,
+        "request_bytes": req_bytes,
+        "response_bytes": resp_bytes,
+        "duration_ms": int(elapsed * 1000),
+        "found": bool(observations),
+        "x_codex_beta_features": request.headers.get("x-codex-beta-features", ""),
+        "request_shape": _probe_request_shape(payload),
+        "response_event_types": response_event_types or {},
+        "response_payload_types": response_payload_types or {},
+        "observations": observations,
+    }
+    try:
+        capture_path.write_text(
+            json.dumps(capture, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        if observations:
+            flag.unlink(missing_ok=True)
+            log(f"  compaction capture: {len(observations)} item event(s), encrypted lengths only; saved data/compaction_capture.json")
+        else:
+            log("  compaction probe: no compaction item in this response; flag remains armed")
+    except OSError as exc:
+        log(f"  compaction capture write failed: {exc.__class__.__name__}: {exc}")
 
 
 def _build_headers(
@@ -256,9 +407,29 @@ async def forward(
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return _error(proto, 400, "请求体不是合法 JSON")
 
+    compaction_capture = (
+        _compaction_capture_requested(endpoint)
+        and (config.DATA_DIR / "compaction_capture.flag").exists()
+    )
     requested = str(payload.get("model", ""))
     asked, flag = naming.split_model(requested)
-    chain = db.resolve_chain(asked, proto.name)
+    normal_chain = db.resolve_chain(asked, proto.name)
+    search_endpoint = path == "/alpha/search"
+    search_target = (
+        db.resolve_standalone_search_target(asked)
+        if search_endpoint and proto.name == protocols.OPENAI.name
+        else None
+    )
+    # Standalone Codex search does not run on the model's Responses provider.
+    # When a search-only group is configured, put it first even if that group
+    # has no ordinary route for this model.  It receives the requested model
+    # unchanged, allowing 上游 to select its own Alpha Search credential/alias.
+    # Avoid retrying the same group through its normal candidate later.
+    chain = (
+        (search_target,) + tuple(route for route in normal_chain if route.group_id != search_target.group_id)
+        if search_target is not None
+        else normal_chain
+    )
     if not chain:
         # 模型录在另一个接口下时说清楚：这种 404 光看「未配置」会以为是没导入
         elsewhere = db.protocol_of_model(asked)
@@ -275,8 +446,24 @@ async def forward(
     stream_flag = bool(payload.get("stream"))
     # 有副作用的 OpenAI 请求不降级：上游可能已经把它存下来了才失败，重试会留下两条
     stateful = payload.get("store") is not None or payload.get("previous_response_id") is not None
-    can_failover = failover.enabled(proto.name) and len(chain) > 1 and not stateful
-    candidates = failover.order_chain(chain) if can_failover else [chain[0]]
+    # Standalone Codex search is side-effect free. It may be unavailable on an
+    # otherwise healthy OpenAI-compatible upstream (404/405/501), so probe the
+    # next configured candidate for this endpoint even when normal OpenAI
+    # failover is disabled. Ordinary /responses keeps the existing policy.
+    can_search_failover = search_endpoint and len(chain) > 1 and not stateful
+    can_failover = (
+        (failover.enabled(proto.name) and len(chain) > 1 and not stateful)
+        or can_search_failover
+    )
+    if search_target is not None:
+        # The explicit target is an operator decision, not a normal model
+        # fallback candidate.  A prior Responses failure must not silently
+        # send a search to another provider before it has been attempted.
+        candidates = [search_target] + (
+            failover.order_chain(chain[1:]) if can_failover else []
+        )
+    else:
+        candidates = failover.order_chain(chain) if can_failover else [chain[0]]
 
     started = time.monotonic()
     resp: httpx.Response | None = None
@@ -329,7 +516,7 @@ async def forward(
                 {**payload, "model": remote}, ensure_ascii=False, separators=(",", ":")
             ).encode()
 
-        _maybe_capture_headers(request)
+        _maybe_capture_headers(request, payload, len(body))
         # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
@@ -420,11 +607,36 @@ async def forward(
             f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
             f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
             f"req={len(sent_body)}B ua={request.headers.get('user-agent', '')[:48]!r}"
+            f"{_capability_summary(payload)}"
             f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
         )
 
         site_bad = resp.status_code in failover.RETRY_STATUS
         model_bad = resp.status_code in failover.MODEL_STATUS
+        if search_endpoint and resp.status_code in {404, 405, 501}:
+            # These status codes mean this upstream has no standalone search
+            # route. Do not count it as a site outage or cool the group down;
+            # just try the next candidate, if one is configured.
+            nxt = advance()
+            if nxt >= 0:
+                log(
+                    f"  alpha/search unsupported ({resp.status_code}) at {label}，"
+                    "关闭响应后尝试下一个候选"
+                )
+                with contextlib.suppress(Exception):
+                    await resp.aclose()
+                elapsed = time.monotonic() - began
+                inflight.failed(call, status=resp.status_code, note="search_failed_over", ms=int(elapsed * 1000))
+                if record:
+                    _record(
+                        request=request, route=route, proto=proto, model=asked,
+                        remote_model=remote, status=resp.status_code, stream_flag=stream_flag,
+                        req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                        usage=NO_USAGE, note="search_failed_over", attempt=attempt,
+                    )
+                resp = None
+                index = nxt
+                continue
         if not site_bad and not model_bad:
             failover.note_ok(route.group_id)
             break
@@ -474,6 +686,9 @@ async def forward(
         sent = 0
         text_bytes = 0
         thinking = False
+        compaction_observations: list[dict[str, object]] = []
+        response_event_types: dict[str, int] = {}
+        response_payload_types: dict[str, int] = {}
         content_type = upstream_resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         observer = protocols.SSEObserver(proto) if content_type == "text/event-stream" else None
         json_body = bytearray()
@@ -508,6 +723,10 @@ async def forward(
                         observer.feed(chunk)
                         text_bytes = observer.text_bytes
                         thinking = observer.thinking
+                        if compaction_capture:
+                            compaction_observations = list(observer.compaction_items)
+                            response_event_types = dict(observer.event_types)
+                            response_payload_types = dict(observer.payload_types)
                     except Exception as exc:
                         log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
                 else:
@@ -541,12 +760,30 @@ async def forward(
         finally:
             if json_body:
                 try:
-                    payload = json.loads(json_body)
-                    if isinstance(payload, dict):
-                        text_bytes, thinking = proto.count_json_content(payload)
+                    json_payload = json.loads(json_body)
+                    if isinstance(json_payload, dict):
+                        text_bytes, thinking = proto.count_json_content(json_payload)
+                        if compaction_capture:
+                            compaction_observations = protocols.compaction_observations(json_payload)
+                            response_payload_types = _probe_response_types(json_payload)
                 except Exception as exc:
                     log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
+            if compaction_capture:
+                _write_compaction_capture(
+                    request=request,
+                    payload=payload,
+                    route=won,
+                    remote_model=won_remote,
+                    status=upstream_resp.status_code,
+                    stream=stream_flag,
+                    req_bytes=won_bytes,
+                    resp_bytes=sent,
+                    elapsed=time.monotonic() - started,
+                    observations=compaction_observations,
+                    response_event_types=response_event_types,
+                    response_payload_types=response_payload_types,
+                )
             # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
             usage = proto.extract_usage(bytes(head), bytes(tail))
             # 先落库（纯同步，即使外层在取消也能跑完），再还连接
@@ -628,6 +865,24 @@ def _record(
 @router.post("/responses", response_model=None)
 async def responses_proxy(request: Request) -> StreamingResponse | JSONResponse:
     return await forward(request, protocols.OPENAI, "/responses")
+
+
+@router.post("/v1/responses/compact", response_model=None)
+@router.post("/responses/compact", response_model=None)
+async def responses_compact_proxy(request: Request) -> StreamingResponse | JSONResponse:
+    """透传 Responses 的独立 compaction endpoint。
+
+    compaction item 是上游生成的 opaque/encrypted 状态，不能在网关里解析、裁剪或重建；
+    复用普通 Responses 转发路径可以保持模型改名、鉴权、流式观察和记录行为一致。
+    """
+    return await forward(request, protocols.OPENAI, "/responses/compact")
+
+
+@router.post("/v1/alpha/search", response_model=None)
+@router.post("/alpha/search", response_model=None)
+async def standalone_search_proxy(request: Request) -> StreamingResponse | JSONResponse:
+    """透传 Codex custom provider 的 standalone web search endpoint。"""
+    return await forward(request, protocols.OPENAI, "/alpha/search")
 
 
 @router.post("/v1/messages", response_model=None)

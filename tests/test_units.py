@@ -57,6 +57,46 @@ def test_sse_observer_keeps_an_incomplete_frame_for_the_next_chunk():
     assert observer.text_bytes == len("hello world")
 
 
+def test_compaction_probe_recognizes_nested_summary_and_cmp_encrypted_items():
+    from gateway.protocols import compaction_observations
+
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "object": "response.compaction",
+            "output": [
+                {"type": "compaction_summary", "id": "cmp_summary", "encrypted_content": "opaque"},
+                {"id": "cmp_adapter", "encrypted_content": "opaque-2"},
+            ],
+        },
+    }
+    got = compaction_observations(payload)
+    assert [item["item_id"] for item in got] == ["cmp_summary", "cmp_adapter"]
+    assert got[0]["encrypted_content_bytes"] == len("opaque")
+    assert all("encrypted_content" not in item for item in got)
+
+
+def test_sse_observer_records_event_and_payload_type_inventory():
+    from gateway.protocols import OPENAI, SSEObserver
+
+    observer = SSEObserver(OPENAI)
+    observer.feed(
+        b'event: response.output_item.done\ndata: {"type":"response.output_item.done",'
+        b'"item":{"type":"compaction","id":"cmp_1","encrypted_content":"x"}}\n\n'
+    )
+    assert observer.event_types == {"response.output_item.done": 1}
+    assert observer.payload_types == {"response.output_item.done": 1}
+    assert observer.compaction_items[0]["item_id"] == "cmp_1"
+
+
+def test_openai_json_content_accepts_codex_alpha_search_string_output():
+    from gateway.protocols import openai_json_content
+
+    size, thinking = openai_json_content({"output": "source-backed search text"})
+    assert size == len("source-backed search text")
+    assert not thinking
+
+
 def test_waiting_for_headers_can_be_cancelled_when_client_disconnects():
     from gateway.proxy import ClientDisconnected, _send_until_headers
 

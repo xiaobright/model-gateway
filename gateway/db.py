@@ -922,6 +922,81 @@ _CHAIN_QUERY = """
 """
 
 
+_STANDALONE_SEARCH_TARGET_KEY = "standalone_search_target_group_id"
+_STANDALONE_SEARCH_MODEL_KEY = "standalone_search_target_model"
+
+
+def _group_route(conn: sqlite3.Connection, group_id: int, model_name: str) -> Route | None:
+    """Build a direct OpenAI route for a configured standalone-search group.
+
+    Alpha Search is a separate Codex endpoint: its provider credential can be
+    capable of search even when it is not a Responses candidate for the model
+    currently selected in Codex.  Keep that decision explicit and use the
+    incoming model name unchanged, so 上游 can apply its own model aliases and
+    credential policy.
+    """
+    row = conn.execute(
+        """
+        SELECT u.*, g.id AS group_id, g.name AS group_name, g.api_key
+        FROM upstream_groups g
+        JOIN upstreams u ON u.id=g.upstream_id
+        WHERE g.id=? AND g.protocol='openai' AND g.enabled=1 AND u.enabled=1
+        """,
+        (group_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return Route(
+        model_name=model_name,
+        upstream=_to_upstream(row, api_key=row["api_key"]),
+        remote_model=model_name,
+        group_id=row["group_id"],
+        group_name=row["group_name"],
+    )
+
+
+def standalone_search_target_group_id() -> int | None:
+    """Return the configured search-only OpenAI group, if it is well formed."""
+    raw = get_setting(_STANDALONE_SEARCH_TARGET_KEY, "").strip()
+    try:
+        group_id = int(raw)
+    except ValueError:
+        return None
+    return group_id if group_id > 0 else None
+
+
+def set_standalone_search_target_group(group_id: int | None) -> None:
+    """Set or clear the explicit target used only by ``/alpha/search``."""
+    set_setting(_STANDALONE_SEARCH_TARGET_KEY, "" if group_id is None else str(group_id))
+
+
+def standalone_search_target_model() -> str:
+    """Return the optional model name sent to the search-only upstream."""
+    return get_setting(_STANDALONE_SEARCH_MODEL_KEY, "").strip()
+
+
+def set_standalone_search_target_model(model_name: str | None) -> None:
+    """Set or clear the model alias used only by standalone Alpha Search."""
+    set_setting(_STANDALONE_SEARCH_MODEL_KEY, (model_name or "").strip())
+
+
+def resolve_standalone_search_group(group_id: int, model_name: str) -> Route | None:
+    """Resolve one enabled OpenAI group for a standalone-search request."""
+    with _conn() as conn:
+        return _group_route(conn, group_id, model_name)
+
+
+def resolve_standalone_search_target(model_name: str) -> Route | None:
+    """Resolve the configured standalone-search group without needing a model route."""
+    group_id = standalone_search_target_group_id()
+    target_model = standalone_search_target_model() or model_name
+    return (
+        resolve_standalone_search_group(group_id, target_model)
+        if group_id is not None
+        else None
+    )
+
+
 def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
     """这个模型在这个接口下所有能用的候选，按「先打谁」排好。
 

@@ -57,6 +57,132 @@ def test_upstream_error_is_passed_through(gateway):
         assert resp.json()["error"]["message"] == "quota exhausted"
 
 
+def test_responses_tools_and_context_management_are_transparent(gateway):
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+
+        body = {
+            "model": "gpt-test",
+            "input": "search this",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto",
+            "include": ["web_search_call.action.sources"],
+            "context_management": [{"type": "compaction", "compact_threshold": 200000}],
+        }
+        seen = gateway.post("/v1/responses", json=body).json()
+
+        assert seen["seen_tools"] == body["tools"]
+        assert seen["seen_tool_choice"] == body["tool_choice"]
+        assert seen["seen_include"] == body["include"]
+        assert seen["seen_context_management"] == body["context_management"]
+
+
+def test_standalone_responses_compact_is_transparent(gateway):
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "gpt-test", g_a, "remote-gpt")
+
+        body = {
+            "model": "gpt-test",
+            "input": [{"role": "user", "content": "long task"}],
+            "tools": [{"type": "web_search"}],
+        }
+        resp = gateway.post("/v1/responses/compact", json=body)
+
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["output"][0]["type"] == "compaction"
+        assert result["output"][0]["encrypted_content"] == "opaque-test-state"
+        assert result["model"] == "remote-gpt"
+        assert result["seen_input"] == body["input"]
+        assert result["seen_tools"] == body["tools"]
+
+
+def test_standalone_web_search_is_transparent(gateway):
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "gpt-test", g_a, "remote-gpt")
+
+        body = {
+            "id": "search-1",
+            "model": "gpt-test",
+            "input": "find current docs",
+            "commands": {"search_query": [{"q": "OpenAI Responses API"}]},
+            "settings": {"external_web_access": "live"},
+        }
+        resp = gateway.post("/v1/alpha/search", json=body)
+
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["output"] == "Search result from siteA"
+        assert result["seen_commands"] == body["commands"]
+        assert result["seen_settings"] == body["settings"]
+
+
+def test_standalone_web_search_fails_over_on_unsupported_endpoint(gateway):
+    """Search-only fallback works even while normal OpenAI failover is off."""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA")
+        g_b = add_upstream(gateway, b, "siteB")
+        add_route(gateway, "gpt-test", g_a, "gpt-test")
+        add_route(gateway, "gpt-test", g_b, "gpt-test")
+        a.sick["search_unsupported"] = True
+
+        body = {
+            "model": "gpt-test",
+            "input": "find current docs",
+        }
+        # The first candidate returns 404. The fallback
+        # should be decided by endpoint support, not the global failover toggle.
+        first = gateway.post("/v1/alpha/search", json=body)
+        assert first.status_code == 200, first.text
+        assert first.json()["output"] == "Search result from siteB"
+
+        rows = gateway.get("/admin/api/requests").json()
+        assert any(r["upstream"] == "siteA" and r["note"] == "search_failed_over" for r in rows)
+        assert any(r["upstream"] == "siteB" and r["status"] == 200 for r in rows)
+
+
+def test_standalone_web_search_uses_configured_search_group(gateway):
+    """Search can use one 上游 group even when Responses is routed elsewhere."""
+    from gateway import db
+
+    with MockUpstream("model-site") as model_site, MockUpstream("search-site") as search_site:
+        models = add_upstream(gateway, model_site, "model-site")
+        search = add_upstream(gateway, search_site, "search-site")
+        add_route(gateway, "gpt-test", models, "remote-model")
+
+        db.set_standalone_search_target_group(search)
+        resp = gateway.post("/v1/alpha/search", json={"model": "gpt-test", "input": "fresh facts"})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["output"] == "Search result from search-site"
+        rows = gateway.get("/admin/api/requests").json()
+        assert rows[0]["upstream"] == "search-site"
+
+
+def test_standalone_search_target_api_validates_and_clears(gateway):
+    with MockUpstream("siteA") as site:
+        group = add_upstream(gateway, site, "siteA")
+
+        selected = gateway.put(
+            "/admin/api/standalone-search-target",
+            json={"group_id": group, "model": "gpt-5.6-luna"},
+        )
+        assert selected.status_code == 200, selected.text
+        assert selected.json() == {"group_id": group, "model": "gpt-5.6-luna"}
+        assert gateway.get("/admin/api/standalone-search-target").json() == {
+            "group_id": group, "model": "gpt-5.6-luna"
+        }
+
+        cleared = gateway.put(
+            "/admin/api/standalone-search-target", json={"group_id": None, "model": None}
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json() == {"group_id": None, "model": None}
+
+
 def test_hanging_error_body_does_not_block_failover(gateway):
     """拿到 503 头后，错误正文不应挡住备用站。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:

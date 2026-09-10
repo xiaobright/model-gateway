@@ -76,6 +76,14 @@ class FailoverIn(BaseModel):
     enabled: bool
 
 
+class StandaloneSearchTargetIn(BaseModel):
+    # None means restore the normal per-model candidate chain.
+    group_id: int | None = Field(default=None, gt=0)
+    # Optional model sent to the search-only upstream. This is useful when the
+    # search provider exposes only a subset of the models exposed downstream.
+    model: str | None = Field(default=None, min_length=1)
+
+
 class CloneIn(BaseModel):
     # 兼容当前只有两种接口时的无请求体调用；有多个目标时必须明确指定。
     protocol: str | None = None
@@ -318,6 +326,28 @@ async def probe_upstream(upstream_id: int) -> dict[str, Any]:
 @router.get("/egress-presets")
 def get_egress_presets() -> dict[str, Any]:
     return {"vps": db.get_setting("egress_vps", "") or None}
+
+
+@router.get("/standalone-search-target")
+def get_standalone_search_target() -> dict[str, int | str | None]:
+    """Read the OpenAI group reserved for Codex standalone Alpha Search."""
+    return {
+        "group_id": db.standalone_search_target_group_id(),
+        "model": db.standalone_search_target_model() or None,
+    }
+
+
+@router.put("/standalone-search-target")
+def put_standalone_search_target(payload: StandaloneSearchTargetIn) -> dict[str, int | str | None]:
+    """Set the search-only group/model, or clear them with null values."""
+    if payload.group_id is not None:
+        # Resolve against enabled OpenAI groups now, rather than accepting a
+        # typo that would silently make Search return to a normal model route.
+        if db.resolve_standalone_search_group(payload.group_id, "search-probe") is None:
+            raise HTTPException(400, "搜索专用分组不存在、已停用，或不是 OpenAI 接口")
+    db.set_standalone_search_target_group(payload.group_id)
+    db.set_standalone_search_target_model(payload.model)
+    return {"group_id": payload.group_id, "model": payload.model}
 
 
 # ---------------------------------------------------------------- 分组

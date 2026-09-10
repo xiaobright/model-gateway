@@ -7,6 +7,8 @@
 | 下游路径 | 上游路径 | 谁在用 |
 | --- | --- | --- |
 | `/v1/responses` | `<站根>/v1/responses` | Codex（OpenAI Responses API） |
+| `/v1/responses/compact` | `<站根>/v1/responses/compact` | Responses 独立 compaction |
+| `/v1/alpha/search` | `<站根>/v1/alpha/search` | Codex custom provider standalone web search |
 | `/v1/messages` | `<站根>/v1/messages` | Claude Code（Anthropic Messages API） |
 | `/v1/messages/count_tokens` | `<站根>/v1/messages/count_tokens` | Claude Code 用它算上下文占用 |
 | `/v1/models` | — | 聚合清单，一份 JSON 同时满足两种形状 |
@@ -196,6 +198,36 @@ curl http://127.0.0.1:8317/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-test", "input": "你好"}'
 ```
+
+Responses 的 server-side compaction 继续走 `/v1/responses`，请求体里的
+`context_management`、`tools` 和其它 Responses 字段由网关透传。需要显式压缩时可调用
+`/v1/responses/compact`；返回的 compaction item 是上游生成的 opaque 状态，客户端应原样带到
+下一次 Responses 请求，网关不会解析或裁剪它。上游必须真实支持对应能力，网关不会把普通模型变成
+支持 compaction 或 hosted web search 的模型。
+
+Codex custom provider 的 standalone web search 使用 `/v1/alpha/search`，网关透传路径、模型名和鉴权，
+请求体中的 `commands`、`settings` 以及上游返回的 `encrypted_output`、`results` 均保持透明。若当前模型链的
+首个上游对该独立 endpoint 明确返回 `404`、`405` 或 `501`，网关会仅为这条搜索请求尝试下一候选（不影响
+普通 `/v1/responses` 的降级开关，也不会把 Tavily 等不同协议的结果伪装成 Codex 搜索结果）。上游仍必须真实
+支持该 endpoint；`supports_standalone_web_search` 是上游侧的能力声明，不是本地网关开关。
+
+如果希望所有模型的 standalone search 统一借用一个具备搜索能力的 上游，可在管理接口指定一个
+OpenAI 分组：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8317/admin/api/standalone-search-target `
+  -Method Put -ContentType 'application/json' -Body '{"group_id": 7, "model": "gpt-5.6-luna"}'
+```
+
+上例中的 `7` 是当前数据里 `站B / 默认` 分组的 ID；实际部署应以
+`GET /admin/api/upstreams` 返回的分组 ID 为准。设置后，所有 `/v1/alpha/search` 请求先走该分组，
+请求中的模型名保持不变，由 上游 自己执行 Codex 凭据和模型别名选择；如果该分组返回 404/405/501，
+或搜索专用降级条件满足，才尝试原模型的其他候选。普通 `/v1/responses` 和 `/v1/responses/compact`
+不受影响。发送 `{"group_id": null}` 可恢复原来的按模型候选链路由。
+
+当搜索专用上游没有下游当前模型时，可额外设置 `model` 为该上游实际支持的模型（当前 站B
+使用 `gpt-5.6-luna` 或 `gpt-5.6-terra`）。这个改名只作用于 `/v1/alpha/search` 的上游请求，
+不会改变当前 Codex 对话模型。
 
 上游返回的非 200 状态码与错误体会原样透传（比如额度用尽的 429）。网关自己产生的错误
 （404 没配这个模型、502 连不上上游）按下游打的那个路径给对应形状：`/v1/responses` 给

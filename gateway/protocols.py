@@ -128,14 +128,31 @@ def anthropic_json_content(payload: dict) -> tuple[int, bool]:
 def openai_json_content(payload: dict) -> tuple[int, bool]:
     """Responses 的完整 JSON 用 output 数组，流式的 delta 正则在这里匹配不到。"""
     size, thinking = 0, False
-    for item in payload.get("output", []):
+    output = payload.get("output", [])
+    # Codex standalone alpha/search returns output text as a string, whereas
+    # Responses returns output items as an array. It shares the transport
+    # observer but is not a malformed Responses body.
+    if not isinstance(output, list):
+        return _text_size(output), thinking
+    for item in output:
+        if not isinstance(item, dict):
+            continue
         kind = item.get("type")
         if kind == "message":
-            for part in item.get("content", []):
+            content = item.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
                 size += _text_size(part.get("text")) + _text_size(part.get("refusal"))
         elif kind == "reasoning":
             thinking = True
-            size += sum(_text_size(part.get("text")) for part in item.get("summary", []))
+            summary = item.get("summary", [])
+            if isinstance(summary, list):
+                size += sum(
+                    _text_size(part.get("text")) for part in summary if isinstance(part, dict)
+                )
         elif kind == "function_call":
             size += _text_size(item.get("arguments"))
     return size, thinking
@@ -290,6 +307,13 @@ class SSEObserver:
         self.ended = False
         self.text_bytes = 0
         self.thinking = False
+        # Compaction is opaque state. Keep only event metadata and ciphertext
+        # length so diagnostics can prove its presence without persisting it.
+        self.compaction_items: list[dict[str, object]] = []
+        # Count-only inventory for capability probes. Some adapters use an
+        # event name not known to the protocol descriptor.
+        self.event_types: dict[str, int] = {}
+        self.payload_types: dict[str, int] = {}
 
     def feed(self, chunk: bytes) -> None:
         self._buffer.extend(chunk)
@@ -314,6 +338,8 @@ class SSEObserver:
 
         if not data and not event:
             return
+        if event:
+            self.event_types[event] = self.event_types.get(event, 0) + 1
         data_bytes = b"\n".join(data)
         try:
             got, think = self.proto.count_content(frame)
@@ -323,6 +349,18 @@ class SSEObserver:
             # 统计只是观察，坏 JSON / 奇怪编码不能让下游断流。
             pass
 
+        data_text = data_bytes.decode("utf-8", "ignore").strip()
+        payload: object = None
+        if data_text:
+            try:
+                payload = json.loads(data_text)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(payload, dict) and isinstance(payload.get("type"), str):
+            payload_type = payload["type"]
+            self.payload_types[payload_type] = self.payload_types.get(payload_type, 0) + 1
+        self.compaction_items.extend(compaction_observations(payload, event=event))
+
         if event in self.proto.end_event_types:
             self.ended = True
             return
@@ -330,13 +368,52 @@ class SSEObserver:
             # 有 event 头时以它为准；否则一个正文里的 type 字段可能把非结束事件
             # 错当成结束。没有 event 头的上游才使用 data JSON 的 type 兜底。
             return
-        data_text = data_bytes.decode("utf-8", "ignore").strip()
         if data_text in self.proto.end_data_markers:
             self.ended = True
             return
-        try:
-            payload = json.loads(data_text)
-        except (TypeError, ValueError):
-            return
         if isinstance(payload, dict) and payload.get("type") in self.proto.end_event_types:
             self.ended = True
+
+
+def compaction_observations(payload: object, *, event: str = "") -> list[dict[str, object]]:
+    """Return redacted metadata for every likely Responses compaction item.
+
+    Official Responses uses ``compaction``. ``compaction_summary`` and nested
+    ``cmp_*`` encrypted items are also accepted because compatible gateways
+    have emitted those shapes. Opaque values are never retained.
+    """
+    observations: list[dict[str, object]] = []
+    seen: set[tuple[str, str, int, str]] = set()
+    root_type = payload.get("type") if isinstance(payload, dict) else None
+
+    def walk(value: object, path: str) -> None:
+        if isinstance(value, dict):
+            kind = value.get("type")
+            item_id = value.get("id") if isinstance(value.get("id"), str) else ""
+            encrypted = value.get("encrypted_content")
+            is_compaction = (
+                isinstance(kind, str)
+                and kind in {"compaction", "compaction_summary", "response.compaction"}
+            ) or (item_id.startswith("cmp_") and isinstance(encrypted, str))
+            if is_compaction:
+                kind_text = str(kind or "compaction")
+                encrypted_len = len(encrypted.encode("utf-8")) if isinstance(encrypted, str) else 0
+                marker = (path, item_id, encrypted_len, kind_text)
+                if marker not in seen:
+                    seen.add(marker)
+                    observations.append({
+                        "event": event or str(root_type or "json"),
+                        "path": path,
+                        "item_type": kind_text,
+                        "item_id": item_id,
+                        "encrypted_content_bytes": encrypted_len,
+                        "has_encrypted_content": isinstance(encrypted, str),
+                    })
+            for key, child in value.items():
+                walk(child, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                walk(child, f"{path}[{index}]")
+
+    walk(payload, "$")
+    return observations

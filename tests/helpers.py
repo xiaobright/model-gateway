@@ -134,12 +134,31 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         return {"object": "list", "data": [{"id": i, "object": "model"} for i in ids]}
 
     @app.post("/v1/responses")
+    @app.post("/v1/responses/compact")
     async def responses(request: Request) -> object:
         if (bad := sick_now()) is not None:
             return bad
         body = json.loads((await request.body()) or b"{}")
         if (gone := unknown(body.get("model", ""))) is not None:
             return gone
+        if request.url.path.endswith("/responses/compact"):
+            return JSONResponse(
+                {
+                    "id": "cmp_1",
+                    "object": "response.compaction",
+                    "model": body.get("model", ""),
+                    "output": [
+                        {
+                            "type": "compaction",
+                            "id": "cmp_item_1",
+                            "encrypted_content": "opaque-test-state",
+                        }
+                    ],
+                    "seen_input": body.get("input"),
+                    "seen_tools": body.get("tools"),
+                    "seen_context_management": body.get("context_management"),
+                }
+            )
         if body.get("stream"):
             mode = body.get("mode", "")
 
@@ -162,21 +181,43 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             return StreamingResponse(gen(), media_type="text/event-stream")
         if body.get("fail"):
             return JSONResponse({"error": {"message": "quota exhausted"}}, status_code=429)
+        response = {
+            "id": "resp_1",
+            "upstream": name,
+            "output": [],
+            "ua": request.headers.get("user-agent", ""),
+            "x_probe": request.headers.get("x-probe", ""),
+            "auth": request.headers.get("authorization", ""),
+            "originator": request.headers.get("originator", ""),
+            "x_drop": request.headers.get("x-drop-me", ""),
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "input_token_details": {"cached_tokens": 80},
+            },
+        }
+        for field in ("tools", "tool_choice", "include", "context_management"):
+            if field in body:
+                response[f"seen_{field}"] = body[field]
+        return JSONResponse(response)
+
+    @app.post("/v1/alpha/search")
+    async def standalone_search(request: Request) -> object:
+        body = json.loads((await request.body()) or b"{}")
+        if (gone := unknown(body.get("model", ""))) is not None:
+            return gone
+        if sick.get("search_unsupported"):
+            return JSONResponse(
+                {"error": {"message": f"{name} has no alpha/search endpoint"}},
+                status_code=404,
+            )
         return JSONResponse(
             {
-                "id": "resp_1",
-                "upstream": name,
-                "output": [],
-                "ua": request.headers.get("user-agent", ""),
-                "x_probe": request.headers.get("x-probe", ""),
-                "auth": request.headers.get("authorization", ""),
-                "originator": request.headers.get("originator", ""),
-                "x_drop": request.headers.get("x-drop-me", ""),
-                "usage": {
-                    "input_tokens": 120,
-                    "output_tokens": 30,
-                    "input_token_details": {"cached_tokens": 80},
-                },
+                "output": f"Search result from {name}",
+                "encrypted_output": None,
+                "results": [{"type": "search_result", "title": "mock result"}],
+                "seen_commands": body.get("commands"),
+                "seen_settings": body.get("settings"),
             }
         )
 
