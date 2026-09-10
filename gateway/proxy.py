@@ -11,7 +11,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, db, failover, inflight, naming, protocols, upstream as upstream_mod
+from . import config, db, failover, inflight, naming, normalize, protocols, upstream as upstream_mod
 from .reqlog import log
 from .upstream import endpoint as upstream_endpoint
 
@@ -412,6 +412,14 @@ async def forward(
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return _error(proto, 400, "请求体不是合法 JSON")
 
+    # Codex 的 "responses-lite" 工具线格式（additional_tools item + namespace 容器）
+    # 是 OpenAI 私有扩展；DeepSeek 这类 Responses 兼容上游 HTTP 200 但不认工具，
+    # 模型会把调用按 DSML 标记吐在正文里（2026-09-10 官方 DeepSeek 直连实测）。
+    # 把默认容器的工具提升到顶层 tools，其余原样透传 —— 响应侧不受影响。
+    lite_hoisted = 0
+    if normalize.needs_normalization(payload):
+        payload, lite_hoisted = normalize.normalize_responses_request(payload)
+
     compaction_capture = (
         _compaction_capture_requested(endpoint)
         and (config.DATA_DIR / "compaction_capture.flag").exists()
@@ -515,8 +523,9 @@ async def forward(
         remote, remote_flag = naming.split_model(route.remote_model)
         want_1m = naming.wants_1m(flag) or naming.wants_1m(remote_flag)
         sent_body = body
-        if remote != requested:
-            # ensure_ascii=False：否则中文请求体会涨三到六倍
+        if lite_hoisted or remote != requested:
+            # ensure_ascii=False：否则中文请求体会涨三到六倍。
+            # 规范化过的请求体也没法保字节级透传了，只能重序列化
             sent_body = json.dumps(
                 {**payload, "model": remote}, ensure_ascii=False, separators=(",", ":")
             ).encode()
@@ -611,6 +620,7 @@ async def forward(
         log(
             f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
             f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
+            f"{'lite=+{} '.format(lite_hoisted) if lite_hoisted else ''}"
             f"req={len(sent_body)}B ua={request.headers.get('user-agent', '')[:48]!r}"
             f"{_capability_summary(payload)}"
             f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"

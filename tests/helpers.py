@@ -139,6 +139,7 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         if (bad := sick_now()) is not None:
             return bad
         body = json.loads((await request.body()) or b"{}")
+        sick["last_responses"] = body
         if (gone := unknown(body.get("model", ""))) is not None:
             return gone
         if request.url.path.endswith("/responses/compact"):
@@ -456,6 +457,10 @@ class MockUpstream:
     def heal(self) -> None:
         self.sick["status"] = None
         self.sick["missing"] = set()
+
+    def last_responses_request(self) -> dict:
+        """这个站最近一次收到的 Responses 请求体（透传规范化测试用）。"""
+        return self.sick.get("last_responses") or {}
 
     def __enter__(self) -> "MockUpstream":
         if IN_PROCESS_UPSTREAMS:
