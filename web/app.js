@@ -14,6 +14,7 @@ import {
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
+import { initOrbit, renderOrbit, renderOrbitActivity, leaveOrbit } from './orbit.js';
 import { createRefreshQueue } from './async-state.js';
 import {
   beginGroupEdit, currentGroupEdit, updateGroupEdit,
@@ -99,6 +100,7 @@ const configRefresh = createRefreshQueue(
     syncEgressPreset();
     views.renderRoutes();
     views.renderUpstreams();
+    renderOrbit();
     syncPickerChecks();
   },
 );
@@ -136,6 +138,7 @@ const overviewRefresh = createRefreshQueue(
     views.renderHot();
     views.renderRoutes();
     views.renderUpstreams();
+    renderOrbit();
   },
 );
 
@@ -169,6 +172,7 @@ const inflightRefresh = createRefreshQueue(
       state.stats = { ...(state.stats || {}), live: data.counts };
       views.renderLive();
       views.renderInflight(data);
+      renderOrbitActivity(data);
     }
   },
 );
@@ -182,10 +186,11 @@ function refreshInflight(options) {
 
 /* ---------------------------------------------------------------- 视图路由 */
 
-const VIEWS = ['overview', 'live', 'upstreams', 'log'];
+const VIEWS = ['overview', 'orbit', 'live', 'upstreams', 'log'];
 let currentView = '';
 
 function paintView(name) {
+  document.body.classList.toggle('is-orbit', name === 'orbit');
   for (const sec of document.querySelectorAll('.view')) {
     sec.hidden = sec.dataset.view !== name;
   }
@@ -196,6 +201,8 @@ function paintView(name) {
     else btn.removeAttribute('aria-current');
   }
   moveMarker($('nav-marker'), document.querySelector(`.nav-item[data-view="${name}"]`));
+  // 画布要等这一节真的显示出来才量得到尺寸，所以放在 unhide 之后
+  if (name === 'orbit') requestAnimationFrame(renderOrbit);
   requestAnimationFrame(() => {
     initSpotlightAndTilt();
     refreshLightTargets();   // 换视图后哪些卡片可见、在哪，都变了
@@ -207,12 +214,13 @@ function showView(name) {
   const cur = VIEWS.indexOf(currentView);
   if (next < 0 || next === cur) return;
   const dir = cur < 0 || next > cur ? 'down' : 'up';
+  if (currentView === 'orbit') leaveOrbit();
   currentView = name;
   state.view = name;
   withViewTransition(dir, () => paintView(name));
   history.replaceState(null, '', '#' + name);
   if (name === 'log') run(null, refreshLog);
-  if (name === 'live') run(null, refreshInflight);
+  if (name === 'live' || name === 'orbit') run(null, refreshInflight);
 }
 
 /* ---------------------------------------------------------------- 时间窗 */
@@ -950,6 +958,8 @@ const ACTIONS = {
   },
 
   'go-live': () => showView('live'),
+  'go-orbit': () => showView('orbit'),
+  'go-overview': () => showView('overview'),
 
   'cancel-call': async ({ id }) => {
     const result = await api('POST', `/admin/api/inflight/${Number(id)}/cancel`);
@@ -1443,7 +1453,7 @@ setInterval(() => {
    秒数不靠轮询走字：本地每 200ms 按「这条什么时候开始的」重算一遍，
    否则要么一秒跳一格，要么得把轮询压到 200ms 去。 */
 setInterval(() => {
-  if (ticking() && state.view === 'live') {
+  if (ticking() && (state.view === 'live' || state.view === 'orbit')) {
     run(null, () => refreshInflight({ allowIntermediate: true }));
   }
 }, 1000);
@@ -1475,6 +1485,13 @@ for (const b of $('seg-window').children) b.classList.toggle('is-on', b.dataset.
 state.iface = '';
 renderProtocolControls();
 for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
+
+/* 编排复用配置刷新队列和删除确认；写完之后 refreshConfig() 同时更新列表与画布。 */
+initOrbit({
+  editUpstream: (id) => openUpstream(id),
+  refreshConfig: () => refreshConfig(),
+  confirmRemove: confirmBox,
+});
 
 const initial = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
 currentView = '';
