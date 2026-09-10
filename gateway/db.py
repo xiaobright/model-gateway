@@ -119,6 +119,10 @@ class DuplicateRemote(Exception):
     """同一个分组下已经有一条映射到这个上游真名的候选了。args = (上游真名,)。"""
 
 
+class RouteTransferConflict(Exception):
+    """拖拽开始后来源候选发生变化，不能继续按旧快照移动。"""
+
+
 class ProtocolLocked(Exception):
     """分组下已经有候选了，不能再改它的接口。args = (候选数,)。"""
 
@@ -794,6 +798,71 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
             (model_name, group_id, remote_model, 1 if count == 0 else 0, nxt),
         )
     return int(cur.lastrowid)
+
+
+def transfer_model_routes(
+    source_model_name: str, target_model_name: str, route_ids: Iterable[int], mode: str = "copy"
+) -> dict:
+    """复制、移动或合并候选；目标写入和来源移除在同一个事务中完成。
+
+    分组、上游真名及 1M 后缀原样保留。已有目标的首选与顺序不变，重复映射合并；
+    新模型继承所选候选中的首选。来源名称也参与校验，拒绝迟到的拖拽快照。
+    """
+    ids = tuple(dict.fromkeys(route_ids))
+    source = source_model_name.strip()
+    target = target_model_name.strip()
+    if not source or not target or source == target or not ids or mode not in ("copy", "move"):
+        raise ValueError("请选择不同的来源和目标模型，并提供有效候选")
+    placeholders = ",".join("?" for _ in ids)
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            f"SELECT * FROM model_routes WHERE id IN ({placeholders}) ORDER BY priority, id", ids
+        ).fetchall()
+        if len(rows) != len(ids) or any(row["model_name"] != source for row in rows):
+            raise RouteTransferConflict("来源候选已经变化，请刷新后重试")
+        protocol = _group_protocol(conn, rows[0]["group_id"])
+        target_protocol = _model_protocol(conn, target)
+        if any(_group_protocol(conn, row["group_id"]) != protocol for row in rows):
+            raise RouteTransferConflict("来源候选的协议不一致")
+        if target_protocol and target_protocol != protocol:
+            raise ProtocolMismatch(target_protocol, protocol)
+        preferred = next((row["id"] for row in rows if row["is_active"]), rows[0]["id"])
+        next_priority = conn.execute(
+            "SELECT COALESCE(MAX(priority), -1) + 1 AS p FROM model_routes WHERE model_name=?",
+            (target,),
+        ).fetchone()["p"]
+        result_ids = []
+        added = 0
+        for row in rows:
+            existing = conn.execute(
+                "SELECT id FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
+                (target, row["group_id"], row["remote_model"]),
+            ).fetchone()
+            if existing:
+                result_ids.append(existing["id"])
+                continue
+            cur = conn.execute(
+                "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
+                " VALUES(?,?,?,?,?)",
+                (target, row["group_id"], row["remote_model"],
+                 int(not target_protocol and row["id"] == preferred), next_priority),
+            )
+            result_ids.append(int(cur.lastrowid))
+            next_priority += 1
+            added += 1
+        if mode == "move":
+            conn.execute(f"DELETE FROM model_routes WHERE id IN ({placeholders})", ids)
+            _reattach_active(conn, source)
+        _reattach_active(conn, target)
+        source_empty = conn.execute(
+            "SELECT 1 FROM model_routes WHERE model_name=? LIMIT 1", (source,)
+        ).fetchone() is None
+        return {
+            "model_name": target, "protocol": protocol, "route_ids": result_ids,
+            "added": added, "merged": len(rows) - added,
+            "moved": len(rows) if mode == "move" else 0, "source_empty": source_empty,
+        }
 
 
 def update_model_route(route_id: int, remote_model: str) -> bool:

@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections import defaultdict
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -54,6 +54,13 @@ class ModelRouteIn(BaseModel):
 class RouteEditIn(BaseModel):
     route_id: int
     remote_model: str = ""
+
+
+class RouteTransferIn(BaseModel):
+    source_model_name: str = Field(min_length=1)
+    target_model_name: str = Field(min_length=1)
+    route_ids: tuple[int, ...] = Field(min_length=1)
+    mode: Literal["copy", "move"] = "copy"
 
 
 class BulkAddIn(BaseModel):
@@ -548,6 +555,25 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
         "remote_model": remote_model,
         "protocol": group.protocol,
     }
+
+
+@router.post("/models/transfer")
+def transfer_model_routes(payload: RouteTransferIn) -> dict[str, Any]:
+    try:
+        result = db.transfer_model_routes(
+            payload.source_model_name, payload.target_model_name, payload.route_ids, payload.mode
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except db.RouteTransferConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except db.ProtocolMismatch as exc:
+        raise _mismatch(payload.target_model_name, exc) from exc
+    log(
+        f"TRANSFER mode={payload.mode} from={payload.source_model_name!r}"
+        f" to={result['model_name']!r} added={result['added']} merged={result['merged']}"
+    )
+    return result
 
 
 @router.put("/models")
