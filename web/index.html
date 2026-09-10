@@ -92,6 +92,9 @@
           </span>
           <span class="fo-box" id="failover-box"></span>
           <input type="search" class="search" id="route-filter" placeholder="筛选模型名…" aria-label="筛选模型名">
+          <button class="btn btn-ghost btn-sm" data-act="open-search"
+                  title="Codex 联网搜索（Alpha Search）专用的上游分组">搜索上游</button>
+          <span class="tag tag-accent" id="search-target-tag" hidden></span>
           <button class="btn btn-sm" data-act="new-route">新增模型</button>
         </div>
         <p class="card-hint">点候选圆片即把该模型切到那一条（高亮的是当前生效的，也是自动降级的起点）。
@@ -379,6 +382,36 @@
     <div class="dlg-foot">
       <span class="grow"></span>
       <button type="submit" class="btn" id="rt-save">添加</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ============ 搜索上游：Codex Alpha Search 专用的 OpenAI 分组 ============ -->
+<dialog id="search-dialog" class="sm">
+  <form id="search-form">
+    <div class="dlg-head">
+      <h2>搜索上游</h2><span class="grow"></span>
+      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+    </div>
+    <div class="dlg-body">
+      <p class="card-hint" style="margin:0 0 12px">
+        Codex 的联网搜索（<code>/v1/alpha/search</code>）默认跟着模型的候选链走。这里可以单独
+        指定一个 <b>OpenAI</b> 分组专门做搜索 —— 有些站搜索能用但普通模型不通，或者只有某个
+        分组带搜索权限。只影响搜索，不影响普通对话。</p>
+      <label class="field">供应商
+        <select id="sr-upstream"></select>
+      </label>
+      <label class="field" style="margin-top:11px">分组
+        <select id="sr-group"></select>
+      </label>
+      <label class="field" style="margin-top:11px">模型（可选）
+        <input type="text" id="sr-model" placeholder="留空 = 用请求里的模型名" autocomplete="off">
+      </label>
+      <p class="dim" id="sr-hint" style="font-size:12px;margin:10px 0 0"></p>
+    </div>
+    <div class="dlg-foot">
+      <span class="grow"></span>
+      <button type="submit" class="btn" id="sr-save">保存</button>
     </div>
   </form>
 </dialog>

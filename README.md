@@ -222,23 +222,19 @@ Codex custom provider 的 standalone web search 使用 `/v1/alpha/search`，网�
 普通 `/v1/responses` 的降级开关，也不会把 Tavily 等不同协议的结果伪装成 Codex 搜索结果）。上游仍必须真实
 支持该 endpoint；`supports_standalone_web_search` 是上游侧的能力声明，不是本地网关开关。
 
-如果希望所有模型的 standalone search 统一借用一个具备搜索能力的 上游，可在管理接口指定一个
-OpenAI 分组：
+如果希望所有模型的 standalone search 统一借用一个具备搜索能力的 上游，在「模型路由」卡片
+右上角点「搜索上游」，选一个 OpenAI 分组，可再填一个该上游实际支持的上游模型名。设置后，所有
+`/v1/alpha/search` 请求先走该分组，请求中的模型名保持不变（或换成你填的那个），由 上游 自己执行
+Codex 凭据和模型别名选择；如果该分组返回 404/405/501，才尝试原模型的其他候选。普通
+`/v1/responses` 和 `/v1/responses/compact` 不受影响。已设置时卡片上会挂一个当前目标的标签；
+选「跟随模型的候选链（默认）」即可恢复。
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8317/admin/api/standalone-search-target `
-  -Method Put -ContentType 'application/json' -Body '{"group_id": 7, "model": "gpt-5.6-luna"}'
-```
-
-上例中的 `7` 是当前数据里 `站B / 默认` 分组的 ID；实际部署应以
-`GET /admin/api/upstreams` 返回的分组 ID 为准。设置后，所有 `/v1/alpha/search` 请求先走该分组，
-请求中的模型名保持不变，由 上游 自己执行 Codex 凭据和模型别名选择；如果该分组返回 404/405/501，
-或搜索专用降级条件满足，才尝试原模型的其他候选。普通 `/v1/responses` 和 `/v1/responses/compact`
-不受影响。发送 `{"group_id": null}` 可恢复原来的按模型候选链路由。
-
-当搜索专用上游没有下游当前模型时，可额外设置 `model` 为该上游实际支持的模型（当前 站B
-使用 `gpt-5.6-luna` 或 `gpt-5.6-terra`）。这个改名只作用于 `/v1/alpha/search` 的上游请求，
-不会改变当前 Codex 对话模型。
+对应的管理接口是 `PUT /admin/api/standalone-search-target`
+（`{"group_id": 7, "model": "gpt-5.6-luna"}`，`group_id` 传 `null` 清除），当前值由
+`GET /admin/api/standalone-search-target` 返回。上例中的 `7` 是当前数据里 `站B / 默认`
+分组的 ID，实际部署应以 `GET /admin/api/upstreams` 返回的分组 ID 为准。`model` 可留空 =
+用请求里的模型名；当前 站B 用 `gpt-5.6-luna` 或 `gpt-5.6-terra`，这个改名只作用于
+`/v1/alpha/search` 的上游请求，不会改变当前 Codex 对话模型。
 
 上游返回的非 200 状态码与错误体会原样透传（比如额度用尽的 429）。网关自己产生的错误
 （404 没配这个模型、502 连不上上游）按下游打的那个路径给对应形状：`/v1/responses` 给

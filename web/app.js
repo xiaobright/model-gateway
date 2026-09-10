@@ -112,17 +112,19 @@ let liveAppliedSeq = 0;
 const configRefresh = createRefreshQueue(
   async () => {
     const presets = await api('GET', '/admin/api/egress-presets').catch(() => null);
-    const [upstreams, routes, failover] = await Promise.all([
+    const [upstreams, routes, failover, searchTarget] = await Promise.all([
       api('GET', '/admin/api/upstreams'),
       api('GET', '/admin/api/models'),
       api('GET', '/admin/api/failover'),
+      api('GET', '/admin/api/standalone-search-target').catch(() => null),
     ]);
-    return { presets, upstreams, routes, failover };
+    return { presets, upstreams, routes, failover, searchTarget };
   },
   (data, args) => {
     state.egressVps = data.presets ? data.presets.vps : null;
     state.upstreams = data.upstreams;
     state.routes = data.routes;
+    state.searchTarget = data.searchTarget;
     if (args.seq >= failoverAppliedSeq) {
       failoverAppliedSeq = args.seq;
       state.failover = data.failover;
@@ -130,6 +132,7 @@ const configRefresh = createRefreshQueue(
     syncEgressPreset();
     views.renderRoutes();
     views.renderUpstreams();
+    renderSearchTarget();
     syncPickerChecks();
   },
 );
@@ -939,6 +942,79 @@ function candLabel(model, cand) {
   return bare && bare !== model ? `${base} · ${bare}` : base;
 }
 
+/* ---------------------------------------------------------------- 搜索上游 */
+
+/* Codex 的 Alpha Search 是独立端点：默认按模型的候选链走，但有些站搜索能用而普通模型不通，
+   所以允许单独指定一个 OpenAI 分组（+ 可选模型名）。存的是「分组 + 模型」两个设置。 */
+function searchUpstreamPool() {
+  return state.upstreams.filter((u) => (u.groups || []).some((g) => g.protocol === 'openai'));
+}
+
+function renderSearchTarget() {
+  const tag = $('search-target-tag');
+  if (!tag) return;
+  const gid = state.searchTarget && state.searchTarget.group_id;
+  const group = gid ? groupOf(Number(gid)) : null;
+  if (!group) { tag.hidden = true; tag.textContent = ''; return; }
+  const up = upstreamOfGroup(group.id);
+  const model = state.searchTarget.model ? ` · ${state.searchTarget.model}` : '';
+  tag.hidden = false;
+  tag.textContent = `${up ? up.name : '?'} · ${group.name}${model}`;
+  tag.title = '当前搜索专用上游；点「搜索上游」可改';
+}
+
+function fillSearchGroups(upstreamId, selectedGid) {
+  const up = state.upstreams.find((u) => u.id === Number(upstreamId));
+  const groups = up ? groupsOfIface(up, 'openai') : [];
+  $('sr-group').innerHTML = groups.map((g) =>
+    `<option value="${g.id}">${esc(g.name)}${g.enabled ? '' : '（停用）'}</option>`).join('')
+    || '<option value="">（这个供应商没有 OpenAI 分组）</option>';
+  if (selectedGid) $('sr-group').value = String(selectedGid);
+}
+
+function syncSearchFields() {
+  const on = Boolean($('sr-upstream').value);
+  $('sr-group').disabled = !on;
+  $('sr-model').disabled = !on;
+  $('sr-hint').textContent = on
+    ? '搜索请求会优先打到这个分组，再按它自己的候选链降级。'
+    : '当前：跟着被搜索模型自己的候选链走（默认）。';
+}
+
+function openSearch() {
+  if (!PROTOCOLS.length) return toast('协议选项还没加载完成，请稍后重试', 'err');
+  const target = state.searchTarget || {};
+  const gid = target.group_id ? Number(target.group_id) : null;
+  const up = gid ? upstreamOfGroup(gid) : null;
+  const pool = searchUpstreamPool();
+  $('sr-upstream').innerHTML = '<option value="">跟随模型的候选链（默认）</option>'
+    + pool.map((u) =>
+      `<option value="${u.id}">${esc(u.name)}${u.enabled ? '' : '（停用）'}</option>`).join('');
+  $('sr-upstream').value = up ? String(up.id) : '';
+  fillSearchGroups(up ? up.id : '', gid);
+  $('sr-model').value = target.model || '';
+  syncSearchFields();
+  $('search-dialog').showModal();
+}
+
+async function saveSearch() {
+  const uid = $('sr-upstream').value;
+  if (!uid) {
+    await api('PUT', '/admin/api/standalone-search-target', { group_id: null, model: null });
+    toast('搜索上游已恢复为跟随候选链', 'ok');
+  } else {
+    const gid = Number($('sr-group').value);
+    if (!gid) return toast('这个供应商没有可用的 OpenAI 分组', 'err');
+    const model = $('sr-model').value.trim();
+    await api('PUT', '/admin/api/standalone-search-target', {
+      group_id: gid, model: model || null,
+    });
+    toast('搜索上游已保存', 'ok');
+  }
+  $('search-dialog').close();
+  await refreshConfig();
+}
+
 /* ---------------------------------------------------------------- 动作表 */
 
 const ACTIONS = {
@@ -1213,6 +1289,7 @@ const ACTIONS = {
     }
   },
 
+  'open-search': openSearch,
   'new-route': () => openRoute('', null),
   'add-candidate': ({ model }) => openRoute(model, null),
   'edit-candidate': ({ model, rid }) => openRoute(model, Number(rid)),
@@ -1404,6 +1481,11 @@ $('route-form').addEventListener('submit', (ev) => {
   run($('rt-save'), saveRoute);
 });
 
+$('search-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  run($('sr-save'), saveSearch);
+});
+
 // 供应商换了就把分组下拉重填一遍；接口换了连供应商池一起换
 $('rt-upstream').addEventListener('change', () => {
   fillGroupSelect('rt-group', $('rt-upstream').value, $('rt-iface').value);
@@ -1412,6 +1494,12 @@ $('rt-upstream').addEventListener('change', () => {
 
 // 分组定了才知道「上游真名」能填哪些
 $('rt-group').addEventListener('change', () => fillRemoteList(Number($('rt-group').value)));
+
+// 搜索上游：供应商换了就重填它的 OpenAI 分组
+$('sr-upstream').addEventListener('change', () => {
+  fillSearchGroups($('sr-upstream').value, null);
+  syncSearchFields();
+});
 
 $('rt-iface').addEventListener('change', () => {
   const iface = $('rt-iface').value;

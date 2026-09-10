@@ -37,6 +37,8 @@ export const state = {
   // 接口全局开关（/admin/api/protocol-switches）：停用的接口在界面上像不存在一样。
   // 空对象 = 全部启用，协议列表还没加载完时别把界面藏空
   protocolEnabled: {},
+  // Codex Alpha Search 的专用上游（/admin/api/standalone-search-target）：{group_id, model}
+  searchTarget: null,
 };
 
 /** 接口是否启用。没拿到开关状态时按启用处理，避免首屏把东西全藏起来。 */
