@@ -738,10 +738,18 @@ dialog {
   background: var(--glass-2); color: var(--ink);
   border: 1px solid var(--edge); border-radius: var(--r-lg);
   box-shadow: var(--shadow-2); padding: 0; width: 94%; max-width: 620px;
-  max-height: min(92vh, 900px);
-  display: flex; flex-direction: column;
-  overflow: hidden;
   backdrop-filter: blur(36px) saturate(200%); -webkit-backdrop-filter: blur(36px) saturate(200%);
+}
+/* 未打开的 dialog 必须彻底不参与布局。
+   UA 默认靠 `dialog:not([open]) { display: none }` 隐藏，但下面给布局规则设了
+   display:flex —— 一旦写在 `dialog` 上就会覆盖掉 UA 的隐藏，导致所有关闭过的弹窗
+   仍然以 flex 盒子留在文档末尾、撑高页面并在底部「显形」（幽灵窗口）。
+   所以这里显式兜底，并且把 flex 布局只挂在 [open] 上。 */
+dialog:not([open]) { display: none !important; }
+dialog[open] {
+  display: flex; flex-direction: column;
+  max-height: min(92vh, 900px);
+  overflow: hidden;
 }
 /* 中间那层 <form> 只是壳：自己不产生滚动条，也不参与限高，
    把 dialog 的剩余高度原样传给里面的 .dlg-body。

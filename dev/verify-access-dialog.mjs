@@ -120,6 +120,33 @@ try {
   check('操作结束后没有残留的弹窗', leftover.length === 0,
     `残留=[${leftover.join(', ')}]`);
 
+  // 关键回归点：关闭的 <dialog> 必须彻底不参与布局。
+  // 若给 `dialog` 直接设了 display:flex，会覆盖 UA 的 `dialog:not([open]){display:none}`，
+  // 于是关掉的弹窗仍以盒子留在文档末尾、撑高页面并在底部「显形」（幽灵窗口）。
+  const ghost = await evaluate(`(() => {
+    const closed = [...document.querySelectorAll('dialog:not([open])')];
+    const layout = closed.filter(d => {
+      const cs = getComputedStyle(d);
+      const r = d.getBoundingClientRect();
+      return cs.display !== 'none' && (r.height > 0 || r.width > 0);
+    }).map(d => {
+      const r = d.getBoundingClientRect();
+      return d.id + ':' + getComputedStyle(d).display + ':' + Math.round(r.height);
+    });
+    return {
+      closedCount: closed.length,
+      ghosts: layout,
+      docH: document.documentElement.scrollHeight,
+      bodyH: document.body.scrollHeight,
+    };
+  })()`);
+  check('关闭的弹窗不占布局空间（无幽灵窗口）',
+    ghost.ghosts.length === 0,
+    ghost.ghosts.length ? `异常=${ghost.ghosts.join(', ')}` : `检查了 ${ghost.closedCount} 个已关闭弹窗`);
+  check('文档高度不被已关闭弹窗撑高',
+    ghost.docH <= ghost.bodyH + 2,
+    `documentElement=${ghost.docH} vs body=${ghost.bodyH}`);
+
   const ok = results.filter(Boolean).length;
   console.log(`\n==== ${ok}/${results.length} 通过 ====`);
   process.exitCode = ok === results.length ? 0 : 1;
