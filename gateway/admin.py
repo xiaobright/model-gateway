@@ -44,22 +44,16 @@ class ModelRouteIn(BaseModel):
 
     同一个分组下可以挂同一个模型名的多条候选，只要各指一个不同的上游真名，
     所以「哪一条」在别的接口里用 route_id 指，不能再用 group_id。
-
-    ``expose_protocol`` 非空 = 这条候选经协议转换暴露成那个协议（见 gateway/bridge），
-    默认空 = 原生。v1 只允许 ``openai-chat`` 分组 + ``expose_protocol='openai'``。
     """
 
     model_name: str = Field(min_length=1)
     group_id: int
     remote_model: str = ""
-    expose_protocol: str = ""
 
 
 class RouteEditIn(BaseModel):
     route_id: int
     remote_model: str = ""
-    # None = 不动；"" = 改回原生。两者不是一回事，所以不能用空串表意
-    expose_protocol: str | None = None
 
 
 class RouteTransferIn(BaseModel):
@@ -561,10 +555,9 @@ def get_model_routes() -> list[dict[str, Any]]:
             row["model_name"],
             {
                 "model_name": row["model_name"],
-                # 模型在哪个接口下暴露 = 它候选的**有效协议**（开了桥接的算 expose_protocol）。
-                # 理论上所有候选都一样（db._validate_candidate_protocol 守着），活跃的
-                # 那条优先，免得手改过的老库看起来乱跳
-                "protocol": db.effective_protocol(row["protocol"], row["expose_protocol"] or ""),
+                # 模型在哪个接口下暴露 = 它候选所在分组的接口。理论上所有候选都一样
+                # （add_model_route 守着），活跃的那条优先，免得手改过的老库看起来乱跳
+                "protocol": row["protocol"],
                 "candidates": [],
                 # 保存的首选和当前实际起点分开：停用首选后，自动降级仍可能有可用候选。
                 "preferred_route_id": None,
@@ -575,7 +568,6 @@ def get_model_routes() -> list[dict[str, Any]]:
         upstream_on = bool(row["upstream_enabled"])
         group_on = bool(row["group_enabled"])
         breaker = cooling.get(row["group_id"])
-        expose = row["expose_protocol"] or ""
         group["candidates"].append(
             {
                 "route_id": row["route_id"],
@@ -583,11 +575,6 @@ def get_model_routes() -> list[dict[str, Any]]:
                 "group_name": row["group_name"],
                 "group_enabled": group_on,
                 "protocol": row["protocol"],
-                # 这条候选所在分组走哪种接口，以及它经桥接暴露成哪个协议
-                "group_protocol": row["protocol"],
-                "expose_protocol": expose,
-                # 前端只认这一个布尔：非空 expose 且和分组接口不同 = 这条要转换
-                "bridged": protocols.is_bridged(row["protocol"], expose),
                 "upstream_id": row["upstream_id"],
                 "upstream_name": row["upstream_name"],
                 "upstream_enabled": upstream_on,
@@ -601,10 +588,8 @@ def get_model_routes() -> list[dict[str, Any]]:
                 "fails": breaker["fails"] if breaker else 0,
             }
         )
-        # 模型在哪个接口下暴露 = 有效协议（开了桥接的按 expose 算）。活跃那条优先，
-        # 免得手改过的老库看起来乱跳
         if is_active:
-            group["protocol"] = db.effective_protocol(row["protocol"], expose)
+            group["protocol"] = row["protocol"]
             group["preferred_route_id"] = row["route_id"]
 
     # 和 proxy.forward 使用同一条 resolve_chain + 断路器排序规则，返回当前真正会先
@@ -621,18 +606,8 @@ def _mismatch(model_name: str, exc: db.ProtocolMismatch) -> HTTPException:
     mine, theirs = exc.args
     return HTTPException(
         409,
-        f"「{model_name}」已经在 {mine} 接口下暴露了，不能再挂一个暴露成 {theirs} 的候选 —— "
-        "同一个模型名的候选必须都暴露成同一种协议",
-    )
-
-
-def _unsupported_bridge(exc: db.UnsupportedBridge) -> HTTPException:
-    group_protocol, want = exc.args
-    known = " / ".join(f"{g}→{e}" for g, e in protocols.BRIDGES)
-    return HTTPException(
-        400,
-        f"还不支持把 {group_protocol} 分组的候选转换后暴露成 {want}。"
-        f"目前实现的组合只有：{known}",
+        f"「{model_name}」已经在 {mine} 接口下暴露了，不能再挂一个 {theirs} 接口的分组 —— "
+        "同一个模型名的候选必须都在同一种接口上",
     )
 
 
@@ -641,13 +616,10 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
     group = _require_group(payload.group_id)
     model_name = payload.model_name.strip()
     remote_model = payload.remote_model.strip() or model_name
-    expose = payload.expose_protocol.strip()
     try:
-        route_id = db.add_model_route(model_name, payload.group_id, remote_model, expose)
+        route_id = db.add_model_route(model_name, payload.group_id, remote_model)
     except db.ProtocolMismatch as exc:
         raise _mismatch(model_name, exc) from exc
-    except db.UnsupportedBridge as exc:
-        raise _unsupported_bridge(exc) from exc
     if not route_id:
         raise HTTPException(
             409,
@@ -659,9 +631,7 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
         "model_name": model_name,
         "group_id": payload.group_id,
         "remote_model": remote_model,
-        "protocol": db.effective_protocol(group.protocol, expose),
-        "expose_protocol": expose,
-        "bridged": protocols.is_bridged(group.protocol, expose),
+        "protocol": group.protocol,
     }
 
 
@@ -677,8 +647,6 @@ def transfer_model_routes(payload: RouteTransferIn) -> dict[str, Any]:
         raise HTTPException(409, str(exc)) from exc
     except db.ProtocolMismatch as exc:
         raise _mismatch(payload.target_model_name, exc) from exc
-    except db.UnsupportedBridge as exc:
-        raise _unsupported_bridge(exc) from exc
     log(
         f"TRANSFER mode={payload.mode} from={payload.source_model_name!r}"
         f" to={result['model_name']!r} added={result['added']} merged={result['merged']}"
@@ -688,46 +656,25 @@ def transfer_model_routes(payload: RouteTransferIn) -> dict[str, Any]:
 
 @router.put("/models")
 def put_model_route(payload: RouteEditIn) -> dict[str, Any]:
-    """改一个已有候选的「上游那边的真实模型名」，以及（可选）它的协议转换开关。
-
-    1M 开关也走这里（存成 `名字[1m]`）。``expose_protocol`` 省略 = 不动它；
-    传空串 = 改回原生。
-    """
+    """改一个已有候选的「上游那边的真实模型名」。1M 开关也走这里（存成 `名字[1m]`）。"""
     route = db.get_route(payload.route_id)
     if route is None:
         raise HTTPException(404, "该候选不存在")
     remote_model = payload.remote_model.strip() or route["model_name"]
     try:
-        ok = db.update_model_route(payload.route_id, remote_model, payload.expose_protocol)
+        ok = db.update_model_route(payload.route_id, remote_model)
     except db.DuplicateRemote as exc:
         raise HTTPException(
             409,
             f"这个分组下已经有一条映射到「{exc.args[0]}」的候选了 —— 改成它就跟那条重复了",
         ) from exc
-    except db.ProtocolMismatch as exc:
-        raise _mismatch(route["model_name"], exc) from exc
-    except db.UnsupportedBridge as exc:
-        raise _unsupported_bridge(exc) from exc
     if not ok:
         raise HTTPException(404, "该候选不存在")
-    expose = (
-        payload.expose_protocol.strip()
-        if payload.expose_protocol is not None
-        else (route["expose_protocol"] or "")
-    )
-    bridged = protocols.is_bridged(route["protocol"], expose)
-    if expose != (route["expose_protocol"] or ""):
-        log(
-            f"BRIDGE route {payload.route_id} ({route['model_name']!r} @ {route['group_name']})"
-            f" -> {protocols.bridge_label(route['protocol'], expose) if bridged else 'off'}"
-        )
     return {
         "route_id": payload.route_id,
         "model_name": route["model_name"],
         "group_id": route["group_id"],
         "remote_model": remote_model,
-        "expose_protocol": expose,
-        "bridged": bridged,
     }
 
 

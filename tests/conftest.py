@@ -13,15 +13,6 @@ from starlette.testclient import TestClient
 import helpers
 
 
-@pytest.fixture(autouse=True)
-def _clean_bridge_memo():
-    """桥接的工具调用备忘是进程内的，不清会串到下一个用例。"""
-    from gateway.bridge import tools as bridge_tools
-
-    bridge_tools.forget_all_tool_calls()
-    yield
-
-
 @pytest.fixture()
 def gateway(tmp_path, monkeypatch, request):
     from gateway import config, failover, inflight

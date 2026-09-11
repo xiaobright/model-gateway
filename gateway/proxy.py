@@ -5,13 +5,14 @@ import contextlib
 import json
 import time
 import urllib.request
+from collections.abc import Mapping
 from typing import AsyncIterator
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import bridge, config, db, failover, inflight, naming, normalize, protocols, upstream as upstream_mod
+from . import config, db, failover, inflight, naming, protocols, upstream as upstream_mod
 from .reqlog import log
 from .upstream import endpoint as upstream_endpoint
 
@@ -183,34 +184,6 @@ async def _send_until_headers(
 def _error(proto: protocols.Protocol, status: int, message: str) -> JSONResponse:
     return JSONResponse(proto.error_body(status, message), status_code=status)
 
-
-def _needs_bridge(route: db.Route, proto: protocols.Protocol) -> bool:
-    """这条候选要不要走协议转换。
-
-    请求侧的协议就是 `proto`（客户端打进来的那个路径决定的），候选的上游协议是它
-    分组的接口。两者不同 = 这条候选开了桥接（`expose_protocol` 显式指向请求协议）。
-    `group_protocol` 为空的历史 Route（standalone search 造的那种）按 `proto` 算，
-    免得被误判成桥接。
-    """
-    group_protocol = route.group_protocol or proto.name
-    return protocols.is_bridged(group_protocol, route.expose_protocol)
-
-
-def _bridge_protocol(route: db.Route, proto: protocols.Protocol) -> protocols.Protocol:
-    """桥接候选转发时该用哪个协议描述符（上游那一侧）。"""
-    return protocols.by_name(route.group_protocol or proto.name)
-
-
-def _forward_path(proto: protocols.Protocol) -> str:
-    """描述符里的 path 转成能交给 `upstream.endpoint()` 的相对路径。
-
-    `endpoint()` 自己会补 `/v1`，而描述符里的 path（`/v1/responses`）是给客户端看的
-    完整路径 —— 不剥掉就拼出 `/v1/v1/responses`，上游一律 404。
-    """
-    if proto.path.startswith(upstream_mod.API_PREFIX):
-        return proto.path[len(upstream_mod.API_PREFIX):]
-    return proto.path
-
 def _client_label(ua: str) -> str:
     if not ua:
         return "unknown"
@@ -347,11 +320,16 @@ def _has_compaction_trigger(payload: dict) -> bool:
 
 def _probe_request_shape(payload: dict) -> dict[str, object]:
     """Return only the request shape needed to diagnose client-side compaction."""
-    input_types, input_roles = _input_item_census(payload)
+    input_value = payload.get("input")
+    input_items = input_value if isinstance(input_value, list) else [input_value]
+    input_types: dict[str, int] = {}
+    for item in input_items:
+        item_type = item.get("type", "?") if isinstance(item, dict) else type(item).__name__
+        key = str(item_type)
+        input_types[key] = input_types.get(key, 0) + 1
     return {
         "top_level_keys": sorted(str(key) for key in payload),
         "input_item_types": input_types,
-        "input_item_roles": input_roles,
         "tools_count": len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
         "has_context_management": "context_management" in payload,
         "has_compaction_trigger": _has_compaction_trigger(payload),
@@ -492,14 +470,6 @@ async def forward(
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return _error(proto, 400, "请求体不是合法 JSON")
 
-    # Codex 的 "responses-lite" 工具线格式（additional_tools item + namespace 容器）
-    # 是 OpenAI 私有扩展；DeepSeek 这类 Responses 兼容上游 HTTP 200 但不认工具，
-    # 模型会把调用按 DSML 标记吐在正文里（2026-09-10 官方 DeepSeek 直连实测）。
-    # 把默认容器的工具提升到顶层 tools，其余原样透传 —— 响应侧不受影响。
-    lite_hoisted = 0
-    if normalize.needs_normalization(payload):
-        payload, lite_hoisted = normalize.normalize_responses_request(payload)
-
     compaction_capture = (
         _compaction_capture_requested(endpoint)
         and (config.DATA_DIR / "compaction_capture.flag").exists()
@@ -539,24 +509,6 @@ async def forward(
     stream_flag = bool(payload.get("stream"))
     # 有副作用的 OpenAI 请求不降级：上游可能已经把它存下来了才失败，重试会留下两条
     stateful = payload.get("store") is not None or payload.get("previous_response_id") is not None
-    if payload.get("previous_response_id"):
-        # 决策 3：`previous_response_id` 的会话状态在 chat 上游模拟不了（litellm 用
-        # session_handler + 内存缓存，我们不引入）。所以这种请求里桥接候选直接不参与 ——
-        # 客户端拿到的是「原生候选的失败」，而不是一个莫名其妙的转换错误。
-        natives = tuple(route for route in chain if not _needs_bridge(route, proto))
-        if len(natives) != len(chain):
-            log(
-                f"POST {endpoint} model={requested!r} previous_response_id 非空："
-                f"跳过 {len(chain) - len(natives)} 个桥接候选"
-            )
-        chain = natives
-        if not chain:
-            why = (
-                f"模型 {requested!r} 只有开启了协议转换的候选，而它们不支持 previous_response_id；"
-                "请改用原生 Responses 上游"
-            )
-            log(f"POST {endpoint} model={requested!r} -> 404 ({why})")
-            return _error(proto, 404, why)
     # Standalone Codex search is side-effect free. It may be unavailable on an
     # otherwise healthy OpenAI-compatible upstream (404/405/501), so probe the
     # next configured candidate for this endpoint even when normal OpenAI
@@ -620,56 +572,17 @@ async def forward(
         # 上游只认它那边的真名。[1m] 是 Claude Code 自己的档位约定，请求侧和配置侧都可能带，一并摘掉
         remote, remote_flag = naming.split_model(route.remote_model)
         want_1m = naming.wants_1m(flag) or naming.wants_1m(remote_flag)
-        # 开了桥接的候选：请求体要改写形状、URL 和请求头要按**上游那边的协议**来。
-        # 客户端那一侧完全无感，它看到的仍然是 Responses。
-        bridged_now = _needs_bridge(route, proto)
-        upstream_proto = _bridge_protocol(route, proto) if bridged_now else proto
-        upstream_path = _forward_path(upstream_proto) if bridged_now else path
-        bridge_notes: list[str] = []
-
         sent_body = body
-        if bridged_now:
-            try:
-                converted = bridge.responses_to_chat(payload, remote)
-            except bridge.BridgeError as exc:
-                # 转换失败是**请求**问题，不是站点问题：不该记站点失败，也不该换下一个
-                # 候选 —— 换过去的桥接候选会用同样的方式失败
-                elapsed = time.monotonic() - started
-                log(
-                    f"POST {endpoint} model={requested!r} -> 400 (协议转换失败: {exc}) "
-                    f"after {elapsed:.1f}s"
-                )
-                inflight.finish(call, status=400, note="bridge_error")
-                if record:
-                    _record(
-                        request=request, route=route, proto=proto, model=asked,
-                        remote_model=remote, status=400, stream_flag=stream_flag,
-                        req_bytes=len(body), resp_bytes=0, elapsed=elapsed,
-                        usage=NO_USAGE, note="bridge_error", attempt=attempt,
-                        converted=True,
-                    )
-                return _error(proto, 400, f"协议转换失败：{exc}")
-            for key in ("_bridge_dropped_parts", "_bridge_dropped_tools"):
-                dropped = converted.get(key)
-                if dropped:
-                    # 键名去前缀：备注列里写 `parts=input_image` 比 `_bridge_dropped_parts=…` 好读
-                    label = key.removeprefix("_bridge_dropped_")
-                    bridge_notes.append(f"{label}={'/'.join(str(item) for item in dropped)}")
-            sent_body = json.dumps(
-                bridge.strip_internal_fields(converted), ensure_ascii=False, separators=(",", ":")
-            ).encode()
-        elif lite_hoisted or remote != requested:
+        if remote != requested:
             # ensure_ascii=False：否则中文请求体会涨三到六倍。
-            # 规范化过的请求体也没法保字节级透传了，只能重序列化
             sent_body = json.dumps(
                 {**payload, "model": remote}, ensure_ascii=False, separators=(",", ":")
             ).encode()
 
         _maybe_capture_headers(request, payload, len(body))
-        # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）。
-        # 桥接时打的是**上游那一侧的路径**，不是客户端打进来的那个
-        url = upstream_endpoint(route.upstream.base_url, upstream_path)
-        headers = _build_headers(request, route.upstream, upstream_proto, want_1m)
+        # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
+        url = upstream_endpoint(route.upstream.base_url, path)
+        headers = _build_headers(request, route.upstream, proto, want_1m)
         label = f"{route.upstream.name}/{route.group_name}"
         inflight.set_route(
             call, attempt=attempt, upstream=route.upstream.name, group_name=route.group_name,
@@ -753,16 +666,9 @@ async def forward(
         inflight.phase(call, inflight.WAIT, status=resp.status_code)
         # 带了 stateful 字段的请求不降级，日志里标出来 —— 排查「为什么这条没换站」时靠它
         detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}" if stateful else ""
-        bridge_mark = (
-            f" bridge={protocols.bridge_label(upstream_proto.name, route.expose_protocol)}"
-            if bridged_now else ""
-        )
-        if lite_hoisted:
-            bridge_mark += f" lite=+{lite_hoisted}"
         log(
             f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
-            f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail}"
-            f"{bridge_mark} "
+            f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
             f"req={len(sent_body)}B ua={request.headers.get('user-agent', '')[:48]!r}"
             f"{_capability_summary(payload)}"
             f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
@@ -837,50 +743,21 @@ async def forward(
     won_attempt = attempt
     won_remote = remote
     won_bytes = len(sent_body)
-    won_bridged = bridged_now
-    won_upstream_proto = upstream_proto
-    won_bridge_notes = list(bridge_notes)
     upstream_resp = resp
-    resp_content_type = upstream_resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-
-    if won_bridged and resp_content_type != "text/event-stream":
-        # 桥接 + 上游给的是 JSON（客户端没要流，或者要了流但站不理会）：
-        # 收齐、转换、一次性回。不能走下面的流式路径 —— 那边是原样透传字节的。
-        return await _relay_bridged_json(
-            request=request, upstream_resp=upstream_resp, payload=payload, proto=proto,
-            route=won, model=asked, remote_model=won_remote,
-            def_body=won_bytes, stream_flag=stream_flag, attempt=won_attempt,
-            started=started, call=call, record=record, notes=won_bridge_notes,
-        )
 
     async def relay() -> AsyncIterator[bytes]:
         sent = 0
-        client_sent = 0
         text_bytes = 0
         thinking = False
         compaction_observations: list[dict[str, object]] = []
         response_event_types: dict[str, int] = {}
         response_payload_types: dict[str, int] = {}
-        content_type = resp_content_type
-        # 观察器一律按**上游那一侧**的协议跑：桥接时上游是 chat，正文/思维/usage
-        # 都长在 chat 帧上。拿 Responses 的正则去套 chat 的帧，统计会全为 0
-        observer = protocols.SSEObserver(won_upstream_proto) if content_type == "text/event-stream" else None
-        stream_bridge = (
-            bridge.StreamBridge(payload, requested, all_tools=bridge.all_tools_of(payload))
-            if won_bridged and content_type == "text/event-stream" else None
-        )
+        content_type = upstream_resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        observer = protocols.SSEObserver(proto) if content_type == "text/event-stream" else None
         json_body = bytearray()
         head = bytearray()
         tail = bytearray()
         note = "ok"
-        # 一次性 SSE 抓包：放 data/capture-sse.flag，下一条流式请求的上游原始字节和
-        # 发给客户端的字节各存一份（各封顶 2MB）—— 对比「真上游发的事件序列」和
-        # 「桥接造的事件序列」就是靠这两份。抓完 flag 就消失，不会一直记。
-        sse_cap = config.DATA_DIR / "capture-sse.flag"
-        sse_capture = sse_cap.exists()
-        sse_upstream: bytearray = bytearray()
-        sse_client: bytearray = bytearray()
-        _SSE_CAPTURE_CAP = 2_000_000
         # 第一块字节开始往下走才算「正在返回」：在这之前是「等上游出字」，两件事的
         # 处置完全不同（卡在等待是模型在想，卡在连接是站连不上）
         chunks = upstream_resp.aiter_bytes()
@@ -898,9 +775,9 @@ async def forward(
                     # 往往在第一块字节里就到手了 —— 比按包大小估准得多，「实时」页上直接用它。
                     # 头填满之前每来一块都试一次：数字可能正好被切成两半，extract_usage
                     # 取最大值，所以多试几次一定会读到完整的那个
-                    if b"input_tokens" in head or b"prompt_tokens" in head:
-                        got = won_upstream_proto.extract_usage(bytes(head), b"")
-                        inflight.usage(call, tokens_in=won_upstream_proto.context_tokens(got))
+                    if b"input_tokens" in head:
+                        got = proto.extract_usage(bytes(head), b"")
+                        inflight.usage(call, tokens_in=proto.context_tokens(got))
                 tail.extend(chunk)
                 # 观察器按完整 SSE 帧统计内容和结束事件；它不参与实际转发，解析出错也不能
                 # 影响下面的原始 chunk。
@@ -921,18 +798,7 @@ async def forward(
                 if len(tail) > TAIL_KEEP:
                     del tail[: len(tail) - TAIL_KEEP]
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
-                if stream_bridge is not None:
-                    # 桥接：上游字节只用来统计和攒状态，发给客户端的是生成出来的事件流
-                    for piece in stream_bridge.feed(chunk):
-                        client_sent += len(piece)
-                        if sse_capture and len(sse_client) < _SSE_CAPTURE_CAP:
-                            sse_client.extend(piece)
-                        yield piece
-                else:
-                    client_sent += len(chunk)
-                    yield chunk
-                if sse_capture and len(sse_upstream) < _SSE_CAPTURE_CAP:
-                    sse_upstream.extend(chunk)
+                yield chunk
         except inflight.ManualAbort:
             note = "manual_abort"
             log(f"  manually stopped after {sent}B")
@@ -948,27 +814,8 @@ async def forward(
             log(f"  client left after {sent}B (completed={completed})")
             raise
         else:
-            if stream_bridge is not None:
-                # 上游流结束：把攒下的收尾事件（output_text.done / response.completed）
-                # 和末尾的 [DONE] 发出去。这一步不能省 —— 客户端就等 response.completed
-                for piece in stream_bridge.finish():
-                    client_sent += len(piece)
-                    if sse_capture and len(sse_client) < _SSE_CAPTURE_CAP:
-                        sse_client.extend(piece)
-                    yield piece
-                if upstream_resp.status_code < 300 and not stream_bridge.completed:
-                    note = "truncated"
-                    log(
-                        f"  WARN bridge finished WITHOUT response.completed "
-                        f"status={upstream_resp.status_code} upstream={sent}B"
-                    )
-                else:
-                    log(
-                        f"  done status={upstream_resp.status_code} upstream={sent}B "
-                        f"client={client_sent}B {time.monotonic() - started:.1f}s"
-                    )
             # 只有「上游说 200 且是流式」时缺完成事件才算被截断，4xx/5xx 本来就没有完成事件
-            elif observer is not None and upstream_resp.status_code < 300 and not observer.ended:
+            if observer is not None and upstream_resp.status_code < 300 and not observer.ended:
                 note = "truncated"
                 log(f"  WARN stream ended WITHOUT completion event status={upstream_resp.status_code} resp={sent}B")
             else:
@@ -978,16 +825,14 @@ async def forward(
                 try:
                     json_payload = json.loads(json_body)
                     if isinstance(json_payload, dict):
-                        text_bytes, thinking = won_upstream_proto.count_json_content(json_payload)
+                        text_bytes, thinking = proto.count_json_content(json_payload)
                         if compaction_capture:
                             compaction_observations = protocols.compaction_observations(json_payload)
                             response_payload_types = _probe_response_types(json_payload)
                 except Exception as exc:
                     log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
-            if compaction_capture and not won_bridged:
-                # 压缩探针解析的是 Responses 响应体，桥接出来的是我们自己造的，
-                # 拿它当证据没有意义
+            if compaction_capture:
                 _write_compaction_capture(
                     request=request,
                     payload=payload,
@@ -1002,34 +847,21 @@ async def forward(
                     response_event_types=response_event_types,
                     response_payload_types=response_payload_types,
                 )
-            if sse_capture:
-                try:
-                    (config.DATA_DIR / "captured_sse_upstream.txt").write_bytes(bytes(sse_upstream))
-                    (config.DATA_DIR / "captured_sse_client.txt").write_bytes(bytes(sse_client))
-                    sse_cap.unlink(missing_ok=True)
-                    log(
-                        f"  captured sse (bridged={won_bridged}): upstream={len(sse_upstream)}B "
-                        f"client={len(sse_client)}B -> data/captured_sse_*.txt"
-                    )
-                except OSError as exc:
-                    log(f"  sse capture write failed: {exc}")
-            # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库。
-            # 桥接时是**上游 chat 帧**里的数，不是生成事件里的数
-            usage = won_upstream_proto.extract_usage(bytes(head), bytes(tail))
+            # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
+            usage = proto.extract_usage(bytes(head), bytes(tail))
             # 先落库（纯同步，即使外层在取消也能跑完），再还连接
             inflight.finish(
                 call, status=upstream_resp.status_code, note=note, sent=sent,
-                tokens_in=won_upstream_proto.context_tokens(usage), tokens_out=usage[1] or 0,
+                tokens_in=proto.context_tokens(usage), tokens_out=usage[1] or 0,
             )
             if record:
                 _record(
                     request=request, route=won, proto=proto, model=asked,
                     remote_model=won_remote, status=upstream_resp.status_code,
                     stream_flag=stream_flag, req_bytes=won_bytes,
-                    resp_bytes=client_sent, elapsed=time.monotonic() - started,
-                    usage=usage, note=_bridged_note(note, won_bridge_notes), attempt=won_attempt,
+                    resp_bytes=sent, elapsed=time.monotonic() - started,
+                    usage=usage, note=note, attempt=won_attempt,
                     text_bytes=text_bytes, thinking=thinking,
-                    converted=won_bridged,
                 )
             with contextlib.suppress(Exception):
                 await upstream_resp.aclose()
@@ -1041,97 +873,6 @@ async def forward(
         headers=passthrough,
         media_type=upstream_resp.headers.get("content-type", "application/json"),
     )
-
-def _bridged_note(note: str, bridge_notes: list[str]) -> str:
-    """把「这轮转换丢了什么」拼进转发记录的 note。
-
-    丢弃是**故意的**（web_search 表达不了、图片 v1 不做），但绝不能无声 ——
-    「模型怎么突然不会搜了」这种问题，答案就在这一行里。
-    """
-    if not bridge_notes:
-        return note
-    return f"{note} ({' '.join(bridge_notes)})"
-
-
-async def _relay_bridged_json(
-    *,
-    request: Request,
-    upstream_resp: httpx.Response,
-    payload: dict,
-    proto: protocols.Protocol,
-    route: db.Route,
-    model: str,
-    remote_model: str,
-    def_body: int,
-    stream_flag: bool,
-    attempt: int,
-    started: float,
-    call: object,
-    record: bool,
-    notes: list[str],
-) -> JSONResponse:
-    """桥接 + 上游给的是 JSON：收齐整块、转成 Responses 再一次性返回。
-
-    客户端要了 stream 而站不理会的情况也要走这里，所以判据是上游的 content-type，
-    不是客户端要没要流。
-    """
-    upstream_proto = protocols.by_name(route.group_protocol)
-    status = upstream_resp.status_code
-    raw = b""
-    note = "ok"
-    try:
-        raw = await inflight.wait_for_upstream(call, upstream_resp.aread())
-    except inflight.ManualAbort:
-        note = "manual_abort"
-    except httpx.HTTPError as exc:
-        note = "upstream_abort"
-        log(f"  read aborted: {exc.__class__.__name__}: {exc}")
-    finally:
-        with contextlib.suppress(Exception):
-            await upstream_resp.aclose()
-
-    elapsed = time.monotonic() - started
-    usage = upstream_proto.extract_usage(raw, raw)
-    text_bytes = thinking = 0
-    converted: dict | None = None
-    if note == "ok":
-        try:
-            chat_json = json.loads(raw)
-        except ValueError:
-            chat_json = None
-            log(f"  WARN bridged upstream JSON unparsable, first 200B: {raw[:200]!r}")
-        if isinstance(chat_json, dict):
-            text_bytes, thinking = upstream_proto.count_json_content(chat_json)
-            converted = bridge.chat_to_responses(
-                chat_json, request=payload, all_tools=bridge.all_tools_of(payload)
-            )
-        else:
-            note = "bridge_error"
-
-    body_bytes = 0
-    if converted is not None:
-        body = json.dumps(converted, ensure_ascii=False, separators=(",", ":")).encode()
-        body_bytes = len(body)
-        log(
-            f"  done (bridged json) status={status} upstream={len(raw)}B "
-            f"client={body_bytes}B {elapsed:.1f}s"
-        )
-    inflight.finish(
-        call, status=status, note=note, sent=len(raw),
-        tokens_in=upstream_proto.context_tokens(usage), tokens_out=usage[1] or 0,
-    )
-    if record:
-        _record(
-            request=request, route=route, proto=proto, model=model,
-            remote_model=remote_model, status=status, stream_flag=stream_flag,
-            req_bytes=def_body, resp_bytes=body_bytes, elapsed=elapsed,
-            usage=usage, note=_bridged_note(note, notes), attempt=attempt,
-            text_bytes=text_bytes, thinking=thinking, converted=True,
-        )
-    if converted is None:
-        return _error(proto, 502, f"上游 {route.upstream.name} 返回的内容没法转成 Responses 响应")
-    return JSONResponse(converted, status_code=status)
-
 
 def _record(
     *,
@@ -1150,7 +891,6 @@ def _record(
     attempt: int = 1,
     text_bytes: int = 0,
     thinking: bool = False,
-    converted: bool = False,
 ) -> None:
     input_tokens, output_tokens, cached_tokens, cache_creation_tokens = usage
     try:
@@ -1174,7 +914,6 @@ def _record(
             cache_creation_tokens=cache_creation_tokens,
             note=note,
             attempt=attempt,
-            converted=converted,
         )
     except Exception as exc:  # 记日志失败绝不能影响转发本身
         log(f"  request_log insert failed: {exc}")
@@ -1182,8 +921,7 @@ def _record(
 
 # ---------------------------------------------------------------- 路由
 #
-# 下游打哪个路径，就转发到上游同名的路径 —— **除非那条候选开了协议转换**
-# （`model_routes.expose_protocol`，见 gateway/bridge）。默认关，没开的路径一字不差。
+# 下游打哪个路径，就转发到上游同名的路径，不做任何格式转换。
 
 
 @router.post("/v1/responses", response_model=None)

@@ -354,43 +354,6 @@ setx ANTHROPIC_DEFAULT_HAIKU_MODEL claude-haiku-4-5
 1.5 亿缓存 token，那边必须能自己回去），也不会悄悄改写你手动选的东西。另外 104 个 502 全是连不上、
 平均白等 16.6 秒，所以 connect 超时从 15 秒收到 8 秒。
 
-## 协议转换（桥接）
-
-默认**不做**格式转换：客户端打哪个路径就转发到上游同名路径。唯一的例外是候选上那个
-`expose_protocol` 开关 —— 开了它，这条候选的请求/响应会在网关里被转换：
-
-```
-Codex (Responses)  ──▶  网关转换  ──▶  只提供 Chat Completions 的站
-```
-
-只做这一个方向（Responses 客户端 → Chat 上游），只对这一种组合实现：
-
-| 分组的接口 | 候选暴露成 | 说明 |
-|---|---|---|
-| `openai-chat` | `openai` | 在「上游站点」给这个站加一个 **OpenAI Chat Completions** 分组，然后在模型路由里加候选时勾上「转换为该接口暴露」 |
-
-怎么开：模型路由卡片上点「+ 候选」（或某个候选的 ✎），选中一个 Chat Completions 分组，
-下面会多出一行「转换为该接口暴露」，勾上保存。卡片上该候选会带一个 **桥接** 小标签。
-关掉就是把那个勾去掉。
-
-几点要知道的：
-
-- **默认关**。没勾的候选行为与以前一字不差 —— 一个模型名可以同时挂原生候选和桥接候选，
-  按优先级混排成一条降级链（原生站挂了就落到桥接站上）。
-- **同一把 key、同一个站**：桥接只是换个线格式，不带路由之外的能力。
-- **丢掉的工具**：`web_search` 这类服务端工具在 Chat 协议里没有对应物，会被丢掉（转发记录
-  的备注里会写清丢了什么）；图片输入同理。Codex 的 `apply_patch` 是 `custom` 工具，会被
-  转成带 `content` 参数的 function 工具发出去，回来时再还原成 `custom_tool_call`。
-- **不支持有状态请求**：带 `previous_response_id` 的请求会跳过桥接候选（只回摘要的推理状态
-  没法在 Chat 上游模拟），客户端拿到的是「原生候选的失败」而不是一个转换错误。
-- **统计口径**是**上游那一侧**的字节（Chat 帧），所以 token 数和你在 Chat 直连时看到的一致；
-  转发记录里 `converted=1` 标记这条是转换来的。
-- 转换不出来（`input` 里有网关不认识的 item 类型）时回 **400**，不算站点失败、不会把分组打进冷却。
-
-实现放在 `gateway/bridge/`，只有一个上游协议 + 一个下游协议，纯 dict 进纯 dict 出，
-转换规则来自 litellm v1.102.0（MIT）的 `responses/litellm_completion_transformation/`，
-按 dict-only 重写。
-
 ## 只对本机开放
 
 - 仅监听 `127.0.0.1`，不对局域网开放
@@ -535,9 +498,7 @@ node tests/web_protocols.test.mjs
 
 按关注点分了文件：`test_proxy`（转发）、`test_routing`（路由）、`test_admin`（管理接口与迁移）、
 `test_stats`（记录与统计）、`test_failover`（自动降级）、`test_inflight`（实时页）、
-`test_egress`（出口）、`test_units`（不依赖网关的纯函数）、`test_lifecycle`（进程内分块统计与取消）、
-`test_bridge_request` / `test_bridge_response` / `test_bridge_stream`（协议转换的纯函数 —— 请求映射、
-非流式响应映射、流式事件状态机）、`test_bridge_proxy`（协议转换接进网关之后的端到端）。
+`test_egress`（出口）、`test_units`（不依赖网关的纯函数）、`test_lifecycle`（进程内分块统计与取消）。
 默认用例通过 FastAPI `TestClient` 和 `httpx.MockTransport` 在进程内运行；`network` 标记的
 用例才启动 Uvicorn、真实 mock 上游或代理。两组集合互斥，合起来等于完整测试集。不要用
 跳过标记代替网络边界：自动降级规则本身走进程内模拟，真实流中断、代理和 TLS 才保留 socket。
@@ -617,9 +578,8 @@ Anthropic 要把缓存读取加进去）、**某个方向忽大忽小时返回 0
 去掉一个上游模型时，指向它的下游候选会一起下线（会先确认）。
 
 模型路由仍支持 `/admin/api/models/transfer`：在同一个 SQLite 事务里把候选复制 / 移动 / 合并到
-另一个下游模型，完整保留分组、上游真实模型（含 1M 后缀）以及协议转换开关 `expose_protocol`。
-迟到的来源快照、以及会改变「这个模型在哪个接口下暴露」的操作都会被拒绝（同协议、或者一个
-原生候选 + 一个桥接候选暴露成同一协议，都算合法）。
+另一个下游模型，完整保留分组及上游真实模型（含 1M 后缀），已有目标的首选和顺序不变，迟到的
+来源快照或不同协议会被拒绝，不做协议转换。
 
 `dev/` 里是做视觉效果时的一次性实验页（玻璃质感那版），不参与运行、也不在 `/static` 下 ——
 放在 `web/` 里会被当成静态资源服务出去。

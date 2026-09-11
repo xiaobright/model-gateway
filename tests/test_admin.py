@@ -480,21 +480,10 @@ def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway,
         )
 
 
-@pytest.mark.parametrize(
-    "version, missing, migrates",
-    [
-        (0, True, True),    # 没打过号，还要补缓存创建列
-        (3, True, True),    # 正常 v3
-        (4, True, True),    # 曾被误打上 v4 却没补列
-        (0, False, False),  # 形状已经最新、只是没打号：补个号就行，不必备份
-        (5, False, True),   # v5 -> v6：补 expose_protocol 与 converted 两列
-        (6, False, False),  # 当前版本
-    ],
-)
-def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatch, version, missing, migrates):
-    """未打号、正常 v3、误打 v4 的老库都要补列；只有真的要迁移才备份。
-    v5 也必须迁移 —— 协议桥接给 model_routes 加了 expose_protocol、给转发记录加了
-    converted，老库没这两列，不迁移就会在第一个桥接请求上炸 no such column。"""
+@pytest.mark.parametrize("version, missing", [(0, True), (3, True), (4, True), (0, False), (5, False)])
+def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatch, version, missing):
+    """未打号、正常 v3、误打 v4 的老库都要补列；完整的新库不应迁移或备份。
+    完整基线是 v5 —— v4 即使 cache_creation 列齐全，也要补 group_models 目录迁移。"""
     import sqlite3
 
     from gateway import config, db
@@ -520,18 +509,14 @@ def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatc
     db.init_db()
     assert db._schema_version(db_path) == db.SCHEMA_VERSION
     assert "cache_creation_tokens" in db._columns(db_path, "request_log")
-    assert "expose_protocol" in db._columns(db_path, "model_routes")
-    assert "converted" in db._columns(db_path, "request_log")
     backups = list(tmp_path.glob("gateway.db.bak-*"))
-    assert bool(backups) == migrates
+    assert bool(backups) == missing
     if missing:
         assert "cache_creation_tokens" not in db._columns(backups[0], "request_log")
     route = db.resolve_route("m", "anthropic")
     assert (route.route_id, route.group_id, route.remote_model, route.upstream.egress) == (42, 13, "remote", "direct")
-    assert route.expose_protocol == "" and route.group_protocol == "anthropic"
     assert db.list_routes()[0]["priority"] == 7
     assert db.recent_requests(1)[0]["cache_creation_tokens"] is None
-    assert db.recent_requests(1)[0]["converted"] == 0
     db.insert_request(
         client="test", model="m", upstream="siteA", status=200, stream=False,
         req_bytes=10, resp_bytes=20, duration_ms=30, input_tokens=100,

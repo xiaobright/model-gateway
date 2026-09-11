@@ -1,17 +1,13 @@
 """按协议不同的那几处细节，集中在这里。
 
-网关默认不做格式转换：下游打哪个路径，就原样转发到上游对应的路径。所以一条请求
+网关本身不做格式转换：下游打哪个路径，就原样转发到上游对应的路径。所以一条请求
 走哪种协议，是由**它打进来的路径**决定的，跟站点无关。站点那一侧的对应物是分组
 （`upstream_groups.protocol`）：那把 key 走哪种接口。两者在 `db.resolve_route()`
 里汇合 —— 模型名 + 请求协议，找出该用哪个分组。
 
-**例外**是候选上的 `expose_protocol`：开了它这条候选就走 `gateway/bridge/` 的转换
-（目前只有 Responses 客户端 → Chat Completions 上游一种），见下面的 `BRIDGES`。
-默认空，没开的行为与以前一字不差。
-
 真正随协议变的细节，以及管理页需要展示的元数据，都在下面的描述符里：结束标记、usage
 字段位置、鉴权头、错误体形状、客户端提示和能力标记。要再加一种直通格式，仍需写描述符、
-显式路由和对应行为测试。转换规则不在这里，在 bridge 包里。
+显式路由和对应行为测试；本模块不负责格式转换。
 """
 
 from __future__ import annotations
@@ -366,37 +362,6 @@ def by_name(name: str) -> Protocol:
     """按名字取描述符。认不出来时退回 OPENAI，调用方全都是「拿它拼个头」的场景，
     没有哪个值得为此抛异常。"""
     return ALL.get(name, OPENAI)
-
-
-# ---------------------------------------------------------------- 协议桥接
-#
-# 「这条候选要不要转换」= 候选自己的协议 ≠ 它要暴露成的协议。两种组合收在一张表里，
-# 而不是散在 db / proxy / admin 的 if 里 —— 加一种桥接（比如 chat 客户端 →
-# Responses 上游）时只该动这里和 bridge 包。
-#
-# v1 只做一种：客户端发 Responses（Codex），上游只有 Chat Completions 站。
-# 反向（chat → Responses）参考实现在 litellm 的
-# `completion_extras/litellm_responses_transformation/`，以后再说。
-#
-# 值只作说明用，会出现在日志和错误文案里。
-BRIDGES: dict[tuple[str, str], str] = {
-    ("openai-chat", "openai"): "Responses 请求转成 Chat Completions 发上游",
-}
-
-
-def is_bridged(group_protocol: str, expose_protocol: str) -> bool:
-    """这条候选要走转换吗。空 expose_protocol = 原生（走分组自己的接口）。"""
-    return bool(expose_protocol) and expose_protocol != group_protocol
-
-
-def bridge_supported(group_protocol: str, expose_protocol: str) -> bool:
-    """这对组合有没有实现。没实现必须在保存配置时就拒掉，别攒到第一个请求。"""
-    return (group_protocol, expose_protocol) in BRIDGES
-
-
-def bridge_label(group_protocol: str, expose_protocol: str) -> str:
-    """日志和转发记录里的一行标记，形如 `openai-chat->openai`。"""
-    return f"{group_protocol}->{expose_protocol}"
 
 
 class SSEObserver:
