@@ -821,13 +821,27 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 
 /* 上游模型勾选列表：单独一截滚动区。260px 只够四五条，列表一长就被裁掉；
    拉高到 ~40vh，并保证滚动条可见，不用缩放网页才能点到底下的模型 */
+.picker-shell {
+  position: relative;
+  margin-top: 9px;
+}
 .picker {
   max-height: min(42vh, 420px);
   min-height: 140px;
   overflow-y: auto; overflow-x: hidden;
   overscroll-behavior: contain;
   border: 1px solid var(--hair-2); border-radius: var(--r-sm);
-  padding: 6px 8px; background: var(--glass-3); margin-top: 9px;
+  padding: 6px 8px; background: var(--glass-3);
+}
+/* 列表裁切时下一条只露半截上缘：底边盖一层薄雾，别像半行坏字 */
+.picker-shell::after {
+  content: "";
+  position: absolute;
+  left: 1px; right: 1px; bottom: 1px;
+  height: 26px;
+  border-radius: 0 0 calc(var(--r-sm) - 1px) calc(var(--r-sm) - 1px);
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--glass-3) 85%);
 }
 /* 6px 半透明滚动条几乎看不见，列表长了像「卡住滚不动」——这里加粗一点 */
 .picker::-webkit-scrollbar { width: 8px; }
