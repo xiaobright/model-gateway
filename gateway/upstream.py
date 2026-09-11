@@ -101,6 +101,24 @@ def ca_context(frag: str) -> ssl.SSLContext:
     return ctx
 
 
+def system_ssl_context() -> ssl.SSLContext | None:
+    """建一个「跟系统证书库走」的 ssl context，杀软 MITM 也能验过。
+
+    Windows 上卡巴斯基这类「加密连接扫描」会用自己的根证书重签所有 TLS 流量：
+    根证书装在系统库里（curl/浏览器都认），但 httpx 默认用自带的 CA 捆绑包，
+    不认 → CERTIFICATE_VERIFY_FAILED。truststore 把系统库注入 ssl，问题消失。
+    没装 truststore（或平台不支持）返回 None，调用方保持 httpx 默认行为。
+    """
+    try:
+        import truststore
+    except ImportError:
+        return None
+    try:
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        return None
+
+
 async def fetch_remote_models(
     base_url: str, api_key: str, header_override: str = "", protocol: str = "openai",
     egress: str = "",

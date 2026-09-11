@@ -207,6 +207,28 @@ def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
         assert "certificate" in str(ei.value).lower()
 
 
+def test_client_args_verifies_upstream_tls_against_the_system_trust_store():
+    """上游 TLS 用系统证书库验：卡巴斯基这类杀软 MITM 的根也能过（2026-09-11 实锤）。
+
+    httpx 自带的 CA 捆绑包不认杀软装进系统库的根证书，curl/浏览器能通、网关 502。
+    truststore 装了就带上 verify，没装则不加、行为原样（可选依赖）。
+    """
+    from gateway import proxy as proxy_mod
+
+    try:
+        import truststore  # noqa: F401
+        installed = True
+    except ImportError:
+        installed = False
+
+    args = proxy_mod.client_args("")
+    if installed:
+        import ssl as _ssl
+        assert isinstance(args.get("verify"), _ssl.SSLContext)
+    else:
+        assert "verify" not in args
+
+
 def test_input_item_census_records_the_role_alongside_the_type():
     """抓形状时连 role 一起记 —— `role: "developer"` 这个坑就是这么被看出来的。
 

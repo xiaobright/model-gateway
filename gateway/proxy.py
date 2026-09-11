@@ -59,6 +59,14 @@ def client_args(egress: str) -> dict:
         "trust_env": egress == EGRESS_SYSTEM,
         "proxy": proxy,
     }
+    # 用 Windows 系统证书库验证上游 TLS。httpx 默认用自带的 CA 捆绑包，认不得
+    # 卡巴斯基这类「加密连接扫描」的 MITM 根证书 —— 明明 curl 能通、浏览器能通，
+    # 网关却 502 "self-signed certificate in certificate chain"（2026-09-11 实锤）。
+    # truststore 把系统库注入 ssl：杀软的根是用户自己机器上受信的，跟着走。
+    # 没装 truststore 就退回 httpx 默认行为。
+    ctx = upstream_mod.system_ssl_context()
+    if ctx is not None:
+        args["verify"] = ctx
     if proxy:
         base, frag = upstream_mod.split_ca(proxy)
         if frag:
