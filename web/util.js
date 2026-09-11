@@ -223,6 +223,44 @@ export const groupsOfIface = (upstream, iface) =>
 export const supportsIface = (upstream, iface) =>
   !iface || (upstream.supports || []).includes(iface);
 
+/* ---------------------------------------------------------------- 协议桥接
+
+   候选可以把某个上游协议「转换后暴露成」另一个协议（网关侧见
+   `gateway/protocols.py` 的 `BRIDGES`）。这张表是那份名单在前端的影子 ——
+   判断「这个分组能不能挂在这个接口下」一律走下面几个函数，别在 app.js 里写 if，
+   否则加第二种桥接时又要满仓库找。
+
+   key = 候选最终暴露成的协议；value = 可以经转换过来的分组协议。 */
+export const BRIDGE_FROM = { openai: ['openai-chat'] };
+
+/** 暴露成 expose 时，还能额外接受哪些分组协议（经转换）。 */
+export const bridgeSourceProtocols = (expose) => BRIDGE_FROM[expose] || [];
+
+/** 这一对是不是「转换后暴露」：分组协议和暴露协议不同，且这对组合实现了。 */
+export const isBridgedPair = (groupProtocol, expose) =>
+  Boolean(groupProtocol) && groupProtocol !== expose
+  && bridgeSourceProtocols(expose).includes(groupProtocol);
+
+/** 暴露成 expose 时，这个供应商有哪些分组可以挂（原生的 + 能转过来的）。 */
+export const groupsForExpose = (upstream, expose) =>
+  (upstream.groups || []).filter((g) => !expose || g.protocol === expose
+    || isBridgedPair(g.protocol, expose));
+
+/** 暴露成 expose 时，这个供应商有没有可用分组。 */
+export const supportsExpose = (upstream, expose) =>
+  !expose || groupsForExpose(upstream, expose).length > 0;
+
+/** 候选圆片上那个「桥接」小标签（带前导空格，空串 = 不显示）。
+
+    标出来是必须的：一个模型挂在 Chat 分组下却能给 Codex 用，看配置的人第一反应是
+    「配错了」。标签的 title 把「从哪来、到哪去」说清楚。 */
+export function bridgeTag(candidate) {
+  if (!candidate || !candidate.bridged) return '';
+  const from = PROTO_SHORT[candidate.group_protocol] || candidate.group_protocol || '?';
+  const to = PROTO_SHORT[candidate.expose_protocol] || candidate.expose_protocol || '?';
+  return ` <span class="tag tag-accent" title="上游走 ${esc(from)}，网关会转换后按 ${esc(to)} 暴露给你">桥接</span>`;
+}
+
 /* 接口 = 一条请求走哪种线格式，也就是它打进来的那个路径。列表由后端描述符的只读投影
    在启动时填入；下面几个映射仍是给现有调用点用的派生值，不再在前端另登记协议 ID。 */
 export let PROTO_INFO = Object.create(null);

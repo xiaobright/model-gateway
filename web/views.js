@@ -5,7 +5,8 @@
 
 import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft, protocolOn,
-  catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
+  catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, bridgeTag,
+  PROTO_LABEL, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -259,11 +260,13 @@ function chipHtml(model, c, showGroup, showRemote, activeRouteId) {
   const cd = cool
     ? ` <span class="tag tag-warn" title="连续失败 ${c.fails} 次，冷却期内自动降级会跳过它">`
       + `冷却 ${fmtLeft(c.cooling_ms)}</span>` : '';
+  // 桥接：这条候选的上游是另一种接口，网关会在中间做格式转换
+  const bridge = bridgeTag(c);
   const full = named ? `${label} · ${bare}` : label;
   const tip = active ? '当前实际使用的候选' : (c.is_active ? '保存的首选候选' : `切到 ${full}`);
   return `<span class="${cls}" data-rid="${c.route_id}">
     <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"
-            data-rid="${c.route_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
+            data-rid="${c.route_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${bridge}${cd}${off}</button>
     <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"
             data-rid="${c.route_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
     <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"
@@ -777,8 +780,13 @@ function logRow(r) {
   const remote = r.remote_model ? ` <span class="dim">→ ${esc(r.remote_model)}</span>` : '';
   const modelTip = r.remote_model ? `${r.model} → ${r.remote_model}` : r.model;
   const proto = r.protocol || '';
+  // 协议列写的是**客户端**用的线格式。开了桥接的候选上游其实是另一种格式，
+  // 所以补一个「转换」标 —— 不标的话，看到一条 Chat 分组上的模型却记着 OpenAI 协议会以为记错了
+  const xlat = r.converted
+    ? ' <span class="tag tag-accent" title="这条经协议转换发给上游（候选开了「转换为该接口暴露」）">转换</span>'
+    : '';
   const protoCell = proto
-    ? `<span class="tag${proto === 'anthropic' ? ' tag-accent' : ''}">${esc(PROTO_LABEL[proto] || proto)}</span>`
+    ? `<span class="tag${proto === 'anthropic' ? ' tag-accent' : ''}">${esc(PROTO_LABEL[proto] || proto)}</span>${xlat}`
     : '<span class="dim">—</span>';
   // 分组名只在不是「默认」时才写出来，不然每一行都拖一条没信息量的尾巴
   const grp = r.group_name && r.group_name !== '默认'

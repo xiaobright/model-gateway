@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
-from . import config, naming
+from . import config, naming, protocols
 from .reqlog import log
 from .upstream import normalize_base
 
@@ -31,8 +31,15 @@ _ROUTE_COLUMNS = """
   remote_model TEXT NOT NULL,
   is_active INTEGER NOT NULL DEFAULT 0,
   priority INTEGER NOT NULL DEFAULT 0,
+  expose_protocol TEXT NOT NULL DEFAULT '',
   UNIQUE(model_name, group_id, remote_model)
 """
+
+# 「这条候选对下游暴露成哪个协议」的 SQL 写法。候选自己开了 expose_protocol 就用它，
+# 否则等于它所在分组的接口。凡是按「模型在哪个接口下」筛选/分组的地方都必须用它 ——
+# 拿 g.protocol 去比会把桥接候选（分组是 openai-chat、暴露成 openai）整条漏掉，
+# 现象是「Codex 发 /v1/responses 说模型没配过」。
+_EFFECTIVE_PROTOCOL = "COALESCE(NULLIF(m.expose_protocol,''), g.protocol)"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS upstreams(
@@ -85,7 +92,8 @@ CREATE TABLE IF NOT EXISTS request_log(
   cached_tokens INTEGER,
   cache_creation_tokens INTEGER,
   note TEXT NOT NULL DEFAULT '',
-  attempt INTEGER NOT NULL DEFAULT 1
+  attempt INTEGER NOT NULL DEFAULT 1,
+  converted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS settings(
   key TEXT PRIMARY KEY,
@@ -106,7 +114,8 @@ LOG_KEEP_ROWS = 2000
 #   3 = 接口在分组上，候选有自增 id
 #   4 = request_log 记录 Anthropic 的缓存创建 token
 #   5 = 上游模型目录（group_models）与下游候选分开
-SCHEMA_VERSION = 5
+#   6 = 候选可以带 expose_protocol（协议桥接开关），转发记录带 converted
+SCHEMA_VERSION = 6
 
 # 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
 BACKUP_KEEP = 3
@@ -123,7 +132,11 @@ class DuplicateBaseUrl(Exception):
 
 
 class ProtocolMismatch(Exception):
-    """候选和模型的接口不一致。args = (模型已在的接口, 这个分组的接口)。"""
+    """候选和模型的接口不一致。args = (模型已在的接口, 这条候选的有效接口)。"""
+
+
+class UnsupportedBridge(Exception):
+    """候选想暴露成的协议还没有实现桥接。args = (分组协议, 想暴露成的协议)。"""
 
 
 class DuplicateRemote(Exception):
@@ -170,6 +183,10 @@ class Route:
     # 候选自己的主键。一个分组下同一个模型名可以有多条（各指一个不同的上游真名），
     # 所以「哪一条」只能用它指，不能再用 group_id
     route_id: int = 0
+    # 这个候选所在分组的接口，以及它要暴露成的协议。两者不同 = 这条候选走
+    # gateway/bridge 的格式转换（`protocols.is_bridged`）
+    group_protocol: str = ""
+    expose_protocol: str = ""
 
 
 @contextmanager
@@ -415,14 +432,19 @@ def _backfill_log_protocol(conn: sqlite3.Connection) -> None:
 
 
 def _warn_mixed_models(conn: sqlite3.Connection) -> None:
-    """一个模型名的候选应该同接口。迁移前的库没这个约束（比如把只跑过 GPT 的站
-    手动标成了 Claude），出现了就记一行日志，让人知道该去改哪个。"""
-    rows = conn.execute("""
-        SELECT m.model_name, COUNT(DISTINCT g.protocol) AS kinds
+    """一个模型名的候选应该暴露成同一个协议。迁移前的库没这个约束（比如把只跑过 GPT 的站
+    手动标成了 Claude），出现了就记一行日志，让人知道该去改哪个。
+
+    比的是**有效协议**（开了桥接的候选按 expose_protocol 算），不是分组协议 ——
+    「原生 Responses 候选 + 桥接候选」混排是允许的（方案决策 2），两种分组的协议
+    天然不同，按分组协议比会天天误报。
+    """
+    rows = conn.execute(f"""
+        SELECT m.model_name, COUNT(DISTINCT {_EFFECTIVE_PROTOCOL}) AS kinds
         FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id
         GROUP BY m.model_name HAVING kinds > 1""").fetchall()
     for row in rows:
-        log(f"WARN model {row['model_name']!r} has candidates on more than one protocol")
+        log(f"WARN model {row['model_name']!r} is exposed on more than one protocol")
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
@@ -443,6 +465,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         "model_routes": [
             # 自动降级的尝试顺序：小的先试。0 = 还没排过，按 group_id 兜底
             ("priority", "INTEGER NOT NULL DEFAULT 0"),
+            # 这条候选经协议桥接暴露成哪个协议。'' = 原生（走分组自己的接口）
+            ("expose_protocol", "TEXT NOT NULL DEFAULT ''"),
         ],
         "request_log": [
             ("remote_model", "TEXT NOT NULL DEFAULT ''"),
@@ -458,6 +482,9 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             # Anthropic 的 input_tokens 不含 cache_read / cache_creation，统计时需要保留
             # 这两个分量，才能按协议算出真实上下文和缓存命中率。
             ("cache_creation_tokens", "INTEGER"),
+            # 这条记录是经协议转换发出去的（候选开了 expose_protocol）。排查「为什么
+            # 模型行为变了」时要一眼看出它走的是桥接
+            ("converted", "INTEGER NOT NULL DEFAULT 0"),
         ],
     }
     for table, columns in wanted.items():
@@ -792,7 +819,7 @@ def delete_group_model(group_id: int, remote_model: str) -> tuple[int, int]:
 def list_routes() -> tuple[dict, ...]:
     query = """
         SELECT m.id AS route_id, m.model_name, m.group_id, m.remote_model, m.is_active, m.priority,
-               g.name AS group_name, g.protocol, g.enabled AS group_enabled,
+               m.expose_protocol, g.name AS group_name, g.protocol, g.enabled AS group_enabled,
                u.id AS upstream_id, u.name AS upstream_name, u.enabled AS upstream_enabled
         FROM model_routes m
         JOIN upstream_groups g ON g.id = m.group_id
@@ -807,7 +834,8 @@ def get_route(route_id: int) -> dict | None:
     """一条候选的全貌（连分组名和供应商名）。给管理接口写日志、报错用。"""
     query = """
         SELECT m.id AS route_id, m.model_name, m.group_id, m.remote_model, m.is_active, m.priority,
-               g.name AS group_name, g.protocol, u.id AS upstream_id, u.name AS upstream_name
+               m.expose_protocol, g.name AS group_name, g.protocol, u.id AS upstream_id,
+               u.name AS upstream_name
         FROM model_routes m
         JOIN upstream_groups g ON g.id = m.group_id
         JOIN upstreams u ON u.id = g.upstream_id
@@ -843,26 +871,85 @@ def _group_protocol(conn: sqlite3.Connection, group_id: int) -> str:
     return row["protocol"] if row is not None else ""
 
 
-def _model_protocol(conn: sqlite3.Connection, model_name: str) -> str:
-    """模型在哪个接口下暴露 = 它任一候选所在分组的接口（优先看活跃的那条）。
-    没有候选就返回空串 —— 这个模型名还不存在。"""
-    row = conn.execute(
-        "SELECT g.protocol FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
-        " WHERE m.model_name=? ORDER BY m.is_active DESC, m.id LIMIT 1",
-        (model_name,),
-    ).fetchone()
-    return row["protocol"] if row is not None else ""
+def effective_protocol(group_protocol: str, expose_protocol: str) -> str:
+    """这条候选对下游暴露成哪个协议。空 expose_protocol = 原生，就是分组的接口。"""
+    return expose_protocol or group_protocol
 
 
-def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
+def _model_protocol(
+    conn: sqlite3.Connection, model_name: str, exclude_route_id: int | None = None
+) -> str:
+    """模型在哪个接口下暴露 = 它任一候选的**有效协议**（优先看活跃的那条）。
+    没有候选就返回空串 —— 这个模型名还不存在。
+
+    有效协议而不是分组协议，是因为一个模型名底下可以同时挂原生候选和桥接候选
+    （方案决策 2）：前者在 Responses 下，后者在 openai-chat 下但暴露成 Responses，
+    两者的有效协议都是 openai。
+
+    ``exclude_route_id`` 给「改某条候选自己的暴露方式」用：那条候选还在库里，
+    不排掉的话它会和自己刚算出来的新有效协议打架（409 自撞）。
+    """
+    sql = (
+        f"SELECT {_EFFECTIVE_PROTOCOL} AS proto FROM model_routes m"
+        " JOIN upstream_groups g ON g.id = m.group_id"
+        " WHERE m.model_name=?"
+    )
+    args: list[object] = [model_name]
+    if exclude_route_id is not None:
+        sql += " AND m.id != ?"
+        args.append(exclude_route_id)
+    rows = conn.execute(sql + " ORDER BY m.is_active DESC, m.id", args).fetchall()
+    if not rows:
+        return ""
+    protos = {row["proto"] for row in rows if row["proto"]}
+    if len(protos) == 1:
+        return next(iter(protos))
+    # 混着（老库手改出来的）：返回活跃那条的，至少 404 文案里说的是个真存在的东西。
+    # 迁移时会把这些名字记进日志
+    return rows[0]["proto"] or ""
+
+
+def _validate_candidate_protocol(
+    conn: sqlite3.Connection,
+    model_name: str,
+    group_id: int,
+    expose_protocol: str,
+    exclude_route_id: int | None = None,
+) -> str:
+    """校验候选的接口，返回它的**有效协议**（下游看到的那个）。
+
+    - 空 `expose_protocol` = 原生：有效协议就是分组自己的接口。
+    - 非空 = 桥接：必须是 `protocols.BRIDGES` 里登记过的组合。没实现的组合在保存
+      配置时就拒掉 —— 攒到第一个请求才报「不支持」等于把配置错误伪装成线上故障。
+    - 同一个模型名的所有候选必须暴露成同一个协议，否则「这个名字在哪个接口下暴露」
+      就没有答案了（这也是 404 文案和 /v1/models 的依据）。
+
+    ``exclude_route_id``：改一条已有候选的暴露方式时要把自己排掉，否则它会拿**旧**
+    的有效协议去和刚算出来的**新**有效协议对比，自己和自己撞 409。
+    """
+    group_protocol = _group_protocol(conn, group_id)
+    wanted = (expose_protocol or "").strip()
+    if wanted and not protocols.bridge_supported(group_protocol, wanted):
+        raise UnsupportedBridge(group_protocol, wanted)
+    mine = effective_protocol(group_protocol, wanted)
+    theirs = _model_protocol(conn, model_name, exclude_route_id)
+    if theirs and theirs != mine:
+        raise ProtocolMismatch(theirs, mine)
+    return mine
+
+
+def add_model_route(
+    model_name: str, group_id: int, remote_model: str, expose_protocol: str = ""
+) -> int:
     """新增一个候选，返回它的 id；该模型的第一个候选自动成为活跃候选。已存在则返回 0。
 
     「已存在」是「同一个分组下已经有一条映射到同一个上游真名的候选」。同一个分组下
     **允许**同一个模型名的多条候选，只要各指一个不同的上游真名 —— 一个站常有好几个
     能用的模型 id，把它们排成一条链比只能挑一个有用。
 
-    模型的接口就是候选所在分组的接口，所以同一个模型名的候选必须全在同一种接口上，
-    否则「这个名字在哪个接口下暴露」就没有答案了。"""
+    模型的接口由候选决定，所以同一个模型名的候选必须暴露成同一种接口（见
+    `_validate_candidate_protocol`）。**允许**「原生候选 + 桥接候选」混在一条链上：
+    前者的分组就是 Responses 站，后者是 openai-chat 站但开了 expose_protocol=openai。"""
     with _conn() as conn:
         exists = conn.execute(
             "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
@@ -870,10 +957,7 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
         ).fetchone()
         if exists:
             return 0
-        mine = _group_protocol(conn, group_id)
-        theirs = _model_protocol(conn, model_name)
-        if theirs and theirs != mine:
-            raise ProtocolMismatch(theirs, mine)
+        _validate_candidate_protocol(conn, model_name, group_id, expose_protocol)
         count = conn.execute(
             "SELECT COUNT(*) AS n FROM model_routes WHERE model_name=?", (model_name,)
         ).fetchone()["n"]
@@ -889,9 +973,11 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
             (group_id, remote_model),
         )
         cur = conn.execute(
-            "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
-            " VALUES(?,?,?,?,?)",
-            (model_name, group_id, remote_model, 1 if count == 0 else 0, nxt),
+            "INSERT INTO model_routes"
+            "(model_name, group_id, remote_model, is_active, priority, expose_protocol)"
+            " VALUES(?,?,?,?,?,?)",
+            (model_name, group_id, remote_model, 1 if count == 0 else 0, nxt,
+             (expose_protocol or "").strip()),
         )
     return int(cur.lastrowid)
 
@@ -917,10 +1003,18 @@ def transfer_model_routes(
         ).fetchall()
         if len(rows) != len(ids) or any(row["model_name"] != source for row in rows):
             raise RouteTransferConflict("来源候选已经变化，请刷新后重试")
-        protocol = _group_protocol(conn, rows[0]["group_id"])
+        # 比的是**有效协议**（开了桥接的按 expose_protocol 算），整批一起搬 ——
+        # 一条链上只能有一种有效协议，否则「这个模型在哪个接口下」就没有答案
+        protocol = effective_protocol(_group_protocol(conn, rows[0]["group_id"]), rows[0]["expose_protocol"])
         target_protocol = _model_protocol(conn, target)
-        if any(_group_protocol(conn, row["group_id"]) != protocol for row in rows):
-            raise RouteTransferConflict("来源候选的协议不一致")
+        for row in rows:
+            mine = effective_protocol(_group_protocol(conn, row["group_id"]), row["expose_protocol"])
+            if mine != protocol:
+                raise RouteTransferConflict("来源候选的协议不一致")
+            if row["expose_protocol"] and not protocols.bridge_supported(
+                _group_protocol(conn, row["group_id"]), row["expose_protocol"]
+            ):
+                raise UnsupportedBridge(_group_protocol(conn, row["group_id"]), row["expose_protocol"])
         if target_protocol and target_protocol != protocol:
             raise ProtocolMismatch(target_protocol, protocol)
         preferred = next((row["id"] for row in rows if row["is_active"]), rows[0]["id"])
@@ -939,10 +1033,12 @@ def transfer_model_routes(
                 result_ids.append(existing["id"])
                 continue
             cur = conn.execute(
-                "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
-                " VALUES(?,?,?,?,?)",
+                "INSERT INTO model_routes"
+                "(model_name, group_id, remote_model, is_active, priority, expose_protocol)"
+                " VALUES(?,?,?,?,?,?)",
                 (target, row["group_id"], row["remote_model"],
-                 int(not target_protocol and row["id"] == preferred), next_priority),
+                 int(not target_protocol and row["id"] == preferred), next_priority,
+                 row["expose_protocol"]),
             )
             result_ids.append(int(cur.lastrowid))
             next_priority += 1
@@ -961,18 +1057,36 @@ def transfer_model_routes(
         }
 
 
-def update_model_route(route_id: int, remote_model: str) -> bool:
-    """只改「上游那边的真实模型名」。1M 开关也是它 —— 存成 `名字[1m]` 后缀。"""
+def update_model_route(
+    route_id: int, remote_model: str, expose_protocol: str | None = None
+) -> bool:
+    """改「上游那边的真实模型名」，以及（可选）这条候选暴露成的协议。
+
+    1M 开关也走 remote_model —— 存成 `名字[1m]` 后缀。
+    `expose_protocol=None` 表示不动它；传 `""` 是「改回原生」，和「不改」是两件事，
+    所以不能用 None 表意。
+    """
     with _conn() as conn:
-        row = conn.execute("SELECT group_id FROM model_routes WHERE id=?", (route_id,)).fetchone()
-        try:
-            cur = conn.execute(
-                "UPDATE model_routes SET remote_model=? WHERE id=?", (remote_model, route_id)
+        row = conn.execute(
+            "SELECT group_id, model_name FROM model_routes WHERE id=?", (route_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        sets = ["remote_model=?"]
+        args: list = [remote_model]
+        if expose_protocol is not None:
+            _validate_candidate_protocol(
+                conn, row["model_name"], row["group_id"], expose_protocol, exclude_route_id=route_id
             )
+            sets.append("expose_protocol=?")
+            args.append(expose_protocol.strip())
+        args.append(route_id)
+        try:
+            cur = conn.execute(f"UPDATE model_routes SET {', '.join(sets)} WHERE id=?", args)
         except sqlite3.IntegrityError as exc:
             # 改成了同分组里另一条候选已经用着的真名，那两条就完全一样了
             raise DuplicateRemote(remote_model) from exc
-        if row is not None and cur.rowcount:
+        if cur.rowcount:
             # 改出来的新真名也是这个站的上游模型，登记一下；旧名保留在目录里
             conn.execute(
                 "INSERT OR IGNORE INTO group_models(group_id, remote_model) VALUES(?,?)",
@@ -1055,8 +1169,9 @@ def _tier_match(conn: sqlite3.Connection, model_name: str, protocol: str) -> str
     names = [
         r["model_name"]
         for r in conn.execute(
-            "SELECT DISTINCT m.model_name FROM model_routes m"
-            " JOIN upstream_groups g ON g.id = m.group_id WHERE g.protocol=?",
+            f"SELECT DISTINCT m.model_name FROM model_routes m"
+            " JOIN upstream_groups g ON g.id = m.group_id"
+            f" WHERE {_EFFECTIVE_PROTOCOL}=?",
             (protocol,),
         )
     ]
@@ -1071,7 +1186,9 @@ def resolve_route(model_name: str, protocol: str) -> Route | None:
     """按「模型名 + 接口」找当前生效的分组；返回的 Route 里 model_name 是实际命中的那条配置。
 
     接口参与匹配：模型是挂在某个接口的分组上的，拿 Anthropic 的请求体去打人家的
-    /v1/responses 只会得到垃圾，所以跨接口一律当没配过。
+    /v1/responses 只会得到垃圾，所以跨接口一律当没配过。**开了桥接的候选算在这个接口
+    下** —— `expose_protocol` 就是「这条候选从这里暴露出去」的意思，Codex 打
+    /v1/responses 能命中一个 openai-chat 分组上的候选，前提正是它开了桥接。
 
     精确找不到时按档位关键字兜一次。Claude Code 发来的是具体 id（`claude-opus-5`、
     `claude-haiku-4-5-20251001` 之类），只有把它那几个 `ANTHROPIC_DEFAULT_*_MODEL`
@@ -1084,12 +1201,17 @@ def resolve_route(model_name: str, protocol: str) -> Route | None:
     return chain[0] if chain else None
 
 
-_CHAIN_QUERY = """
-    SELECT u.*, m.id AS route_id, g.id AS group_id, g.name AS group_name, g.api_key, m.remote_model
+# 原生候选（分组接口 == 请求接口，expose 为空）+ 暴露成这个接口的桥接候选，一起排。
+# 这样「原生 Responses 候选 + 桥接候选」能按 is_active/priority 混排成一条降级链
+# （方案决策 2），灰度时先挂一条桥接候选试水、不行就落到原生的那份配置上。
+_CHAIN_QUERY = f"""
+    SELECT u.*, m.id AS route_id, g.id AS group_id, g.name AS group_name, g.api_key, m.remote_model,
+           m.expose_protocol AS expose_protocol, g.protocol AS group_protocol
     FROM model_routes m
     JOIN upstream_groups g ON g.id = m.group_id
     JOIN upstreams u ON u.id = g.upstream_id
-    WHERE m.model_name=? AND g.protocol=? AND u.enabled=1 AND g.enabled=1
+    WHERE m.model_name=? AND ((g.protocol=? AND m.expose_protocol='') OR m.expose_protocol=?)
+      AND u.enabled=1 AND g.enabled=1
     ORDER BY m.is_active DESC, m.priority, m.id
 """
 
@@ -1182,10 +1304,14 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
     """
     with _conn() as conn:
         matched = model_name
-        rows = conn.execute(_CHAIN_QUERY, (model_name, protocol)).fetchall()
+        rows = conn.execute(_CHAIN_QUERY, (model_name, protocol, protocol)).fetchall()
         if not rows:
             matched = _tier_match(conn, model_name, protocol)
-            rows = conn.execute(_CHAIN_QUERY, (matched, protocol)).fetchall() if matched else []
+            rows = (
+                conn.execute(_CHAIN_QUERY, (matched, protocol, protocol)).fetchall()
+                if matched
+                else []
+            )
     return tuple(
         Route(
             model_name=matched,
@@ -1194,6 +1320,8 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
             group_id=row["group_id"],
             group_name=row["group_name"],
             route_id=row["route_id"],
+            group_protocol=row["group_protocol"],
+            expose_protocol=row["expose_protocol"],
         )
         for row in rows
     )
@@ -1206,14 +1334,18 @@ def protocol_of_model(model_name: str) -> str:
 
 
 def exposed_models(protocol: str = "") -> tuple[str, ...]:
-    """对下游暴露的模型清单。停用的接口不算暴露 —— 客户端不该看见调不动的名字。"""
+    """对下游暴露的模型清单。停用的接口不算暴露 —— 客户端不该看见调不动的名字。
+
+    按**有效协议**过滤：桥接候选的分组是 openai-chat，但它暴露在 Responses 下，
+    拿 g.protocol 去比会让 Codex 的 /v1/models 里少掉这些名字。
+    """
     query = (
-        "SELECT DISTINCT m.model_name, g.protocol FROM model_routes m"
+        f"SELECT DISTINCT m.model_name, {_EFFECTIVE_PROTOCOL} AS protocol FROM model_routes m"
         " JOIN upstream_groups g ON g.id = m.group_id"
     )
     args: tuple = ()
     if protocol:
-        query += " WHERE g.protocol=?"
+        query += f" WHERE {_EFFECTIVE_PROTOCOL}=?"
         args = (protocol,)
     disabled = disabled_protocols()
     with _conn() as conn:
@@ -1258,16 +1390,19 @@ def insert_request(
     resp_text_bytes: int = 0,
     thinking: bool = False,
     cache_creation_tokens: int | None = None,
+    converted: bool = False,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             "INSERT INTO request_log(client, model, remote_model, protocol, upstream, group_name,"
             " status, stream, req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens,"
-            " cached_tokens, cache_creation_tokens, note, attempt, resp_text_bytes, thinking)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " cached_tokens, cache_creation_tokens, note, attempt, resp_text_bytes, thinking,"
+            " converted)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (client, model, remote_model, protocol, upstream, group_name, status, int(stream),
              req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens,
-             cache_creation_tokens, note, attempt, resp_text_bytes, int(thinking)),
+             cache_creation_tokens, note, attempt, resp_text_bytes, int(thinking),
+             int(converted)),
         )
         conn.execute(
             "DELETE FROM request_log WHERE id <= (SELECT MAX(id) - ? FROM request_log)", (LOG_KEEP_ROWS,)

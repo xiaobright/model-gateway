@@ -378,6 +378,12 @@
         <input type="checkbox" id="rt-onem">
         <span>按 1M 上下文请求（真名存成 <code>名字[1m]</code>，转发时摘掉后缀、补 beta 头）</span>
       </label>
+      <label class="checkline" id="rt-bridge-wrap" style="margin-top:12px" hidden>
+        <input type="checkbox" id="rt-bridge">
+        <span>转换为该接口暴露（网关在中间改请求/响应格式）
+          <span class="dim" id="rt-bridge-hint" style="display:block;font-size:12px"></span>
+        </span>
+      </label>
     </div>
     <div class="dlg-foot">
       <span class="grow"></span>

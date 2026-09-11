@@ -231,6 +231,12 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             return gone
         if body.get("fail"):
             return JSONResponse({"error": {"message": "quota exhausted"}}, status_code=429)
+        # 桥接测试要能脚本化：站的行为差异（有/没有 reasoning、工具参数分几块、
+        # usage 缺不缺、[DONE] 缺不缺、中途断流）全在这里演
+        sick["last_chat"] = body
+        script = sick.get("chat")
+        if isinstance(script, dict):
+            return scripted_chat(script)
         if body.get("stream"):
             mode = body.get("mode", "")
 
@@ -438,7 +444,7 @@ class MockUpstream:
         self.base_url = f"http://127.0.0.1:{self.port}"
         # 运行中可翻转的「病历」：设了 status 就一律回那个码，用来演故障与恢复；
         # missing 里的模型名一律回 404，用来演「这个站把某个模型 id 下掉了」
-        self.sick: dict = {"status": None, "missing": set()}
+        self.sick: dict = {"status": None, "missing": set(), "chat": None, "last_chat": None}
         self.app = build_upstream_app(name, self.sick)
         self._server = uvicorn.Server(
             uvicorn.Config(
@@ -457,6 +463,14 @@ class MockUpstream:
     def heal(self) -> None:
         self.sick["status"] = None
         self.sick["missing"] = set()
+
+    def script_chat(self, **script: object) -> None:
+        """让这个站的 /v1/chat/completions 按脚本回（见 scripted_chat）。"""
+        self.sick["chat"] = script
+
+    def last_chat_request(self) -> dict:
+        """这个站最近一次收到的 chat 请求体 —— 用来断言「网关发出去的形状」。"""
+        return self.sick.get("last_chat") or {}
 
     def last_responses_request(self) -> dict:
         """这个站最近一次收到的 Responses 请求体（透传规范化测试用）。"""
@@ -479,6 +493,95 @@ class MockUpstream:
 
 
 DEFAULT_GROUP = "默认"
+
+
+def _split_every(text: str, size: int) -> list[str]:
+    return [text[start : start + size] for start in range(0, len(text), size)] or [""]
+
+
+def scripted_chat(script: dict) -> object:
+    """按脚本产出一个 chat 响应，用来演各种上游站的行为差异。
+
+    脚本字段（都能省）：
+
+    - ``stream``（默认 True）：False 就是非流式 JSON。
+    - ``reasoning`` / ``text``：会切成小块发，模拟 token 级流。
+    - ``tool_calls``：``[{"id", "name", "arguments"(对象或字符串), "arg_split"(默认 8)}]``，
+      参数按 `arg_split` 切片，用来验「参数跨多块拼接」。
+    - ``finish_reason``（默认 stop）、``usage``（None = **完全不报** usage）。
+    - ``no_done``：流末不发 ``[DONE]``。
+    - ``truncate``：发完内容就断，不给收尾块（演劣质站/半路挂掉）。
+    """
+
+    def chunk(delta: dict, finish_reason: str | None = None) -> dict:
+        return {
+            "id": "chatcmpl-script", "object": "chat.completion.chunk", "created": 1757500000,
+            "model": script.get("model", "upstream-model"),
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+
+    tool_calls = script.get("tool_calls") or []
+    usage = script.get("usage", chat_usage())
+    finish_reason = script.get("finish_reason") or ("tool_calls" if tool_calls else "stop")
+
+    if script.get("json_mode") or not script.get("stream", True):
+        message: dict = {"role": "assistant", "content": script.get("text")}
+        if script.get("reasoning"):
+            message["reasoning_content"] = script["reasoning"]
+        if tool_calls:
+            message["tool_calls"] = [
+                {
+                    "id": call["id"], "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call["arguments"]
+                        if isinstance(call["arguments"], str)
+                        else json.dumps(call["arguments"], ensure_ascii=False),
+                    },
+                }
+                for call in tool_calls
+            ]
+        payload: dict = {
+            "id": "chatcmpl-script", "object": "chat.completion", "created": 1757500000,
+            "model": script.get("model", "upstream-model"),
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            payload["usage"] = usage
+        return JSONResponse(payload)
+
+    async def gen():
+        yield f"data: {json.dumps(chunk({'role': 'assistant', 'content': ''}))}\n\n".encode()
+        if script.get("reasoning"):
+            for piece in _split_every(script["reasoning"], 6):
+                yield f"data: {json.dumps(chunk({'reasoning_content': piece}))}\n\n".encode()
+        if script.get("text"):
+            for piece in _split_every(script["text"], 5):
+                yield f"data: {json.dumps(chunk({'content': piece}))}\n\n".encode()
+        for index, call in enumerate(tool_calls):
+            arguments = (
+                call["arguments"] if isinstance(call["arguments"], str)
+                else json.dumps(call["arguments"], ensure_ascii=False)
+            )
+            for position, piece in enumerate(_split_every(arguments, call.get("arg_split", 8))):
+                tool = {
+                    "index": index, "type": "function",
+                    "function": {"arguments": piece} if position else
+                    {"name": call["name"], "arguments": piece},
+                }
+                if position == 0:
+                    tool["id"] = call["id"]
+                yield f"data: {json.dumps(chunk({'tool_calls': [tool]}))}\n\n".encode()
+        if script.get("truncate"):
+            return
+        final = chunk({}, finish_reason)
+        if usage is not None:
+            final["usage"] = usage
+        yield f"data: {json.dumps(final)}\n\n".encode()
+        if not script.get("no_done"):
+            yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 def add_upstream(
@@ -523,11 +626,25 @@ def provider_id(client: httpx.Client, name: str) -> int:
     return int(row["id"])
 
 
-def add_route(client: httpx.Client, model_name: str, group_id: int, remote_model: str = "") -> int:
-    """加一个候选，返回它的 route_id —— 切换 / 改 / 删单条都按这个 id 指。"""
+def add_route(
+    client: httpx.Client,
+    model_name: str,
+    group_id: int,
+    remote_model: str = "",
+    expose_protocol: str = "",
+) -> int:
+    """加一个候选，返回它的 route_id —— 切换 / 改 / 删单条都按这个 id 指。
+
+    ``expose_protocol`` 非空 = 这条候选经协议转换暴露成那个协议（见 gateway/bridge）。
+    """
     resp = client.post(
         "/admin/api/models",
-        json={"model_name": model_name, "group_id": group_id, "remote_model": remote_model},
+        json={
+            "model_name": model_name,
+            "group_id": group_id,
+            "remote_model": remote_model,
+            "expose_protocol": expose_protocol,
+        },
     )
     assert resp.status_code == 200, resp.text
     return int(resp.json()["route_id"])
@@ -601,3 +718,71 @@ def wait_inflight(client: httpx.Client, ready, timeout: float = 6.0) -> dict:
             return data
         time.sleep(0.05)
     raise AssertionError(f"inflight 没等到期望的状态: {data}")
+
+
+# ---------------------------------------------------------------- 协议桥接的语料
+
+
+def chat_chunk(delta: dict, *, finish_reason: str | None = None, usage: dict | None = None,
+               cid: str = "chatcmpl-1", created: int = 1757500000,
+               model: str = "upstream-model") -> dict:
+    """一个 Chat Completions 的流式 chunk。"""
+    chunk: dict = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
+
+
+def chat_tool_delta(index: int, *, call_id: str | None = None, name: str | None = None,
+                    arguments: str | None = None) -> dict:
+    """工具调用的一次增量。id 和 name 只在第一块里出现，之后只有 index + 参数片段。"""
+    function: dict = {}
+    if name is not None:
+        function["name"] = name
+    if arguments is not None:
+        function["arguments"] = arguments
+    call: dict = {"index": index, "type": "function", "function": function}
+    if call_id is not None:
+        call["id"] = call_id
+    return call
+
+
+def chat_usage(prompt: int = 120, completion: int = 30, cached: int = 80,
+               reasoning: int = 0) -> dict:
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": {"cached_tokens": cached},
+        "completion_tokens_details": {"reasoning_tokens": reasoning},
+    }
+
+
+def sse_chunks(*chunks: dict, done: bool = True) -> bytes:
+    """一串 chat chunk -> 上游 SSE 字节（末尾可选 [DONE]）。"""
+    body = b"".join(
+        f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode() for chunk in chunks
+    )
+    return body + (b"data: [DONE]\n\n" if done else b"")
+
+
+def bridge_events(raw: bytes) -> list[dict]:
+    """把桥接输出的 SSE 字节摊成事件 dict 列表（[DONE] 不算事件）。"""
+    events: list[dict] = []
+    for line in raw.decode("utf-8").splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        events.append(json.loads(line[len("data: "):]))
+    return events
+
+
+def codex_request() -> dict:
+    """Codex Desktop 的真实请求形状（缩小版），见 tests/fixture/。"""
+    path = Path(__file__).parent / "fixture" / "codex_responses_request.json"
+    return json.loads(path.read_text(encoding="utf-8"))

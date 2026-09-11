@@ -205,3 +205,33 @@ def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
         with pytest.raises(httpx.HTTPError) as ei:
             asyncio.run(through(bare))
         assert "certificate" in str(ei.value).lower()
+
+
+def test_input_item_census_records_the_role_alongside_the_type():
+    """抓形状时连 role 一起记 —— `role: "developer"` 这个坑就是这么被看出来的。
+
+    Codex Desktop 的 "responses lite" 线格式不发顶层 `instructions`，系统提示词是
+    `role: "developer"` 的 message item。只数 type 会看到「一堆普通 message」，
+    什么都看不出来；把 role 记下来，下次抓包一眼就知道该映射哪一个。
+    """
+    from gateway.proxy import _input_item_census
+
+    types, roles = _input_item_census({
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": []},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "sys"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            "just a string",
+        ],
+    })
+
+    assert types == {"additional_tools": 1, "message": 2, "reasoning": 1, "str": 1}
+    assert roles == {"additional_tools:developer": 1, "message:developer": 1, "message:user": 1}
+
+
+def test_input_item_census_handles_a_scalar_input():
+    from gateway.proxy import _input_item_census
+
+    types, roles = _input_item_census({"input": "hello"})
+    assert types == {"str": 1} and roles == {}

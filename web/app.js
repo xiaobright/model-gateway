@@ -11,6 +11,7 @@ import {
   catalogOfGroup, catalogOfUpstream, routeCountOfGroup, routeCountOfUpstream,
   groupLabel, upstreamOfGroup, groupOf, protocolOn,
   supportsIface, groupsOfIface, splitOneM, withOneM,
+  groupsForExpose, isBridgedPair, supportsExpose,
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
@@ -429,18 +430,51 @@ function upstreamsFor(iface) {
   return state.upstreams.filter((u) => supportsIface(u, iface));
 }
 
+/* 候选弹窗的供应商池：除了原生支持这个接口的站，还要带上那些**能转换过来**的站
+   （openai 接口下的 openai-chat 站）。少了这一半，「给 Codex 挂一个 chat 站」这件事
+   在界面上根本走不到。 */
+function upstreamsForExpose(iface) {
+  return state.upstreams.filter((u) => supportsExpose(u, iface));
+}
+
 function fillUpstreamSelect(selectId, pool) {
   $(selectId).innerHTML = pool.map((u) =>
     `<option value="${u.id}">${esc(u.name)}${u.enabled ? '' : '（停用）'}</option>`).join('');
 }
 
-/** 供应商选好之后填它在这个接口下的分组 */
-function fillGroupSelect(selectId, upstreamId, iface) {
+/** 供应商选好之后填它在这个接口下的分组。
+
+    ``allowBridge`` 打开时把「转换后能暴露成这个接口」的分组也算进来，并标上「需转换」——
+    不给标记的话，同一个站的两个同名分组（一个 openai 一个 openai-chat）根本分不清
+    点的是哪一个。 */
+function fillGroupSelect(selectId, upstreamId, iface, allowBridge = false) {
   const up = state.upstreams.find((u) => u.id === Number(upstreamId));
-  const groups = up ? groupsOfIface(up, iface) : [];
-  $(selectId).innerHTML = groups.map((g) =>
-    `<option value="${g.id}">${esc(g.name)}${g.enabled ? '' : '（停用）'}</option>`).join('')
-    || '<option value="">（这个供应商没有这种接口的分组）</option>';
+  const groups = up ? (allowBridge ? groupsForExpose(up, iface) : groupsOfIface(up, iface)) : [];
+  $(selectId).innerHTML = groups.map((g) => {
+    const bridged = allowBridge && isBridgedPair(g.protocol, iface);
+    const tag = bridged ? `（${PROTO_SHORT[g.protocol] || g.protocol} 需转换）` : '';
+    return `<option value="${g.id}">${esc(g.name)}${tag}${g.enabled ? '' : '（停用）'}</option>`;
+  }).join('') || '<option value="">（这个供应商没有这种接口的分组）</option>';
+}
+
+/** 桥接勾选行：只有「选中的分组协议 ≠ 要暴露的协议」时才出现，默认勾上。
+
+    不勾就不能挂（后端 409：同一个模型名不能同时暴露成两种协议），所以默认勾上、
+    也允许取消 —— 取消之后由后端给出那句明确的报错，比前端自己编一套规则可靠。 */
+function syncBridgeRow() {
+  const wrap = $('rt-bridge-wrap');
+  if (!wrap) return;
+  const iface = $('rt-iface').value;
+  const group = groupOf(Number($('rt-group').value));
+  const needed = Boolean(group) && group.protocol !== iface;
+  wrap.hidden = !needed;
+  if (!needed) return;
+  const known = isBridgedPair(group.protocol, iface);
+  $('rt-bridge').checked = known;
+  $('rt-bridge').disabled = !known;
+  $('rt-bridge-hint').textContent = known
+    ? `这个分组走 ${PROTO_LABEL[group.protocol]}，请求会被转换后按 ${PROTO_LABEL[iface]} 暴露出去`
+    : `网关还没实现 ${PROTO_LABEL[group.protocol]} → ${PROTO_LABEL[iface]} 的转换，这个分组挂不上`;
 }
 
 /* ---------------------------------------------------------------- 供应商弹窗 */
@@ -805,9 +839,9 @@ function openRoute(model, rid) {
   const cand = row && rid ? row.candidates.find((c) => c.route_id === rid) : null;
   // 已有模型的接口已经定了；新增时跟当前分段（分段在「全部」就默认 OpenAI）
   const iface = row ? row.protocol : (state.iface || defaultProtocol());
-  const pool = upstreamsFor(iface);
+  const pool = upstreamsForExpose(iface);
   if (!pool.length) {
-    return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
+    return toast(`没有能挂到 ${PROTO_LABEL[iface]} 下的分组，先去「上游站点」给某个站加一个`, 'err');
   }
   state.editingCand = cand ? { model, rid } : null;
   routeRemoteSeq += 1;
@@ -824,10 +858,10 @@ function openRoute(model, rid) {
 
   if (cand) {
     $('rt-upstream').value = String(cand.upstream_id);
-    fillGroupSelect('rt-group', cand.upstream_id, iface);
+    fillGroupSelect('rt-group', cand.upstream_id, iface, true);
     $('rt-group').value = String(cand.group_id);
   } else {
-    fillGroupSelect('rt-group', $('rt-upstream').value, iface);
+    fillGroupSelect('rt-group', $('rt-upstream').value, iface, true);
   }
 
   const { bare, onem } = splitOneM(cand ? cand.remote_model : '');
@@ -835,6 +869,9 @@ function openRoute(model, rid) {
   $('rt-onem').checked = onem;
   $('rt-onem-wrap').hidden = iface !== 'anthropic';   // beta 头只有 Anthropic 那边有
   fillRemoteList(Number($('rt-group').value));
+  // 桥接勾选：分组协议和要暴露的协议不同时才出现
+  syncBridgeRow();
+  if (cand && $('rt-bridge-wrap').hidden === false) $('rt-bridge').checked = Boolean(cand.bridged);
   // 顺序只在「改某个候选」时能调：新增的那条还不在链上
   $('rt-order-wrap').hidden = !cand;
   orderHint();
@@ -916,13 +953,19 @@ async function saveRoute() {
     $('rt-remote').value.trim() || model,
     $('rt-onem').checked && !$('rt-onem-wrap').hidden,
   );
+  // 桥接开关只在这一行看得见时才发：看不见说明这个分组是原生的，
+  // 发个空串会把「不动它」变成「改回原生」，把已有的桥接候选悄悄关掉
+  const bridgeRowShown = !$('rt-bridge-wrap').hidden;
+  const expose = bridgeRowShown && $('rt-bridge').checked ? $('rt-iface').value : '';
   if (cand) {
-    await api('PUT', '/admin/api/models', { route_id: cand.rid, remote_model: remote });
+    const body = { route_id: cand.rid, remote_model: remote };
+    if (bridgeRowShown) body.expose_protocol = expose;
+    await api('PUT', '/admin/api/models', body);
   } else {
     const gid = Number($('rt-group').value);
     if (!gid) return toast('这个供应商没有对应接口的分组', 'err');
     await api('POST', '/admin/api/models', {
-      model_name: model, group_id: gid, remote_model: remote,
+      model_name: model, group_id: gid, remote_model: remote, expose_protocol: expose,
     });
   }
   await refreshConfig();
@@ -1488,12 +1531,16 @@ $('search-form').addEventListener('submit', (ev) => {
 
 // 供应商换了就把分组下拉重填一遍；接口换了连供应商池一起换
 $('rt-upstream').addEventListener('change', () => {
-  fillGroupSelect('rt-group', $('rt-upstream').value, $('rt-iface').value);
+  fillGroupSelect('rt-group', $('rt-upstream').value, $('rt-iface').value, true);
   fillRemoteList(Number($('rt-group').value));
+  syncBridgeRow();
 });
 
-// 分组定了才知道「上游真名」能填哪些
-$('rt-group').addEventListener('change', () => fillRemoteList(Number($('rt-group').value)));
+// 分组定了才知道「上游真名」能填哪些，也才知道要不要转换
+$('rt-group').addEventListener('change', () => {
+  fillRemoteList(Number($('rt-group').value));
+  syncBridgeRow();
+});
 
 // 搜索上游：供应商换了就重填它的 OpenAI 分组
 $('sr-upstream').addEventListener('change', () => {
@@ -1503,12 +1550,13 @@ $('sr-upstream').addEventListener('change', () => {
 
 $('rt-iface').addEventListener('change', () => {
   const iface = $('rt-iface').value;
-  const pool = upstreamsFor(iface);
-  if (!pool.length) toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」加一个`, 'err');
+  const pool = upstreamsForExpose(iface);
+  if (!pool.length) toast(`没有能挂到 ${PROTO_LABEL[iface]} 下的分组，先去「上游站点」加一个`, 'err');
   fillUpstreamSelect('rt-upstream', pool);
-  fillGroupSelect('rt-group', $('rt-upstream').value, iface);
+  fillGroupSelect('rt-group', $('rt-upstream').value, iface, true);
   fillRemoteList(Number($('rt-group').value));
   $('rt-onem-wrap').hidden = iface !== 'anthropic';
+  syncBridgeRow();
 });
 
 // 站根填/改的时候把补出来的两个地址实时显示出来，免得又把 /v1 带上
