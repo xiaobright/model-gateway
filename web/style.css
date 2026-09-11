@@ -848,10 +848,14 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .up-row button, .up-row input, .up-row a { cursor: default; }
 .up-row .btn, .up-row .switch, .up-row .tw { cursor: pointer; }
 .up-row.is-open > td { background: var(--hover); }
-/* 标记和分组数挤在一行；列窄了宁可整表横向滚动（card-body 已经 scroll-x），
+/* 表格比卡片宽时在卡片内滚动，而不是顶破整页 —— 以前这条只在窄屏（≤720px）
+   生效，但列内容是动态的（接口标签、长 URL、分组多了都变宽），宽屏窗口不够宽
+   时一样会溢出顶出去。所以只要溢出就滚，跟屏宽无关。 */
+.scroll-x { overflow-x: auto; }
+/* 标记和分组数挤在一行；列窄了宁可整表横向滚动（上面那条），
    也别让每个标签各占一行、把行高撑成三倍 */
 .up-sub { display: flex; gap: 5px; align-items: center; margin-top: 5px; flex-wrap: nowrap; }
-.tbl-upstreams { min-width: 900px; }
+.tbl-upstreams { min-width: 840px; }
 /* th 上的 width 只是建议，auto 布局照样会把这一列挤到一个按钮宽、让两个按钮上下叠。
    nowrap 把「两个按钮并排」变成这一列的最小内容宽度，布局就不会再挤它 */
 .tbl-upstreams td:last-child { white-space: nowrap; }
@@ -1169,7 +1173,6 @@ th.num { text-align: right; }
   .route { grid-template-columns: 1fr; }
   .route-actions { opacity: 1; }
   .route-side { display: none; }
-  .scroll-x { overflow-x: auto; }
   .scroll-x table { min-width: 660px; }
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .bar-row { grid-template-columns: minmax(0, 1fr) 60px 46px; }
