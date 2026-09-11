@@ -732,7 +732,16 @@ dialog {
   background: var(--glass-2); color: var(--ink);
   border: 1px solid var(--edge); border-radius: var(--r-lg);
   box-shadow: var(--shadow-2); padding: 0; width: 94%; max-width: 620px;
+  /* 不限高时弹窗会比视口还高，底部保存按钮被推出屏幕；表单自己限高 */
+  max-height: min(92vh, 900px);
+  display: flex; flex-direction: column;
   backdrop-filter: blur(36px) saturate(200%); -webkit-backdrop-filter: blur(36px) saturate(200%);
+}
+/* form 是 dialog 的唯一直接内容：头/体/脚都放在它里面，由它做 flex 列 */
+dialog > form {
+  display: flex; flex-direction: column;
+  min-height: 0; max-height: inherit;
+  overflow: hidden;
 }
 dialog::backdrop { background: rgba(30, 40, 60, .36); backdrop-filter: blur(10px); }
 :root[data-theme="dark"] dialog::backdrop { background: rgba(0, 0, 0, .6); }
@@ -759,8 +768,16 @@ dialog.sm { max-width: 420px; }
 }
 .dlg-x:hover { background: var(--hover); color: var(--ink); }
 .dlg-x:active { transform: scale(0.9); }
-.dlg-body { padding: 18px 20px; max-height: min(68vh, 640px); overflow: auto; }
+/* 占满 form 剩余高度，内容多了自己滚；不要用固定 max-height —— 字段一多，
+   下面的模型列表就被推出可视区，看起来像「滚不下去」 */
+.dlg-body {
+  flex: 1 1 auto; min-height: 0;
+  padding: 18px 20px;
+  overflow-y: auto; overflow-x: hidden;
+  overscroll-behavior: contain;
+}
 .dlg-foot {
+  flex: none;
   padding: 14px 20px; border-top: 1px solid var(--hair);
   display: flex; gap: 10px; justify-content: flex-end; align-items: center;
 }
@@ -802,10 +819,20 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .ug-row .switch::after { width: 15px; height: 15px; }
 .ug-row .switch:checked::after { transform: translateX(13px); }
 
+/* 上游模型勾选列表：单独一截滚动区。260px 只够四五条，列表一长就被裁掉；
+   拉高到 ~40vh，并保证滚动条可见，不用缩放网页才能点到底下的模型 */
 .picker {
-  max-height: 260px; overflow: auto; border: 1px solid var(--hair-2); border-radius: var(--r-sm);
+  max-height: min(42vh, 420px);
+  min-height: 140px;
+  overflow-y: auto; overflow-x: hidden;
+  overscroll-behavior: contain;
+  border: 1px solid var(--hair-2); border-radius: var(--r-sm);
   padding: 6px 8px; background: var(--glass-3); margin-top: 9px;
 }
+/* 6px 半透明滚动条几乎看不见，列表长了像「卡住滚不动」——这里加粗一点 */
+.picker::-webkit-scrollbar { width: 8px; }
+.picker::-webkit-scrollbar-thumb { background: var(--hair-2); border-radius: 999px; }
+.picker::-webkit-scrollbar-thumb:hover { background: var(--ink-3); }
 .picker label {
   display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px;
   font-family: var(--mono); font-size: 12.5px; cursor: pointer; color: var(--ink);
@@ -1151,8 +1178,18 @@ th.num { text-align: right; }
 .dot-crit { background: var(--crit); }
 .dot-off { background: var(--ink-3); }
 
-/* 自定义 Apple 极细悬浮滚动条 */
-.scroll-y { max-height: 480px; overflow-y: auto; margin: 0 -20px; padding: 0 20px; }
+/* 自定义 Apple 极细悬浮滚动条。
+   模型路由那张卡用它：高度跟视口走，模型多了卡片内滚，不用整页缩放。
+   负 margin 是为了滚动条贴卡片边缘（card-body 自带左右 padding）。 */
+.scroll-y {
+  max-height: min(52vh, 560px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0 -20px; padding: 0 20px;
+}
+.scroll-y::-webkit-scrollbar { width: 8px; }
+.scroll-y::-webkit-scrollbar-thumb { background: var(--hair-2); border-radius: 999px; }
+.scroll-y::-webkit-scrollbar-thumb:hover { background: var(--ink-3); }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
