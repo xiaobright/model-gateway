@@ -100,6 +100,14 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         code = sick.get("status")
         if not code:
             return None
+        # fail_times：先回 fail_times 次错误，然后自愈 —— 同站重试测试用
+        left = sick.get("fail_times")
+        if left is not None:
+            if left <= 0:
+                sick["status"] = None
+                sick.pop("fail_times", None)
+                return None
+            sick["fail_times"] = left - 1
         if sick.get("hang_body"):
             async def never() -> object:
                 # Send one empty body message so ASGITransport exposes the
@@ -447,8 +455,13 @@ class MockUpstream:
         )
         self._thread = threading.Thread(target=self._server.run, daemon=True)
 
-    def fail_with(self, status: int) -> None:
+    def fail_with(self, status: int, times: int | None = None) -> None:
+        """times 给了就只失败那么多次，然后自愈（同站重试用）。"""
         self.sick["status"] = status
+        if times is not None:
+            self.sick["fail_times"] = times
+        else:
+            self.sick.pop("fail_times", None)
 
     def drop_model(self, *names: str) -> None:
         """这个站不再认这几个模型 id（带日期后缀的那种最常被下掉）。"""

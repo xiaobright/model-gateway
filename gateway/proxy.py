@@ -555,18 +555,39 @@ async def forward(
             return -1
         return failover.next_index(candidates, index + 1, dead_groups)
 
+    async def same_retry_pause(delay_s: float) -> bool:
+        """同站重试前的间隔；客户端已经走了就返回 False。"""
+        if delay_s > 0:
+            end = time.monotonic() + delay_s
+            while time.monotonic() < end:
+                if await request.is_disconnected():
+                    return False
+                await asyncio.sleep(min(0.05, max(0.0, end - time.monotonic())))
+        return True
+
+    # 每个上游在本次请求里已经同站重试过几次（键是 upstream.id）
+    same_counts: dict[int, int] = {}
+    # True = 上一轮决定同站再发，本轮不把 attempt 加一（同站重试优先于换站降级）
+    same_mode = False
+
     # 这里是「自动降级」唯一安全的落点：状态码已经拿到手，但还没往下游发过任何字节，
     # 换个上游重试客户端完全无感。第一个字节一旦发出去就不能再换了。
+    # 同站重试也在这同一个落点：先吃供应商的 retry_rules，耗尽了才轮到换候选。
     while True:
         route = candidates[index]
-        attempt += 1
-        if attempt > 1:
+        if same_mode:
+            same_mode = False
+        else:
+            attempt += 1
+        if attempt > 1 or same_counts.get(route.upstream.id, 0) > 0:
             if await request.is_disconnected():
-                attempt -= 1
-                log(f"  客户端已经走了，不再降级（试过 {attempt} 个）")
+                if attempt > 1:
+                    attempt -= 1
+                log(f"  客户端已经走了，不再重试（试过 {attempt} 个）")
                 break
             if time.monotonic() - started > failover.START_DEADLINE:
-                attempt -= 1
+                if attempt > 1:
+                    attempt -= 1
                 log(f"  已经耗了 {time.monotonic() - started:.0f}s，不再开新尝试")
                 break
 
@@ -649,6 +670,30 @@ async def forward(
                 f"({exc.__class__.__name__}: {exc}) after {elapsed:.1f}s req={len(sent_body)}B"
                 f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
             )
+            # 连不上也算 502：供应商若把 502 写进了同站重试，就先原站再拨一把
+            delay = failover.same_retry_delay(
+                route.upstream.retry_rules, 502, same_counts.get(route.upstream.id, 0)
+            )
+            if delay is not None:
+                same_counts[route.upstream.id] = same_counts.get(route.upstream.id, 0) + 1
+                log(
+                    f"  同站重试：{route.upstream.name} 连不上，{delay:.2f}s 后再试"
+                    f"（第 {same_counts[route.upstream.id]} 次）"
+                )
+                inflight.failed(call, status=502, note="same_retry", ms=int(elapsed * 1000))
+                if record:
+                    _record(
+                        request=request, route=route, proto=proto, model=asked,
+                        remote_model=remote, status=502, stream_flag=stream_flag,
+                        req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                        usage=NO_USAGE, note="same_retry", attempt=attempt,
+                    )
+                if not await same_retry_pause(delay):
+                    log("  客户端已断开，不再同站重试")
+                    break
+                fail = None
+                same_mode = True
+                continue
             failover.note_fail(route.group_id, 502, label)
             dead_groups.add(route.group_id)
             inflight.failed(call, status=502, note="connect_failed", ms=int(elapsed * 1000))
@@ -677,6 +722,35 @@ async def forward(
 
         site_bad = resp.status_code in failover.RETRY_STATUS
         model_bad = resp.status_code in failover.MODEL_STATUS
+        # 同站重试优先于换站降级：命中该供应商的规则就原站再发，耗尽了才走下面的
+        # note_fail / advance。错误状态说明上游还没吐正文，重发对 store 类请求通常也安全
+        delay = failover.same_retry_delay(
+            route.upstream.retry_rules, resp.status_code, same_counts.get(route.upstream.id, 0)
+        )
+        if delay is not None:
+            same_counts[route.upstream.id] = same_counts.get(route.upstream.id, 0) + 1
+            log(
+                f"  同站重试：{route.upstream.name} 返回 {resp.status_code}，"
+                f"{delay:.2f}s 后再发（第 {same_counts[route.upstream.id]} 次）"
+            )
+            status_for_retry = resp.status_code
+            with contextlib.suppress(Exception):
+                await resp.aclose()
+            elapsed = time.monotonic() - began
+            inflight.failed(call, status=status_for_retry, note="same_retry", ms=int(elapsed * 1000))
+            if record:
+                _record(
+                    request=request, route=route, proto=proto, model=asked,
+                    remote_model=remote, status=status_for_retry, stream_flag=stream_flag,
+                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    usage=NO_USAGE, note="same_retry", attempt=attempt,
+                )
+            resp = None
+            if not await same_retry_pause(delay):
+                log("  客户端已断开，不再同站重试")
+                break
+            same_mode = True
+            continue
         if search_endpoint and resp.status_code in {404, 405, 501}:
             # These status codes mean this upstream has no standalone search
             # route. Do not count it as a site outage or cool the group down;

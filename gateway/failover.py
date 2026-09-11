@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Sequence
@@ -147,6 +148,63 @@ def snapshot() -> list[dict]:
             }
         )
     return sorted(out, key=lambda r: -r["cooling_ms"])
+
+
+# ---------------------------------------------------------------- 同站重试
+#
+# 和「自动降级换站」是两件事：这里是在**同一个上游**上再发几把。优先级更高 ——
+# 先吃同站规则，耗尽了才轮到换候选。规则绑供应商（upstreams.retry_rules），
+# 哪个站、哪些状态码、重试几次都由配置决定。
+
+# 同站最多再发几把的硬顶：防止配置写飘了把一次请求打成十几遍
+SAME_RETRY_MAX_TIMES = 10
+
+
+def parse_retry_rules(raw: str) -> dict[int, dict[str, int]]:
+    """把 vendors 的 retry_rules JSON 收成 {status: {times, delay_ms}}。
+
+    解析失败或形状不对就当没配 —— 转发路径上不该因为配置脏了而炸请求。
+    管理接口在保存时会校验并拒掉非法 JSON。
+    """
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, list):
+        return {}
+    out: dict[int, dict[str, int]] = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            status = int(item["status"])
+            times = int(item.get("times", 2))
+            delay_ms = int(item.get("delay_ms", 0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (100 <= status <= 599) or not (1 <= times <= SAME_RETRY_MAX_TIMES):
+            continue
+        if delay_ms < 0:
+            delay_ms = 0
+        out[status] = {"times": times, "delay_ms": delay_ms}
+    return out
+
+
+def same_retry_delay(
+    raw_rules: str, status: int, used_for_upstream: int
+) -> float | None:
+    """这次响应该不该同站再发一把？返回要等多少秒；不该重试返回 None。
+
+    used_for_upstream = 这个上游在本次请求里已经同站重试过几次。
+    """
+    rule = parse_retry_rules(raw_rules).get(status)
+    if rule is None:
+        return None
+    if used_for_upstream >= rule["times"]:
+        return None
+    return rule["delay_ms"] / 1000.0
 
 
 # ---------------------------------------------------------------- 排链

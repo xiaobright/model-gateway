@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS upstreams(
   enabled INTEGER NOT NULL DEFAULT 1,
   header_override TEXT NOT NULL DEFAULT '',
   egress TEXT NOT NULL DEFAULT '',
+  retry_rules TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS upstream_groups(
@@ -106,7 +107,8 @@ LOG_KEEP_ROWS = 2000
 #   3 = 接口在分组上，候选有自增 id
 #   4 = request_log 记录 Anthropic 的缓存创建 token
 #   5 = 上游模型目录（group_models）与下游候选分开
-SCHEMA_VERSION = 5
+#   6 = 上游同站重试规则（retry_rules）
+SCHEMA_VERSION = 6
 
 # 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
 BACKUP_KEEP = 3
@@ -144,6 +146,9 @@ class Upstream:
     header_override: str = ""
     # 从哪扇门出去：'' 跟随系统代理（今天的默认）/ 'direct' 直连 / 一个代理 URL
     egress: str = ""
+    # 同站重试：JSON 数组 [{"status":400,"times":2,"delay_ms":0}, ...]。
+    # 空串 = 不配。规则绑供应商，优先于自动降级换站。
+    retry_rules: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +197,7 @@ def _to_upstream(row: sqlite3.Row, api_key: str = "") -> Upstream:
         enabled=bool(row["enabled"]),
         header_override=row["header_override"],
         egress=row["egress"],
+        retry_rules=row["retry_rules"] if "retry_rules" in row.keys() else "",
     )
 
 
@@ -404,6 +410,24 @@ def _normalize_base_urls(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE upstreams SET base_url=? WHERE id=?", (fixed, row["id"]))
 
 
+def _seed_same_retry_presets(conn: sqlite3.Connection) -> None:
+    """给已知痛点站写上同站重试预置（只在空时填一次）。
+
+    站A 的 400 是 调用端 偶发、下一发就好；站B 的 503 是
+    OpenAI capacity（返回很快，Codex 收到就停）。以后新情况在管理页自己加。
+    """
+    presets = (
+        ("站A", '[{"status":400,"times":2,"delay_ms":0}]'),
+        ("站B", '[{"status":503,"times":2,"delay_ms":300}]'),
+    )
+    for name, rules in presets:
+        conn.execute(
+            "UPDATE upstreams SET retry_rules=?"
+            " WHERE name=? AND (retry_rules IS NULL OR retry_rules='')",
+            (rules, name),
+        )
+
+
 def _backfill_log_protocol(conn: sqlite3.Connection) -> None:
     """老记录没有协议列，而它们全是 /v1/responses 打进来的。回填一下，
     「实测格式」那列才有东西可看。"""
@@ -435,6 +459,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             # 现实里同一台机器上「有的站必须走代理、有的站必须别走代理」是常态 ——
             # 公益站按 IP 屏蔽，校园网 IP 和机房 IP 各自被不同的站拉黑
             ("egress", "TEXT NOT NULL DEFAULT ''"),
+            # 同站重试规则（JSON）。空串 = 不配；见 failover.parse_retry_rules
+            ("retry_rules", "TEXT NOT NULL DEFAULT ''"),
         ],
         "model_routes": [
             # 自动降级的尝试顺序：小的先试。0 = 还没排过，按 group_id 兜底
@@ -513,6 +539,7 @@ def _upgrade(path, stage: int) -> None:
         # 补列必须在**重建表之前**：旧版 _migrate_route_ids 是 INSERT ... SELECT，
         # 要从老表上读 priority，而老库根本没这一列 —— 先补上才不会报 no such column
         _add_missing_columns(conn)
+        _seed_same_retry_presets(conn)
         if stage == 0:
             # 最老那一代一步到位：每个供应商变成一个分组，候选直接建成最新形状
             _migrate_to_groups(conn)
@@ -579,6 +606,7 @@ def create_upstream(
     header_override: str = "",
     enabled: bool = True,
     egress: str = "",
+    retry_rules: str = "",
 ) -> Upstream:
     """只建供应商本身。分组（key + 接口）由调用方紧接着建 —— 接口得选，猜不出来。"""
     base = normalize_base(base_url)
@@ -586,9 +614,9 @@ def create_upstream(
         _check_base_url(conn, base)
         try:
             cur = conn.execute(
-                "INSERT INTO upstreams(name, base_url, header_override, enabled, egress)"
-                " VALUES(?,?,?,?,?)",
-                (name, base, header_override, int(enabled), egress),
+                "INSERT INTO upstreams(name, base_url, header_override, enabled, egress, retry_rules)"
+                " VALUES(?,?,?,?,?,?)",
+                (name, base, header_override, int(enabled), egress, retry_rules),
             )
         except sqlite3.IntegrityError as exc:
             raise DuplicateName(name) from exc
@@ -603,15 +631,16 @@ def update_upstream(
     enabled: bool,
     header_override: str = "",
     egress: str = "",
+    retry_rules: str = "",
 ) -> bool:
     base = normalize_base(base_url)
     with _conn() as conn:
         _check_base_url(conn, base, upstream_id)
         try:
             cur = conn.execute(
-                "UPDATE upstreams SET name=?, base_url=?, enabled=?, header_override=?, egress=?"
-                " WHERE id=?",
-                (name, base, int(enabled), header_override, egress, upstream_id),
+                "UPDATE upstreams SET name=?, base_url=?, enabled=?, header_override=?,"
+                " egress=?, retry_rules=? WHERE id=?",
+                (name, base, int(enabled), header_override, egress, retry_rules, upstream_id),
             )
         except sqlite3.IntegrityError as exc:
             raise DuplicateName(name) from exc

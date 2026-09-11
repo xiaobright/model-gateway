@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from helpers import wait_for_row, MockUpstream, add_upstream, add_group, provider_id, add_route, route_id, msg
+from gateway import db as gateway_db
 
 
 def test_duplicate_upstream_name_is_409_not_500(gateway):
@@ -485,10 +486,21 @@ def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway,
         )
 
 
-@pytest.mark.parametrize("version, missing", [(0, True), (3, True), (4, True), (0, False), (5, False)])
+@pytest.mark.parametrize(
+    "version, missing",
+    [
+        (0, True),
+        (3, True),
+        (4, True),
+        (5, True),  # v5 缺 retry_rules，要补列并预置同站重试
+        (0, False),
+        # 完整基线跟 SCHEMA_VERSION 走：结构升版时这里不用手改数字
+        (gateway_db.SCHEMA_VERSION, False),
+    ],
+)
 def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatch, version, missing):
     """未打号、正常 v3、误打 v4 的老库都要补列；完整的新库不应迁移或备份。
-    完整基线是 v5 —— v4 即使 cache_creation 列齐全，也要补 group_models 目录迁移。"""
+    完整基线是当前 SCHEMA_VERSION —— 旧版即使 cache_creation 列齐全，也要补后续迁移。"""
     import sqlite3
 
     from gateway import config, db

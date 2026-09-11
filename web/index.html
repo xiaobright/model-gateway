@@ -261,6 +261,23 @@
         </div>
       </details>
 
+      <!-- 同站重试：命中状态码就在这个站再发几把，优先于自动降级换站 -->
+      <details class="adv" id="up-retry-adv">
+        <summary>同站重试 <span class="tag" id="up-retry-tag" hidden></span></summary>
+        <div class="adv-body">
+          <label class="field">JSON 数组。命中 status 就在这个站重试 times 次（先于换站降级）。delay_ms 是间隔毫秒。
+            <textarea id="up-retry" rows="3" placeholder='[{"status":400,"times":2},{"status":503,"times":2,"delay_ms":300}]'></textarea>
+          </label>
+          <div class="field-row" style="margin-top:8px">
+            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="workbuddy">站A · 400×2</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="capacity">站B · 503×2</button>
+          </div>
+          <span class="dim" style="font-size:12px;margin-top:6px;display:block">
+            站A 的 400、站B 的 capacity 503 都靠这个在网关里吞掉，客户端不停。
+          </span>
+        </div>
+      </details>
+
       <!-- 分组的二级管理：列表在这儿，改一个就叠一层分组弹窗上去 -->
       <div id="up-groups-wrap" hidden>
         <div class="dlg-section divider">分组 <span class="tag" id="up-gcount"></span></div>

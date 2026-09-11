@@ -515,10 +515,12 @@ function openUpstream(id) {
   $('up-name').value = u ? u.name : '';
   $('up-base').value = u ? u.base_url : '';
   $('up-override').value = u ? (u.header_override || '') : '';
+  $('up-retry').value = u ? (u.retry_rules || '') : '';
   $('up-enabled').checked = u ? u.enabled : true;
   fillEgress(u ? u.egress : '');
   baseHint();
   markOverride();
+  markRetry();
 
   const hint = $('up-groups-hint');
   hint.hidden = Boolean(u);
@@ -543,6 +545,28 @@ function markOverride() {
   $('up-adv').open = Boolean(raw);
 }
 
+function markRetry() {
+  const raw = $('up-retry').value.trim();
+  const tag = $('up-retry-tag');
+  let count = 0;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) throw new Error('not array');
+      count = parsed.length;
+    } catch { count = -1; }
+  }
+  tag.hidden = !raw;
+  tag.textContent = count < 0 ? '格式有问题' : `${count} 条`;
+  tag.className = count < 0 ? 'tag tag-warn' : 'tag tag-accent';
+  $('up-retry-adv').open = Boolean(raw);
+}
+
+const RETRY_PRESETS = {
+  workbuddy: '[{"status":400,"times":2,"delay_ms":0}]',
+  capacity: '[{"status":503,"times":2,"delay_ms":300}]',
+};
+
 function upstreamPayload(source = null, enabled = null) {
   return {
     name: source ? source.name : $('up-name').value.trim(),
@@ -550,6 +574,7 @@ function upstreamPayload(source = null, enabled = null) {
     enabled: enabled ?? (source ? source.enabled : $('up-enabled').checked),
     header_override: source ? (source.header_override || '') : $('up-override').value.trim(),
     egress: source ? (source.egress || '') : egressValue(),
+    retry_rules: source ? (source.retry_rules || '') : $('up-retry').value.trim(),
   };
 }
 
@@ -562,6 +587,14 @@ async function saveUpstream() {
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('必须是一个对象');
     } catch (e) {
       return toast('请求头覆写不是合法 JSON：' + e.message, 'err');
+    }
+  }
+  if (payload.retry_rules) {
+    try {
+      const parsed = JSON.parse(payload.retry_rules);
+      if (!Array.isArray(parsed)) throw new Error('必须是一个数组');
+    } catch (e) {
+      return toast('同站重试不是合法 JSON：' + e.message, 'err');
     }
   }
   if (state.editing === null) {
@@ -1163,6 +1196,11 @@ const ACTIONS = {
     markOverride();
   },
 
+  'preset-retry': ({ r }) => {
+    $('up-retry').value = RETRY_PRESETS[r] || '';
+    markRetry();
+  },
+
   /* 拉取用的是**服务端存着的**那把 key。key 改了没保存就点拉取，拉的是旧 key，
      回来一个 401 让人一头雾水 —— 先把改动落库，再拉。 */
   'pull-models': async () => {
@@ -1525,6 +1563,7 @@ $('rt-iface').addEventListener('change', () => {
 // 站根填/改的时候把补出来的两个地址实时显示出来，免得又把 /v1 带上
 $('up-base').addEventListener('input', baseHint);
 $('up-override').addEventListener('input', markOverride);
+$('up-retry').addEventListener('input', markRetry);
 $('up-egress-kind').addEventListener('change', egressHint);
 
 /* 手填模型名：回车直接加，别提交整个表单（那是保存分组的按钮）。

@@ -28,6 +28,8 @@ class UpstreamIn(BaseModel):
     # 从哪扇门出去：'' 跟随系统代理 / 'direct' 直连 / 一个代理 URL
     # PUT 省略时保留已有出口，兼容列表快捷开关等只更新启用状态的调用方。
     egress: str | None = None
+    # 同站重试：JSON 数组 [{"status":400,"times":2,"delay_ms":0}, ...]；空串 = 关
+    retry_rules: str = ""
 
 
 class GroupIn(BaseModel):
@@ -128,6 +130,38 @@ def _validate_override(raw: str) -> str:
     return raw.strip()
 
 
+def _validate_retry_rules(raw: str) -> str:
+    """同站重试规则：[{status, times, delay_ms}, ...]。空串 = 不配。"""
+    if not raw.strip():
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, f"同站重试不是合法 JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(400, '同站重试必须是数组，例如 [{"status":503,"times":2}]')
+    out: list[dict[str, int]] = []
+    for item in parsed:
+        if not isinstance(item, dict) or "status" not in item:
+            raise HTTPException(400, "每条规则都要有 status，例如 {\"status\":503,\"times\":2}")
+        try:
+            status = int(item["status"])
+            times = int(item.get("times", 2))
+            delay_ms = int(item.get("delay_ms", 0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "status / times / delay_ms 必须是整数") from exc
+        if not (100 <= status <= 599):
+            raise HTTPException(400, f"status 只能在 100–599（收到 {status}）")
+        if not (1 <= times <= failover.SAME_RETRY_MAX_TIMES):
+            raise HTTPException(
+                400, f"times 只能在 1–{failover.SAME_RETRY_MAX_TIMES}（收到 {times}）"
+            )
+        if delay_ms < 0 or delay_ms > 30_000:
+            raise HTTPException(400, "delay_ms 只能在 0–30000 之间")
+        out.append({"status": status, "times": times, "delay_ms": delay_ms})
+    return json.dumps(out, separators=(",", ":"))
+
+
 def _validate_egress(raw: str) -> str:
     """出口：'' 跟随系统 / 'direct' 直连 / 一个代理 URL。
 
@@ -196,6 +230,7 @@ def _serialize_upstream(
         "enabled": u.enabled,
         "header_override": u.header_override,
         "egress": u.egress,
+        "retry_rules": u.retry_rules,
         "supports": [p for p in protocols.NAMES if any(g.protocol == p for g in groups)],
         "groups": [_serialize_group(g, models_by_group.get(g.id, ())) for g in groups],
     }
@@ -283,6 +318,7 @@ def post_upstream(payload: UpstreamIn) -> dict[str, Any]:
             _validate_override(payload.header_override),
             payload.enabled,
             _validate_egress(payload.egress or ""),
+            _validate_retry_rules(payload.retry_rules),
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
@@ -304,6 +340,7 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
             payload.enabled,
             _validate_override(payload.header_override),
             egress,
+            _validate_retry_rules(payload.retry_rules),
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
