@@ -5,7 +5,7 @@
 
 import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft, protocolOn,
-  catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_PATH, PROTOCOLS,
+  catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -593,8 +593,8 @@ function protoTags(health) {
   return keys.map((p) => {
     const s = by[p];
     const pct = Math.round(s.ok_rate * 1000) / 10;
-    const label = PROTO_LABEL[p] || p;
-    return `<span class="tag tag-${toneOf(s.ok_rate)}" title="${esc(label)} 跑过 ${fmtInt(s.n)} 次，成功率 ${pct}%">`
+    const label = PROTO_SHORT[p] || PROTO_LABEL[p] || p;
+    return `<span class="tag tag-${toneOf(s.ok_rate)}" title="${esc(PROTO_LABEL[p] || p)} 跑过 ${fmtInt(s.n)} 次，成功率 ${pct}%">`
       + `${esc(label)} ${fmtInt(s.n)}</span>`;
   }).join(' ');
 }
@@ -604,7 +604,8 @@ function ifaceTags(u) {
   const marks = u.supports || [];
   if (!marks.length) return '<span class="tag tag-warn">还没有分组</span>';
   return marks.map((p) =>
-    `<span class="tag${p === 'anthropic' ? ' tag-accent' : ''}">${PROTO_LABEL[p] || p}</span>`).join(' ');
+    `<span class="tag${p === 'anthropic' ? ' tag-accent' : ''}" title="${esc(PROTO_LABEL[p] || p)}">`
+    + `${esc(PROTO_SHORT[p] || PROTO_LABEL[p] || p)}</span>`).join(' ');
 }
 
 const maskKey = (key) => (key ? `${esc(key.slice(0, 6))}… ${key.length}` : '<span class="dim">透传客户端</span>');
@@ -723,7 +724,7 @@ export function renderUpstreams() {
       </td>
       <td class="mono dim truncate" title="${esc(u.base_url)}">${esc(u.base_url)}${egressTag(u)}</td>
       <td>${modelTags(catalogOfUpstream(u.id))}</td>
-      <td class="nowrap">${protoTags(h)}</td>
+      <td>${protoTags(h)}</td>
       <td class="num nowrap">${stat}</td>
       <td><input type="checkbox" class="switch" ${u.enabled ? 'checked' : ''}
                  data-act="toggle-upstream" data-uid="${u.id}"
