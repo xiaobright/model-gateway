@@ -665,7 +665,20 @@ function openGroup(upstreamId, gid) {
   $('grp-import').hidden = !g;
   renderPicker();
   $('group-dialog').showModal();
-  $('grp-name').focus();
+  if (g) {
+    // 编辑已有分组：核心操作是勾选上游模型，而字段区较高、列表在下方，
+    // 打开就把列表带进视野，别让用户以为「拉到的模型显示不出来」。
+    requestAnimationFrame(() => {
+      const body = document.querySelector('#group-dialog .dlg-body');
+      const pick = $('grp-picker');
+      if (body && pick) {
+        body.scrollTop = Math.max(0,
+          pick.offsetTop - body.clientHeight + pick.offsetHeight + 24);
+      }
+    });
+  } else {
+    $('grp-name').focus();
+  }
 }
 
 async function saveGroup() {
@@ -1224,6 +1237,9 @@ const ACTIONS = {
           const mine = catalogOfGroup(gid);
           const hit = pulled.filter((m) => mine.includes(m)).length;
           $('grp-pull-status').textContent = `上游列出 ${pulled.length} 个，其中 ${hit} 个已登记`;
+          // 字段多的时候列表会被挤到可视区下方，拉完直接把它带进视野，
+          // 省得用户以为「拉到了但显示不出来」还得自己找滚动位置
+          $('grp-picker').scrollIntoView({ block: 'nearest' });
         },
         onFailure: (error) => {
           $('grp-pull-status').textContent = '';

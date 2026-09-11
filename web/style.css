@@ -728,19 +728,29 @@ input:disabled, select:disabled, .dlg-body input[readonly] {
 .pill:hover code { color: var(--accent); }
 
 /* ============================================================ 弹窗 */
+/* 弹窗本身是「头 / 体 / 脚」三段的竖向 flex 容器，并且限高不超视口 ——
+   字段一多的时候只有中间的 .dlg-body 滚，头脚始终留在屏幕里。
+   注意：这里刻意不写 `dialog > form` 这种选择器。弹窗有两种结构：
+   带 <form> 包一层的（供应商/分组/模型路由/搜索），和不带的
+   （下游接入、确认框 —— 它们的 .dlg-foot 自己就是个 <form method="dialog">）。
+   只认 .dlg-head/.dlg-body/.dlg-foot 这三个类，两种结构都吃得下。 */
 dialog {
   background: var(--glass-2); color: var(--ink);
   border: 1px solid var(--edge); border-radius: var(--r-lg);
   box-shadow: var(--shadow-2); padding: 0; width: 94%; max-width: 620px;
-  /* 不限高时弹窗会比视口还高，底部保存按钮被推出屏幕；表单自己限高 */
   max-height: min(92vh, 900px);
   display: flex; flex-direction: column;
+  overflow: hidden;
   backdrop-filter: blur(36px) saturate(200%); -webkit-backdrop-filter: blur(36px) saturate(200%);
 }
-/* form 是 dialog 的唯一直接内容：头/体/脚都放在它里面，由它做 flex 列 */
-dialog > form {
+/* 中间那层 <form> 只是壳：自己不产生滚动条，也不参与限高，
+   把 dialog 的剩余高度原样传给里面的 .dlg-body。
+   必须排除 .dlg-foot —— 确认框底部的 <form method="dialog" class="dlg-foot">
+   本身就是那个 form，不能被当成中间的壳（否则取消/确定会被竖着排）。 */
+dialog > form:not(.dlg-foot) {
   display: flex; flex-direction: column;
-  min-height: 0; max-height: inherit;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
 }
 dialog::backdrop { background: rgba(30, 40, 60, .36); backdrop-filter: blur(10px); }
@@ -753,6 +763,9 @@ dialog[open] { animation: pop .32s cubic-bezier(.34, 1.35, .4, 1); }
 @media (prefers-reduced-motion: reduce) { dialog[open] { animation: none; } }
 
 dialog.sm { max-width: 420px; }
+/* 分组弹窗字段多（组名/接口/Key/供应商 + 模型勾选列表），给宽一点，
+   字段两列更舒展，纵向少占一些高度，列表也能多露几行 */
+dialog.wide { max-width: 740px; }
 .dlg-head {
   padding: 16px 20px 14px; border-bottom: 1px solid var(--hair);
   display: flex; align-items: center; gap: 8px;
@@ -768,16 +781,25 @@ dialog.sm { max-width: 420px; }
 }
 .dlg-x:hover { background: var(--hover); color: var(--ink); }
 .dlg-x:active { transform: scale(0.9); }
-/* 占满 form 剩余高度，内容多了自己滚；不要用固定 max-height —— 字段一多，
-   下面的模型列表就被推出可视区，看起来像「滚不下去」 */
+/* 中间正文：占满头脚之间的剩余高度，内容多了只有它滚。
+   不要写死 max-height —— 那会让字段一多就把下面的列表推出可视区，
+   看起来像「滚不下去」（Windows 系统缩放放大后尤其明显）。 */
 .dlg-body {
-  flex: 1 1 auto; min-height: 0;
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 18px 20px;
   overflow-y: auto; overflow-x: hidden;
   overscroll-behavior: contain;
+  /* 竖向 flex：字段照常从上往下排，但里面的 #grp-import 能拿到
+     「剩余高度」的约束（配合它的 flex/percent，让模型列表撑满可用空间）。
+     flex 下 margin 不再折叠，间距由各元素自己的 margin 决定，视觉无差异。 */
+  display: flex; flex-direction: column;
 }
+/* 正文里的直接子元素默认不被压缩，只有明确要长高的（#grp-import）例外 */
+.dlg-body > * { flex: 0 0 auto; }
+/* 头脚不参与伸缩，永远钉在弹窗上下两端 */
+.dlg-head, .dlg-foot { flex: none; }
 .dlg-foot {
-  flex: none;
   padding: 14px 20px; border-top: 1px solid var(--hair);
   display: flex; gap: 10px; justify-content: flex-end; align-items: center;
 }
@@ -819,31 +841,29 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .ug-row .switch::after { width: 15px; height: 15px; }
 .ug-row .switch:checked::after { transform: translateX(13px); }
 
-/* 上游模型勾选列表：单独一截滚动区。260px 只够四五条，列表一长就被裁掉；
-   拉高到 ~40vh，并保证滚动条可见，不用缩放网页才能点到底下的模型 */
-.picker-shell {
-  position: relative;
-  margin-top: 9px;
+/* 上游模型勾选区：跟着 .dlg-body 的剩余高度走即可，本身不强行撑高。 */
+#grp-import {
+  display: flex; flex-direction: column;
+  min-height: 0;
 }
+
+/* 上游模型勾选列表：单独一截独立滚动区。
+   历史问题：原来写死 260px，且外层正文又写死 max-height，字段一多列表就被
+   推到可视区外；滚轮只作用在正文上，看着像「列表卡住滚不动」，得改浏览器
+   缩放才够得着（Windows 系统缩放放大后更明显）。
+   现在：高度跟视口走，小屏也不会把底部按钮顶出去；下限保证至少看得到 5 行，
+   上限避免屏幕很大时列表长得没边。列表自身独立滚动、滚动条加粗可见。 */
 .picker {
-  max-height: min(42vh, 420px);
-  min-height: 140px;
+  flex: 0 0 auto;
+  height: min(42vh, 340px);
+  min-height: 180px;
   overflow-y: auto; overflow-x: hidden;
   overscroll-behavior: contain;
   border: 1px solid var(--hair-2); border-radius: var(--r-sm);
-  padding: 6px 8px; background: var(--glass-3);
+  padding: 6px 8px; background: var(--glass-3); margin-top: 9px;
+  /* 让滚动条清晰可见 —— 6px 半透明条几乎看不见，列表长了像「卡住滚不动」 */
+  scrollbar-width: thin;
 }
-/* 列表裁切时下一条只露半截上缘：底边盖一层薄雾，别像半行坏字 */
-.picker-shell::after {
-  content: "";
-  position: absolute;
-  left: 1px; right: 1px; bottom: 1px;
-  height: 26px;
-  border-radius: 0 0 calc(var(--r-sm) - 1px) calc(var(--r-sm) - 1px);
-  pointer-events: none;
-  background: linear-gradient(to bottom, transparent, var(--glass-3) 85%);
-}
-/* 6px 半透明滚动条几乎看不见，列表长了像「卡住滚不动」——这里加粗一点 */
 .picker::-webkit-scrollbar { width: 8px; }
 .picker::-webkit-scrollbar-thumb { background: var(--hair-2); border-radius: 999px; }
 .picker::-webkit-scrollbar-thumb:hover { background: var(--ink-3); }
@@ -1192,15 +1212,12 @@ th.num { text-align: right; }
 .dot-crit { background: var(--crit); }
 .dot-off { background: var(--ink-3); }
 
+/* 自定义 Apple 极细悬浮滚动条 */
 /* 自定义 Apple 极细悬浮滚动条。
-   模型路由那张卡用它：高度跟视口走，模型多了卡片内滚，不用整页缩放。
-   负 margin 是为了滚动条贴卡片边缘（card-body 自带左右 padding）。 */
-.scroll-y {
-  max-height: min(52vh, 560px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  margin: 0 -20px; padding: 0 20px;
-}
+   模型路由/记录等卡片用它：高度跟视口走，条目多了卡片内滚，不用整页缩放。
+   负 margin 是为了滚动条贴卡片边缘（card-body 自带左右 padding）。
+   上下限别写太死 —— 屏幕小或系统缩放大的时候要留出余量。 */
+.scroll-y { max-height: min(60vh, 620px); overflow-y: auto; overscroll-behavior: contain; margin: 0 -20px; padding: 0 20px; }
 .scroll-y::-webkit-scrollbar { width: 8px; }
 .scroll-y::-webkit-scrollbar-thumb { background: var(--hair-2); border-radius: 999px; }
 .scroll-y::-webkit-scrollbar-thumb:hover { background: var(--ink-3); }
