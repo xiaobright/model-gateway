@@ -855,16 +855,17 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
   min-height: 0;
 }
 
-/* 上游模型勾选列表：单独一截独立滚动区。
-   历史问题：原来写死 260px，且外层正文又写死 max-height，字段一多列表就被
-   推到可视区外；滚轮只作用在正文上，看着像「列表卡住滚不动」，得改浏览器
-   缩放才够得着（Windows 系统缩放放大后更明显）。
-   现在：高度跟视口走，小屏也不会把底部按钮顶出去；下限保证至少看得到 5 行，
-   上限避免屏幕很大时列表长得没边。列表自身独立滚动、滚动条加粗可见。 */
+/* 上游模型勾选列表：自适应高度的独立滚动区。
+   目标（用户要求）：条目少 → 按实际内容高度显示，下面不留空白；
+   条目多 → 长到这个上限就停下来，改成内部滚动。
+   历史坑：原来写死 260px，且外层正文又写死 max-height，字段一多列表就被
+   推到可视区外；滚轮只作用在正文上，看着像「列表卡住滚不动」。
+   现在用 flex + max-height：不写死 height，也不设 min-height（那会强行撑高、
+   在条目少时留出空白）；只给上限，超出才滚。
+   上限同时受视口和正文可用高度约束，小屏/系统缩放放大时也不会把底部按钮顶出去。 */
 .picker {
-  flex: 0 0 auto;
-  height: min(42vh, 340px);
-  min-height: 180px;
+  flex: 0 1 auto;
+  max-height: min(46vh, 360px);
   overflow-y: auto; overflow-x: hidden;
   overscroll-behavior: contain;
   border: 1px solid var(--hair-2); border-radius: var(--r-sm);
