@@ -122,10 +122,6 @@ class DuplicateBaseUrl(Exception):
     """已经有别的供应商用了这个站根 —— 同一个站应该加分组，不是再建一个供应商。"""
 
 
-class ProtocolMismatch(Exception):
-    """候选和模型的接口不一致。args = (模型已在的接口, 这个分组的接口)。"""
-
-
 class DuplicateRemote(Exception):
     """同一个分组下已经有一条映射到这个上游真名的候选了。args = (上游真名,)。"""
 
@@ -822,16 +818,28 @@ def set_route_order(model_name: str, route_ids: Iterable[int]) -> int:
     """按给定顺序重排这个模型的候选（自动降级依次尝试的顺序）。返回排到的条数。
 
     只认真的存在的候选，没提到的留在后面（priority 从 len(order) 起排，保持它们原来的相对次序）。
+    顺序是链内的：以给出的第一个候选所在的接口为准，别的接口那条链的 priority 不动。
     """
+    ids = list(dict.fromkeys(route_ids))
+    if not ids:
+        return 0
     with _conn() as conn:
+        first = conn.execute(
+            "SELECT g.protocol AS protocol FROM model_routes m"
+            " JOIN upstream_groups g ON g.id = m.group_id WHERE m.id=?",
+            (ids[0],),
+        ).fetchone()
+        if first is None:
+            return 0
         have = [
             r["id"]
             for r in conn.execute(
-                "SELECT id FROM model_routes WHERE model_name=? ORDER BY priority, id",
-                (model_name,),
+                "SELECT m.id FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+                " WHERE m.model_name=? AND g.protocol=? ORDER BY m.priority, m.id",
+                (model_name, first["protocol"]),
             )
         ]
-        wanted = [rid for rid in route_ids if rid in have]
+        wanted = [rid for rid in ids if rid in have]
         rest = [rid for rid in have if rid not in wanted]
         for i, rid in enumerate(wanted + rest):
             conn.execute("UPDATE model_routes SET priority=? WHERE id=?", (i, rid))
@@ -843,26 +851,29 @@ def _group_protocol(conn: sqlite3.Connection, group_id: int) -> str:
     return row["protocol"] if row is not None else ""
 
 
-def _model_protocol(conn: sqlite3.Connection, model_name: str) -> str:
-    """模型在哪个接口下暴露 = 它任一候选所在分组的接口（优先看活跃的那条）。
-    没有候选就返回空串 —— 这个模型名还不存在。"""
-    row = conn.execute(
-        "SELECT g.protocol FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
-        " WHERE m.model_name=? ORDER BY m.is_active DESC, m.id LIMIT 1",
+def _model_protocols(conn: sqlite3.Connection, model_name: str) -> tuple[str, ...]:
+    """模型在哪些接口下暴露 = 它各候选所在分组的接口集合。空 = 这个模型名还不存在。
+
+    同一个模型名允许在多种接口下各挂一条链（一个站同时暴露 Responses 和 Chat
+    Completions 很常见）：转发按「模型名 + 请求接口」选链（_CHAIN_QUERY 过滤协议），
+    两条链互不可见，跨接口调用照旧 404。"""
+    rows = conn.execute(
+        "SELECT DISTINCT g.protocol FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+        " WHERE m.model_name=?",
         (model_name,),
-    ).fetchone()
-    return row["protocol"] if row is not None else ""
+    ).fetchall()
+    return tuple(r["protocol"] for r in rows)
 
 
 def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
-    """新增一个候选，返回它的 id；该模型的第一个候选自动成为活跃候选。已存在则返回 0。
+    """新增一个候选，返回它的 id；该链的第一个候选自动成为活跃候选。已存在则返回 0。
 
     「已存在」是「同一个分组下已经有一条映射到同一个上游真名的候选」。同一个分组下
     **允许**同一个模型名的多条候选，只要各指一个不同的上游真名 —— 一个站常有好几个
     能用的模型 id，把它们排成一条链比只能挑一个有用。
 
-    模型的接口就是候选所在分组的接口，所以同一个模型名的候选必须全在同一种接口上，
-    否则「这个名字在哪个接口下暴露」就没有答案了。"""
+    活跃位、顺序都是**链内**（模型名 + 接口）的概念：同一模型名可以在另一种接口下
+    另有一条独立链，两边的首选和优先级互不影响。"""
     with _conn() as conn:
         exists = conn.execute(
             "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
@@ -871,16 +882,17 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
         if exists:
             return 0
         mine = _group_protocol(conn, group_id)
-        theirs = _model_protocol(conn, model_name)
-        if theirs and theirs != mine:
-            raise ProtocolMismatch(theirs, mine)
         count = conn.execute(
-            "SELECT COUNT(*) AS n FROM model_routes WHERE model_name=?", (model_name,)
+            "SELECT COUNT(*) AS n FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=?",
+            (model_name, mine),
         ).fetchone()["n"]
         # 新候选排在链尾：自动降级按 priority 从小到大试，刚加的那个不该抢到最前面去
         nxt = conn.execute(
-            "SELECT COALESCE(MAX(priority), -1) + 1 AS p FROM model_routes WHERE model_name=?",
-            (model_name,),
+            "SELECT COALESCE(MAX(m.priority), -1) + 1 AS p FROM model_routes m"
+            " JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=?",
+            (model_name, mine),
         ).fetchone()["p"]
         # 暴露一个下游模型时顺手把上游真名登记进目录：它必然是这个站的一个上游模型，
         # 不登记的话上游站点那列会漏掉它
@@ -918,15 +930,21 @@ def transfer_model_routes(
         if len(rows) != len(ids) or any(row["model_name"] != source for row in rows):
             raise RouteTransferConflict("来源候选已经变化，请刷新后重试")
         protocol = _group_protocol(conn, rows[0]["group_id"])
-        target_protocol = _model_protocol(conn, target)
         if any(_group_protocol(conn, row["group_id"]) != protocol for row in rows):
             raise RouteTransferConflict("来源候选的协议不一致")
-        if target_protocol and target_protocol != protocol:
-            raise ProtocolMismatch(target_protocol, protocol)
+        # 目标模型可以在别的接口下已有自己的链（同名多协议是合法的），所以只看
+        # 「目标在**这种接口**下是否已有链」来决定新插候选要不要当首选
+        has_chain = conn.execute(
+            "SELECT 1 FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=? LIMIT 1",
+            (target, protocol),
+        ).fetchone() is not None
         preferred = next((row["id"] for row in rows if row["is_active"]), rows[0]["id"])
         next_priority = conn.execute(
-            "SELECT COALESCE(MAX(priority), -1) + 1 AS p FROM model_routes WHERE model_name=?",
-            (target,),
+            "SELECT COALESCE(MAX(m.priority), -1) + 1 AS p FROM model_routes m"
+            " JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=?",
+            (target, protocol),
         ).fetchone()["p"]
         result_ids = []
         added = 0
@@ -942,7 +960,7 @@ def transfer_model_routes(
                 "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
                 " VALUES(?,?,?,?,?)",
                 (target, row["group_id"], row["remote_model"],
-                 int(not target_protocol and row["id"] == preferred), next_priority),
+                 int(not has_chain and row["id"] == preferred), next_priority),
             )
             result_ids.append(int(cur.lastrowid))
             next_priority += 1
@@ -984,20 +1002,16 @@ def update_model_route(route_id: int, remote_model: str) -> bool:
 def add_routes_for_group(group_id: int, model_names: Iterable[str]) -> tuple[int, tuple[str, ...]]:
     """批量加候选，返回 (加上了几个, 跳过了哪些)。
 
-    跳过的是「这个名字已经在另一种接口下暴露了」的：拉一个站的模型列表常常几十上百个，
-    里面撞上一两个不能挂的就整批失败、一个都不落库，比跳过难用得多。重复的不算跳过
-    （已经有了本来就是想要的结果）。"""
+    跳过的一直是空的（历史上是「跨接口撞名」的兜底，同名多协议放开后不再有这种情况）；
+    重复的真名不算跳过 —— 已经有了本来就是想要的结果。保留返回形状以兼容管理 API。"""
     added = 0
     skipped: list[str] = []
     for raw in model_names:
         name = raw.strip()
         if not name:
             continue
-        try:
-            if add_model_route(name, group_id, name):
-                added += 1
-        except ProtocolMismatch:
-            skipped.append(name)
+        if add_model_route(name, group_id, name):
+            added += 1
     return added, tuple(skipped)
 
 
@@ -1026,21 +1040,47 @@ def delete_routes_in_group(model_name: str, group_id: int) -> int:
         return removed
 
 
-def delete_model(model_name: str) -> int:
-    """删掉一个模型名下的所有候选，返回删除条数。"""
+def delete_model(model_name: str, protocol: str = "") -> int:
+    """删掉一个模型名下的候选，返回删除条数。给了 protocol 就只删那条链 ——
+    同名模型在别的接口下的候选保留（整名删掉时不存在活跃位问题，不用重挂）。"""
     with _conn() as conn:
-        return conn.execute("DELETE FROM model_routes WHERE model_name=?", (model_name,)).rowcount
+        if protocol:
+            removed = conn.execute(
+                "DELETE FROM model_routes WHERE id IN ("
+                "  SELECT m.id FROM model_routes m"
+                "  JOIN upstream_groups g ON g.id = m.group_id"
+                "  WHERE m.model_name=? AND g.protocol=?)",
+                (model_name, protocol),
+            ).rowcount
+            if removed:
+                _reattach_active(conn, model_name)
+        else:
+            removed = conn.execute(
+                "DELETE FROM model_routes WHERE model_name=?", (model_name,)
+            ).rowcount
+        return removed
 
 
 def switch_route(route_id: int) -> str:
-    """把流量切到这一条候选，返回它的模型名（找不到返回空串）。"""
+    """把流量切到这一条候选，返回它的模型名（找不到返回空串）。
+
+    活跃位是链内（模型名 + 接口）的：同名模型在别的接口下还有自己的链，别把那边的
+    首选一起清了。"""
     with _conn() as conn:
-        row = conn.execute("SELECT model_name FROM model_routes WHERE id=?", (route_id,)).fetchone()
+        row = conn.execute(
+            "SELECT m.model_name AS model_name, g.protocol AS protocol FROM model_routes m"
+            " JOIN upstream_groups g ON g.id = m.group_id WHERE m.id=?",
+            (route_id,),
+        ).fetchone()
         if row is None:
             return ""
         name = row["model_name"]
         conn.execute(
-            "UPDATE model_routes SET is_active=0 WHERE model_name=? AND is_active=1", (name,)
+            "UPDATE model_routes SET is_active=0 WHERE id IN ("
+            "  SELECT m.id FROM model_routes m"
+            "  JOIN upstream_groups g ON g.id = m.group_id"
+            "  WHERE m.model_name=? AND g.protocol=? AND m.is_active=1)",
+            (name, row["protocol"]),
         )
         conn.execute("UPDATE model_routes SET is_active=1 WHERE id=?", (route_id,))
     return name
@@ -1199,17 +1239,20 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
     )
 
 
-def protocol_of_model(model_name: str) -> str:
-    """这个模型名在哪个接口下暴露；没录入过就是空串。给 404 文案用。"""
+def protocol_of_model(model_name: str) -> tuple[str, ...]:
+    """这个模型名在哪些接口下暴露；没录入过就是空。给 404 文案用。"""
     with _conn() as conn:
-        return _model_protocol(conn, model_name)
+        return _model_protocols(conn, model_name)
 
 
 def exposed_models(protocol: str = "") -> tuple[str, ...]:
-    """对下游暴露的模型清单。停用的接口不算暴露 —— 客户端不该看见调不动的名字。"""
+    """对下游暴露的模型清单。停用的接口不算暴露 —— 客户端不该看见调不动的名字。
+
+    同名模型在多种接口下各有一条链时只列一次；只有在**所有**链都落在停用接口上时
+    才整个隐藏。"""
     query = (
-        "SELECT DISTINCT m.model_name, g.protocol FROM model_routes m"
-        " JOIN upstream_groups g ON g.id = m.group_id"
+        "SELECT DISTINCT m.model_name AS model_name, g.protocol AS protocol"
+        " FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
     )
     args: tuple = ()
     if protocol:
@@ -1218,22 +1261,38 @@ def exposed_models(protocol: str = "") -> tuple[str, ...]:
     disabled = disabled_protocols()
     with _conn() as conn:
         rows = conn.execute(query + " ORDER BY m.model_name", args).fetchall()
-    return tuple(r["model_name"] for r in rows if r["protocol"] not in disabled)
+    visible: dict[str, bool] = {}
+    for r in rows:
+        visible[r["model_name"]] = visible.get(r["model_name"], False) or r["protocol"] not in disabled
+    return tuple(name for name, ok in visible.items() if ok)
 
 
 def _reattach_active(conn: sqlite3.Connection, model_name: str) -> None:
-    """删除候选后如果没有活跃候选了，把流量落到链上第一个候选（priority 最小的那条）。"""
-    still_active = conn.execute(
-        "SELECT 1 FROM model_routes WHERE model_name=? AND is_active=1", (model_name,)
-    ).fetchone()
-    if still_active is not None:
-        return
-    remaining = conn.execute(
-        "SELECT id FROM model_routes WHERE model_name=? ORDER BY priority, id LIMIT 1",
+    """删除候选后如果某条链没有活跃候选了，把流量落到那条链的第一个候选（priority 最小）。
+
+    同名模型可以在多种接口下各有一条链，活跃位是链内的 —— 所以按 (模型名, 接口)
+    逐条检查，别把另一条链的活跃位顶掉。"""
+    chains = conn.execute(
+        "SELECT DISTINCT g.protocol FROM model_routes m"
+        " JOIN upstream_groups g ON g.id = m.group_id WHERE m.model_name=?",
         (model_name,),
-    ).fetchone()
-    if remaining is not None:
-        conn.execute("UPDATE model_routes SET is_active=1 WHERE id=?", (remaining["id"],))
+    ).fetchall()
+    for chain in chains:
+        protocol = chain["protocol"]
+        still_active = conn.execute(
+            "SELECT 1 FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=? AND m.is_active=1",
+            (model_name, protocol),
+        ).fetchone()
+        if still_active is not None:
+            continue
+        remaining = conn.execute(
+            "SELECT m.id FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=? ORDER BY m.priority, m.id LIMIT 1",
+            (model_name, protocol),
+        ).fetchone()
+        if remaining is not None:
+            conn.execute("UPDATE model_routes SET is_active=1 WHERE id=?", (remaining["id"],))
 
 # ---------------------------------------------------------------- 转发记录
 

@@ -69,10 +69,11 @@ def test_merge_reuses_duplicate_and_keeps_target_preference_and_order(gateway):
     assert routes(gateway, "source") is None
 
 
-@pytest.mark.parametrize("reason", ["protocol", "missing", "stale-source", "same-model", "blank"])
+@pytest.mark.parametrize("reason", ["missing", "stale-source", "same-model", "blank"])
 def test_rejected_transfer_leaves_both_models_unchanged(gateway, reason):
     _, one, two = seed(gateway)
-    seed(gateway, "target", "anthropic" if reason == "protocol" else "openai")
+    if reason != "protocol":
+        seed(gateway, "target", "openai")
     before = db.list_routes()
     response = transfer(
         gateway, [one, 999999 if reason == "missing" else two],

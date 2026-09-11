@@ -241,7 +241,7 @@ function cloneButtons(group) {
 
 /* 一个分组下可以挂同一个模型的好几条候选（各指一个不同的上游真名），这时候光写
    「供应商 · 分组」两个圆片长得一模一样，所以 showRemote 会强制把真名显示出来。 */
-function chipHtml(model, c, showGroup, showRemote, activeRouteId) {
+function chipHtml(model, c, showGroup, showRemote, activeRouteId, proto) {
   const live = c.upstream_enabled && c.group_enabled;
   const cool = c.cooling_ms > 0;
   const active = c.route_id === activeRouteId;
@@ -261,12 +261,14 @@ function chipHtml(model, c, showGroup, showRemote, activeRouteId) {
       + `冷却 ${fmtLeft(c.cooling_ms)}</span>` : '';
   const full = named ? `${label} · ${bare}` : label;
   const tip = active ? '当前实际使用的候选' : (c.is_active ? '保存的首选候选' : `切到 ${full}`);
+  // data-proto：同名模型可以在两种接口下各挂一条链，事件处理要靠它分清是哪一行
+  const protoAttr = ` data-proto="${esc(c.protocol || proto || '')}"`;
   return `<span class="${cls}" data-rid="${c.route_id}">
-    <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"
+    <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"${protoAttr}
             data-rid="${c.route_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
-    <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"
+    <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"${protoAttr}
             data-rid="${c.route_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
-    <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"
+    <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"${protoAttr}
             data-rid="${c.route_id}" title="移除这一条候选">✕</button>
   </span>`;
 }
@@ -346,15 +348,16 @@ export function renderRoutes() {
     const chips = g.candidates.map((c) =>
       chipHtml(
         g.model_name, c, multi.has(c.upstream_id), sibs.get(c.group_id) > 1, g.active_route_id,
+        g.protocol,
       )).join('');
 
-    return `<div class="route" data-model="${esc(g.model_name)}">
+    return `<div class="route" data-model="${esc(g.model_name)}" data-proto="${esc(g.protocol)}">
       <div class="route-name">${esc(g.model_name)}${ifaceTag}${dead}</div>
       <div class="route-cands">${chips}</div>
       <div class="route-side">${usage}</div>
       <div class="route-actions">
-        <button class="btn btn-ghost btn-sm" data-act="add-candidate" data-model="${esc(g.model_name)}">+ 候选</button>
-        <button class="btn btn-danger btn-sm" data-act="del-model" data-model="${esc(g.model_name)}">删除</button>
+        <button class="btn btn-ghost btn-sm" data-act="add-candidate" data-model="${esc(g.model_name)}" data-proto="${esc(g.protocol)}">+ 候选</button>
+        <button class="btn btn-danger btn-sm" data-act="del-model" data-model="${esc(g.model_name)}" data-proto="${esc(g.protocol)}">删除</button>
       </div>
     </div>`;
   }).join('');
@@ -964,8 +967,9 @@ export function updateKpiLive() {
 }
 
 /* 切换候选后：把"流量改道"这件事演出来 */
-export function afterSwitch(model, fromRid, toRid) {
-  const row = $('route-list').querySelector(`.route[data-model="${CSS.escape(model)}"]`);
+export function afterSwitch(model, fromRid, toRid, proto) {
+  const scope = proto ? `[data-proto="${CSS.escape(proto)}"]` : '';
+  const row = $('route-list').querySelector(`.route[data-model="${CSS.escape(model)}"]${scope}`);
   if (!row) return;
   flow(row.querySelector(`.chip[data-rid="${fromRid}"]`), row.querySelector(`.chip[data-rid="${toRid}"]`));
 }

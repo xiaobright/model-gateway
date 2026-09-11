@@ -116,7 +116,8 @@ def test_delete_whole_model_removes_every_candidate(gateway):
 
 def test_model_is_bound_to_one_interface(gateway):
     """模型的接口 = 它候选所在分组的接口。跨接口调是 404 —— 拿 Anthropic 的请求体去打人家的
-    /v1/responses 只会得到垃圾。跨接口挂候选是 409，否则「这个名字在哪个接口下」就没答案了。"""
+    /v1/responses 只会得到垃圾。同名模型可以在两种接口下各挂一条链，但两条链互不可见：
+    转发只在自己接口的候选里挑、降级，谁也串不到谁那边去。"""
     with MockUpstream("siteA") as a:
         g_an = add_upstream(gateway, a, "siteA", "anthropic")
         uid = provider_id(gateway, "siteA")
@@ -131,9 +132,19 @@ def test_model_is_bound_to_one_interface(gateway):
         assert wrong.status_code == 404
         assert "anthropic" in wrong.json()["error"]["message"]
 
+        # 同名模型挂到另一种接口：合法，两条链各自独立
         dup = gateway.post("/admin/api/models", json={"model_name": "opus", "group_id": g_oa})
-        assert dup.status_code == 409 and "接口" in dup.json()["detail"]
-        assert "opus" in dup.json()["detail"], "得说清是哪个模型名撞了，一批几十个时才找得到"
+        assert dup.status_code == 200, dup.text
+
+        rows = gateway.get("/admin/api/models").json()
+        assert sorted((g["model_name"], g["protocol"]) for g in rows) == [
+            ("opus", "anthropic"), ("opus", "openai"),
+        ]
+        # 各链各管各的转发：/v1/responses 现在走 openai 链，/v1/messages 走 anthropic 链
+        assert gateway.post("/v1/responses", json={"model": "opus"}).status_code == 200
+        assert gateway.post("/v1/messages", json=msg("opus")).json()["model"] == "claude-opus-4-1"
+        # /v1/models 里只列一次
+        assert [m["id"] for m in gateway.get("/v1/models").json()["data"]].count("opus") == 1
 
         bad = gateway.post(f"/admin/api/upstreams/{uid}/groups", json={"name": "x", "protocol": "nope"})
         assert bad.status_code == 400
@@ -208,10 +219,15 @@ def test_chat_completions_is_a_third_protocol(gateway):
         assert wrong.status_code == 404
         assert "openai-chat" in wrong.json()["error"]["message"]
 
-        # 同名的候选不能挂到别的接口上
+        # 同名的候选可以挂到别的接口上（同名多协议），两条链互不干扰
         g_oa = add_group(gateway, provider_id(gateway, "siteA"), "openai", name="gpt", api_key="k")
-        dup = gateway.post("/admin/api/models", json={"model_name": "chat-model", "group_id": g_oa})
-        assert dup.status_code == 409
+        assert gateway.post(
+            "/admin/api/models", json={"model_name": "chat-model", "group_id": g_oa}
+        ).status_code == 200
+        # 挂上之后两个端点都通：chat 走 chat 链，responses 走 openai 链
+        body = {"model": "chat-model", "messages": [{"role": "user", "content": "hi"}]}
+        assert gateway.post("/v1/chat/completions", json=body).status_code == 200
+        assert gateway.post("/v1/responses", json={"model": "chat-model"}).status_code == 200
 
 
 def test_chat_completions_stream_uses_done_marker_and_usage(gateway):

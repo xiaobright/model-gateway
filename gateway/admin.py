@@ -547,16 +547,17 @@ def remove_group_model(
 def get_model_routes() -> list[dict[str, Any]]:
     disabled = db.disabled_protocols()
     cooling = {b["group_id"]: b for b in failover.snapshot()}
-    grouped: dict[str, dict[str, Any]] = {}
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for row in db.list_routes():
         if row["protocol"] in disabled:
             continue
+        key = (row["model_name"], row["protocol"])
         group = grouped.setdefault(
-            row["model_name"],
+            key,
             {
                 "model_name": row["model_name"],
-                # 模型在哪个接口下暴露 = 它候选所在分组的接口。理论上所有候选都一样
-                # （add_model_route 守着），活跃的那条优先，免得手改过的老库看起来乱跳
+                # 同名模型可以在多种接口下各挂一条链（转发按「模型名 + 请求接口」选链，
+                # 两条链互不可见），所以一行 = 一条链，接口是它自己的属性
                 "protocol": row["protocol"],
                 "candidates": [],
                 # 保存的首选和当前实际起点分开：停用首选后，自动降级仍可能有可用候选。
@@ -589,7 +590,6 @@ def get_model_routes() -> list[dict[str, Any]]:
             }
         )
         if is_active:
-            group["protocol"] = row["protocol"]
             group["preferred_route_id"] = row["route_id"]
 
     # 和 proxy.forward 使用同一条 resolve_chain + 断路器排序规则，返回当前真正会先
@@ -599,16 +599,7 @@ def get_model_routes() -> list[dict[str, Any]]:
         if chain:
             ordered = failover.order_chain(chain) if failover.enabled(group["protocol"]) else chain
             group["active_route_id"] = ordered[0].route_id
-    return sorted(grouped.values(), key=lambda g: g["model_name"])
-
-
-def _mismatch(model_name: str, exc: db.ProtocolMismatch) -> HTTPException:
-    mine, theirs = exc.args
-    return HTTPException(
-        409,
-        f"「{model_name}」已经在 {mine} 接口下暴露了，不能再挂一个 {theirs} 接口的分组 —— "
-        "同一个模型名的候选必须都在同一种接口上",
-    )
+    return sorted(grouped.values(), key=lambda g: (g["model_name"], g["protocol"]))
 
 
 @router.post("/models")
@@ -616,10 +607,7 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
     group = _require_group(payload.group_id)
     model_name = payload.model_name.strip()
     remote_model = payload.remote_model.strip() or model_name
-    try:
-        route_id = db.add_model_route(model_name, payload.group_id, remote_model)
-    except db.ProtocolMismatch as exc:
-        raise _mismatch(model_name, exc) from exc
+    route_id = db.add_model_route(model_name, payload.group_id, remote_model)
     if not route_id:
         raise HTTPException(
             409,
@@ -645,8 +633,6 @@ def transfer_model_routes(payload: RouteTransferIn) -> dict[str, Any]:
         raise HTTPException(400, str(exc)) from exc
     except db.RouteTransferConflict as exc:
         raise HTTPException(409, str(exc)) from exc
-    except db.ProtocolMismatch as exc:
-        raise _mismatch(payload.target_model_name, exc) from exc
     log(
         f"TRANSFER mode={payload.mode} from={payload.source_model_name!r}"
         f" to={result['model_name']!r} added={result['added']} merged={result['merged']}"
@@ -754,6 +740,7 @@ def remove_model_route(
     model_name: str = Query(default="", description="模型名"),
     group_id: int | None = Query(default=None, description="只删这个模型在该分组下的候选（可能有多条）"),
     route_id: int | None = Query(default=None, description="只删这一条候选；给了它就不看前两个参数"),
+    protocol: str = Query(default="", description="只删这个接口下的链；同名模型在其它接口下的候选保留"),
 ) -> dict[str, Any]:
     # 走 query 而不是路径参数：模型名常带 '/'（如 deepseek-ai/DeepSeek-V3），放路径里会被当成多段
     if route_id is not None:
@@ -764,7 +751,7 @@ def remove_model_route(
     if not model_name:
         raise HTTPException(400, "要么给 route_id，要么给 model_name")
     if group_id is None:
-        removed = db.delete_model(model_name)
+        removed = db.delete_model(model_name, protocol)
         if removed == 0:
             raise HTTPException(404, f"模型「{model_name}」不存在")
         return {"ok": True, "removed": removed}

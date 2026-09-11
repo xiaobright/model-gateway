@@ -797,19 +797,24 @@ async function removeModel(name) {
 /* ---------------------------------------------------------------- 路由弹窗 */
 
 /* 一个弹窗三种用法：新增模型 / 给已有模型加候选 / 改某个候选（上游真名 + 1M）。
-   「接口」在这里只是个过滤器 —— 真正决定模型走哪种接口的是它候选所在分组的接口。
+   「接口」在这里只是个过滤器 —— 真正决定候选走哪种接口的是它所在分组的接口。
+   同名模型可以在多种接口下各挂一条链，所以定位行要 (model, proto) 两个字段。
    候选用它自己的 route_id 指：同一个分组下可以挂同一个模型的好几条真名。 */
-function openRoute(model, rid) {
+function openRoute(model, rid, proto) {
   if (!PROTOCOLS.length) return toast('协议选项还没加载完成，请稍后重试', 'err');
-  const row = model ? state.routes.find((r) => r.model_name === model) : null;
+  const row = model
+    ? state.routes.find((r) => r.model_name === model && (!proto || r.protocol === proto))
+    : null;
   const cand = row && rid ? row.candidates.find((c) => c.route_id === rid) : null;
-  // 已有模型的接口已经定了；新增时跟当前分段（分段在「全部」就默认 OpenAI）
-  const iface = row ? row.protocol : (state.iface || defaultProtocol());
+  // 改候选时接口跟那条候选走（不能改）；新增/加候选时默认该链的接口，也允许换一种
+  const iface = cand
+    ? row.protocol
+    : (proto || (row ? row.protocol : null) || state.iface || defaultProtocol());
   const pool = upstreamsFor(iface);
   if (!pool.length) {
     return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
   }
-  state.editingCand = cand ? { model, rid } : null;
+  state.editingCand = cand ? { model, rid, proto: row.protocol } : null;
   routeRemoteSeq += 1;
 
   $('route-title').textContent = cand ? `改候选：${model}` : (model ? `给「${model}」加候选` : '新增模型');
@@ -817,7 +822,8 @@ function openRoute(model, rid) {
   $('rt-model').value = model || '';
   $('rt-model').readOnly = Boolean(model);
   fillIfaceSelect('rt-iface', iface);
-  $('rt-iface-wrap').hidden = Boolean(row);   // 已有模型的接口不给改
+  // 只有「改某个候选」才锁接口；给已有模型加候选允许选另一种接口（同名多协议）
+  $('rt-iface-wrap').hidden = Boolean(cand);
   fillUpstreamSelect('rt-upstream', pool);
   $('rt-upstream').disabled = Boolean(cand);
   $('rt-group').disabled = Boolean(cand);     // 改候选就是改这一条，别顺手换成另一个分组
@@ -846,7 +852,9 @@ function openRoute(model, rid) {
 function orderHint() {
   const cand = state.editingCand;
   if (!cand) return;
-  const row = state.routes.find((r) => r.model_name === cand.model);
+  const row = state.routes.find(
+    (r) => r.model_name === cand.model && (!cand.proto || r.protocol === cand.proto),
+  );
   const ids = row ? row.candidates.map((c) => c.route_id) : [];
   const at = ids.indexOf(cand.rid);
   $('rt-order-hint').textContent = at < 0 ? '' : `第 ${at + 1} / ${ids.length} 位`;
@@ -1291,8 +1299,8 @@ const ACTIONS = {
 
   'open-search': openSearch,
   'new-route': () => openRoute('', null),
-  'add-candidate': ({ model }) => openRoute(model, null),
-  'edit-candidate': ({ model, rid }) => openRoute(model, Number(rid)),
+  'add-candidate': ({ model, proto }) => openRoute(model, null, proto),
+  'edit-candidate': ({ model, rid, proto }) => openRoute(model, Number(rid), proto),
 
   /* 接口全局开关：停用后这种接口的模型 / 分组 / 只有它的站都隐藏，转发直接拒绝。
      只影响展示与转发，描述符和配置都留着，打开就回来。 */
@@ -1356,9 +1364,9 @@ const ACTIONS = {
     requestAnimationFrame(orderHint);
   },
 
-  'switch': async ({ model, rid }) => {
+  'switch': async ({ model, rid, proto }) => {
     const id = Number(rid);
-    const group = state.routes.find((r) => r.model_name === model);
+    const group = state.routes.find((r) => r.model_name === model && r.protocol === proto);
     const cand = group && group.candidates.find((c) => c.route_id === id);
     if (!cand) return;
     if (!cand.upstream_enabled) return toast('这个供应商是停用状态，先在「上游站点」里启用它', 'err');
@@ -1366,13 +1374,13 @@ const ACTIONS = {
     const from = group.active_route_id;
     await api('POST', '/admin/api/models/switch', { route_id: id });
     await refreshConfig();
-    views.afterSwitch(model, from, id);
+    views.afterSwitch(model, from, id, proto);
     toast(`${model} → ${candLabel(model, cand)}`, 'ok');
   },
 
-  'del-candidate': async ({ model, rid }) => {
+  'del-candidate': async ({ model, rid, proto }) => {
     const id = Number(rid);
-    const group = state.routes.find((r) => r.model_name === model);
+    const group = state.routes.find((r) => r.model_name === model && r.protocol === proto);
     const cand = group && group.candidates.find((c) => c.route_id === id);
     const last = group && group.candidates.length === 1;
     const okay = await confirmBox({
@@ -1389,17 +1397,20 @@ const ACTIONS = {
     toast('已移除', 'ok');
   },
 
-  'del-model': async ({ model }) => {
-    const group = state.routes.find((r) => r.model_name === model);
+  'del-model': async ({ model, proto }) => {
+    const group = state.routes.find((r) => r.model_name === model && r.protocol === proto);
     const n = group ? group.candidates.length : 0;
+    const other = state.routes.find((r) => r.model_name === model && r.protocol !== proto);
     const okay = await confirmBox({
       title: '删除模型',
-      body: `删掉 <b>${esc(model)}</b> 的全部 ${n} 条候选，它将不再出现在 /v1/models 里。`
+      body: `删掉 <b>${esc(model)}</b> 在${PROTO_LABEL[proto] || proto || '该接口'}下的全部 ${n} 条候选，`
+        + `它将不再从这个接口的 /v1/models 里暴露。`
+        + (other ? '<br><br>它在其它接口下还有候选，不受影响。' : '')
         + '<br><br>上游站点本身不受影响，之后还能重新导入。',
       ok: '删除',
     });
     if (!okay) return;
-    await api('DELETE', `/admin/api/models?model_name=${encodeURIComponent(model)}`);
+    await api('DELETE', `/admin/api/models?model_name=${encodeURIComponent(model)}&protocol=${encodeURIComponent(proto || '')}`);
     await refreshConfig();
     toast('已删除', 'ok');
   },
