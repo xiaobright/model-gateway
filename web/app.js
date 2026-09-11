@@ -1491,13 +1491,14 @@ document.addEventListener('click', (ev) => {
   const seg = ev.target.closest('[data-window]');
   if (seg) { setWindow(seg.dataset.window); return; }
 
-  // 两个分段选择器：data-iface 在模型路由上，data-proto 在转发记录上。
-  // 记录行用的是 data-log-proto、候选圆片用 data-gid，都不会被这里的 closest 命中
-  const ifaceSeg = ev.target.closest('[data-iface]');
+  // 分段选择器各自锁在自己的 seg 容器里。候选圆片 / 模型行也带 data-proto
+  //（多协议同名模型要分清是哪条链），绝不能被这里的 closest 截走 —— 否则
+  // 点「切换 / ✎ / ✕ / 删除」只会去切转发记录的协议筛选，动作本身永远不执行
+  const ifaceSeg = ev.target.closest('#seg-iface [data-iface]');
   if (ifaceSeg) { setIface(ifaceSeg.dataset.iface); return; }
 
-  const proto = ev.target.closest('[data-proto]');
-  if (proto) { setProto(proto.dataset.proto); return; }
+  const protoSeg = ev.target.closest('#seg-proto [data-proto]');
+  if (protoSeg) { setProto(protoSeg.dataset.proto); return; }
 
   const el = ev.target.closest('[data-act]');
   if (!el || el.tagName === 'INPUT') return;
