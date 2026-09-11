@@ -693,3 +693,15 @@ requirements.txt 已加。**重启网关生效**。
 **结论**：Codex 客户端直接配 DeepSeek 模型 id（如 `deepseek-v4-flash`）→ 自动回退
 兼容线格式 → 顶层 function 工具、无 namespace、无 developer、无 exec → 任何兼容
 Responses 的上游**零改动透传**即可用。这验证了用户的方案（2026-09-11）。
+
+### 10.14 退役（2026-09-11 10:15）
+
+真机冒烟确认：Codex 配第三方模型 slug（deepseek-v4-flash）走 fallback 兼容格式，
+纯透传 6 步全过 —— 桥接与 normalize 失去触发路径，从工作区移除（commit c676ab0）。
+
+完整代码永久可回捞：
+- 桥接层 + 全部集成：`git checkout c3e9c6f -- gateway/bridge/`（或整库看该提交）
+- normalize：b0784dc
+- 桥接的流式/折叠修复（stream.py）：c3e9c6f 里的版本已含
+
+若哪天要再接「gpt-5.6-* 模型名 + 仅 Chat 上游」的组合，从 c3e9c6f 捞回即可。
