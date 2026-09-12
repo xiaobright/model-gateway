@@ -54,13 +54,21 @@ const refresh = createRefreshQueue(
   (value) => applied.push(value),
 );
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+// 队列回归成「丢弃第二个请求」时不能让脚本永久挂起：等不到就直接失败
+async function until(check, what) {
+  for (let i = 0; i < 200; i += 1) {
+    if (check()) return;
+    await tick();
+  }
+  throw new Error(`超时等待：${what}`);
+}
 const oldRefresh = refresh({ name: 'old' });
 const newRefresh = refresh({ name: 'new' });
 let oldResolved = false;
 oldRefresh.then(() => { oldResolved = true; });
 await tick();
 loads[0].resolve('old');
-while (loads.length < 2) await tick();
+await until(() => loads.length >= 2, '第二个刷新入队');
 await tick();
 assert.equal(oldResolved, false);
 assert.deepEqual(applied, []);
@@ -78,7 +86,7 @@ const firstPoll = pollRefresh({ name: 'poll-1' }, { allowIntermediate: true });
 const secondPoll = pollRefresh({ name: 'poll-2' }, { allowIntermediate: true });
 await tick();
 pollLoads[0].resolve('poll-1');
-while (pollLoads.length < 2) await tick();
+await until(() => pollLoads.length >= 2, '第二个轮询入队');
 await tick();
 assert.deepEqual(pollApplied, ['poll-1']);
 pollLoads[1].resolve('poll-2');
@@ -88,17 +96,22 @@ assert.deepEqual(pollApplied, ['poll-1', 'poll-2']);
 const originalFetch = globalThis.fetch;
 let resolveFetch;
 globalThis.fetch = () => new Promise((resolve) => { resolveFetch = resolve; });
-const token = beginGroupEdit(1, 7);
-const late = pullRemoteModels(
-  7,
-  `group:${token.seq}:7`,
-  () => isCurrentGroupEdit(token),
-  { onSuccess: () => { throw new Error('stale response painted'); } },
-);
-beginGroupEdit(1, 8);
-resolveFetch(new Response(JSON.stringify({ models: ['late-model'] }), { status: 200 }));
-await late;
-assert.equal(remoteModels(7), undefined);
+try {
+  const token = beginGroupEdit(1, 7);
+  const late = pullRemoteModels(
+    7,
+    `group:${token.seq}:7`,
+    () => isCurrentGroupEdit(token),
+    { onSuccess: () => { throw new Error('stale response painted'); } },
+  );
+  beginGroupEdit(1, 8);
+  resolveFetch(new Response(JSON.stringify({ models: ['late-model'] }), { status: 200 }));
+  await late;
+  assert.equal(remoteModels(7), undefined);
+} finally {
+  // 中途断言失败也要还原，不然被 mock 的 fetch 会留在整个进程里
+  globalThis.fetch = originalFetch;
+}
 
 const writeToken = beginGroupEdit(1, 9);
 assert.equal(beginModelWrites(writeToken, ['m']), true);
@@ -113,6 +126,5 @@ assert.equal(updateGroupEdit(movingToken, 2, 11), true);
 endModelWrites(movingToken, ['moving']);
 assert.equal(beginModelWrites(movingToken, ['moving']), true);
 endModelWrites(movingToken, ['moving']);
-globalThis.fetch = originalFetch;
 
 console.log('web protocol metadata behavior: ok');

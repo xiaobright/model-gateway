@@ -512,7 +512,7 @@ def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway,
         (0, True),
         (3, True),
         (4, True),
-        (5, True),  # v5 缺 retry_rules，要补列并预置同站重试
+        (5, True),  # v5 缺 retry_rules / cache_creation_tokens，要补列（不预置规则）
         (0, False),
         # 完整基线跟 SCHEMA_VERSION 走：结构升版时这里不用手改数字
         (gateway_db.SCHEMA_VERSION, False),
@@ -540,16 +540,22 @@ def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatc
         """)
         if missing:
             conn.execute("ALTER TABLE request_log DROP COLUMN cache_creation_tokens")
+            if version == 5:
+                conn.execute("ALTER TABLE upstreams DROP COLUMN retry_rules")
         conn.execute(f"PRAGMA user_version={version}")
     conn.close()
 
     db.init_db()
     assert db._schema_version(db_path) == db.SCHEMA_VERSION
     assert "cache_creation_tokens" in db._columns(db_path, "request_log")
+    if version == 5:  # v5 真缺 retry_rules 这一列，迁移必须补回来才能变成「完整基线」
+        assert "retry_rules" in db._columns(db_path, "upstreams")
     backups = list(tmp_path.glob("gateway.db.bak-*"))
     assert bool(backups) == missing
     if missing:
         assert "cache_creation_tokens" not in db._columns(backups[0], "request_log")
+        if version == 5:
+            assert "retry_rules" not in db._columns(backups[0], "upstreams")
     route = db.resolve_route("m", "anthropic")
     assert (route.route_id, route.group_id, route.remote_model, route.upstream.egress) == (42, 13, "remote", "direct")
     assert db.list_routes()[0]["priority"] == 7

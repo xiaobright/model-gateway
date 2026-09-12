@@ -72,8 +72,7 @@ def test_merge_reuses_duplicate_and_keeps_target_preference_and_order(gateway):
 @pytest.mark.parametrize("reason", ["missing", "stale-source", "same-model", "blank"])
 def test_rejected_transfer_leaves_both_models_unchanged(gateway, reason):
     _, one, two = seed(gateway)
-    if reason != "protocol":
-        seed(gateway, "target", "openai")
+    seed(gateway, "target", "openai")
     before = db.list_routes()
     response = transfer(
         gateway, [one, 999999 if reason == "missing" else two],
@@ -82,6 +81,23 @@ def test_rejected_transfer_leaves_both_models_unchanged(gateway, reason):
         mode="move",
     )
     assert response.status_code in (400, 409, 422), response.text
+    assert db.list_routes() == before
+
+
+def test_transfer_rejects_candidates_from_different_protocols(gateway):
+    """一条链的事务边界是「一种接口」：来源候选跨了接口必须拒绝。"""
+    _, one, _ = seed(gateway)  # openai
+    site = gateway.post(
+        "/admin/api/upstreams", json={"name": "second", "base_url": "https://second.example.invalid"}
+    ).json()
+    other_group = add_group(gateway, site["id"], "anthropic", name="另一条链")
+    mixed = add_route(gateway, "source", other_group, "remote-other")
+    before = db.list_routes()
+
+    response = transfer(gateway, [one, mixed])
+
+    assert response.status_code == 409
+    assert "协议" in response.json()["detail"]
     assert db.list_routes() == before
 
 

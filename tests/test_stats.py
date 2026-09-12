@@ -24,9 +24,9 @@ def test_request_log_records_usage_and_stats(gateway):
         assert row["client"] == "python-httpx"
 
         stats = gateway.get("/admin/api/stats").json()
-        assert stats["requests"] >= 1
-        assert stats["input_tokens"] >= 120
-        assert stats["cached_tokens"] >= 80
+        assert stats["requests"] == 1
+        assert stats["input_tokens"] == 120
+        assert stats["cached_tokens"] == 80
         assert 0 < stats["cache_hit_rate"] < 1
 
 

@@ -73,14 +73,18 @@ def gateway(tmp_path, monkeypatch, request):
         monkeypatch.setattr(
             "gateway.upstream.fetch_remote_models", fetch_remote_models
         )
-        with TestClient(
-            create_app(),
-            base_url="http://127.0.0.1",
-            headers={"user-agent": "python-httpx"},
-        ) as client:
-            yield client
-        helpers._FAKE_UPSTREAMS.clear()
-        helpers.IN_PROCESS_UPSTREAMS = False
+        try:
+            with TestClient(
+                create_app(),
+                base_url="http://127.0.0.1",
+                headers={"user-agent": "python-httpx"},
+            ) as client:
+                yield client
+        finally:
+            # lifespan 收尾抛异常也要复位，否则后面的 network 用例会把 mock 上游
+            # 当成进程内假上游注册，形成级联怪错
+            helpers._FAKE_UPSTREAMS.clear()
+            helpers.IN_PROCESS_UPSTREAMS = False
         return
 
     port = helpers.free_port()

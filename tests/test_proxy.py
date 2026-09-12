@@ -183,8 +183,9 @@ def test_standalone_search_target_api_validates_and_clears(gateway):
         assert cleared.json() == {"group_id": None, "model": None}
 
 
+@pytest.mark.network
 def test_hanging_error_body_does_not_block_failover(gateway):
-    """拿到 503 头后，错误正文不应挡住备用站。"""
+    """拿到 503 头后，错误正文不应挡住备用站（走真实 socket，验证 ASGI 侧的挂体语义）。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA", "anthropic")
         g_b = add_upstream(gateway, b, "siteB", "anthropic")
