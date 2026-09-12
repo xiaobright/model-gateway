@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import urllib.parse
 from collections import defaultdict
-from typing import Any, Iterable, Literal
+from typing import Annotated, Any, Iterable, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from . import capture, db, failover, inflight, protocols, proxy as proxy_mod, rewrite
 from . import stats as stats_mod
@@ -17,12 +18,24 @@ from .reqlog import log
 
 router = APIRouter(prefix="/admin/api")
 
+# 只含空白的名字过得了 min_length=1，但落库后是空串 —— 在入口就 strip 再查长度
+_NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+def _validate_base_url(raw: str) -> str:
+    """站根必须是 http(s)://主机[:端口]；坏地址在保存时就拒绝，别攒到第一个请求。"""
+    value = raw.strip()
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise HTTPException(400, f"站根要填 http(s)://主机[:端口]（收到 {value!r}）")
+    return value
+
 
 class UpstreamIn(BaseModel):
     """供应商只管「站在哪、怎么连」。key 和接口都在分组里。"""
 
-    name: str = Field(min_length=1)
-    base_url: str = Field(min_length=1)
+    name: _NonBlank
+    base_url: _NonBlank
     enabled: bool = True
     header_override: str = ""
     # 从哪扇门出去：'' 跟随系统代理 / 'direct' 直连 / 一个代理 URL
@@ -33,7 +46,7 @@ class UpstreamIn(BaseModel):
 
 
 class GroupIn(BaseModel):
-    name: str = Field(min_length=1)
+    name: _NonBlank
     protocol: str = Field(min_length=1)
     api_key: str = ""
     enabled: bool = True
@@ -48,7 +61,7 @@ class ModelRouteIn(BaseModel):
     所以「哪一条」在别的接口里用 route_id 指，不能再用 group_id。
     """
 
-    model_name: str = Field(min_length=1)
+    model_name: _NonBlank
     group_id: int
     remote_model: str = ""
 
@@ -59,8 +72,8 @@ class RouteEditIn(BaseModel):
 
 
 class RouteTransferIn(BaseModel):
-    source_model_name: str = Field(min_length=1)
-    target_model_name: str = Field(min_length=1)
+    source_model_name: _NonBlank
+    target_model_name: _NonBlank
     route_ids: tuple[int, ...] = Field(min_length=1)
     mode: Literal["copy", "move"] = "copy"
 
@@ -81,7 +94,7 @@ class SwitchIn(BaseModel):
 
 
 class OrderIn(BaseModel):
-    model_name: str = Field(min_length=1)
+    model_name: _NonBlank
     # 自动降级依次尝试的顺序，从先到后。元素是候选 id
     order: tuple[int, ...] = Field(min_length=1)
 
@@ -335,7 +348,7 @@ def post_upstream(payload: UpstreamIn) -> dict[str, Any]:
     try:
         created = db.create_upstream(
             name,
-            payload.base_url.strip(),
+            _validate_base_url(payload.base_url),
             _validate_override(payload.header_override),
             payload.enabled,
             _validate_egress(payload.egress or ""),
@@ -357,7 +370,7 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
         ok = db.update_upstream(
             upstream_id,
             name,
-            payload.base_url.strip(),
+            _validate_base_url(payload.base_url),
             payload.enabled,
             _validate_override(payload.header_override),
             egress,
@@ -374,6 +387,9 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
 
 @router.delete("/upstreams/{upstream_id}")
 def remove_upstream(upstream_id: int) -> dict[str, bool]:
+    # 分组随供应商级联删除；先把它们的断路器状态清掉，不然管理页会一直挂着幽灵条目
+    for group in db.list_groups(upstream_id):
+        failover.clear(group.id)
     if not db.delete_upstream(upstream_id):
         raise HTTPException(404, f"供应商 {upstream_id} 不存在")
     return {"ok": True}
@@ -547,6 +563,7 @@ def remove_group(group_id: int) -> dict[str, bool]:
     _require_group(group_id)
     if not db.delete_group(group_id):
         raise HTTPException(404, f"分组 {group_id} 不存在")
+    failover.clear(group_id)
     return {"ok": True}
 
 
@@ -893,12 +910,8 @@ def remove_model_route(
 
 @router.get("/requests")
 def get_requests(limit: int = 50) -> list[dict[str, Any]]:
-    rows = db.recent_requests(max(1, min(limit, 200)))
-    disabled = db.disabled_protocols()
-    if disabled:
-        # 停用的接口在管理页里像不存在一样，历史记录也一起藏起来
-        rows = tuple(r for r in rows if (r.get("protocol") or "") not in disabled)
-    return list(rows)
+    # 停用的接口像不存在一样，历史记录也一起藏 —— 过滤放 SQL 里，别让它们占 limit 配额
+    return list(db.recent_requests(max(1, min(limit, 200)), db.disabled_protocols()))
 
 
 @router.delete("/requests")

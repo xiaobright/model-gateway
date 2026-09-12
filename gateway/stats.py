@@ -91,9 +91,15 @@ def request_stats(rows: Iterable[dict] | None = None) -> dict[str, int]:
 
 
 def cache_hit_rate(stats: dict[str, int]) -> float:
-    """缓存读取 / 协议归一化后的总输入；Anthropic 的 cache_read 不在 input 内。"""
+    """缓存读取 / 协议归一化后的总输入；Anthropic 的 cache_read 不在 input 内。
+
+    夹到 100%：某行的 usage 只捞到缓存数、没捞到 input（流被截/上游字段缺失）时，
+    分子会大于分母，旧口径能算出 900% 这种数。
+    """
     total = stats.get("context_tokens") or 0
-    return round((stats.get("cached_tokens") or 0) / total, 4) if total else 0.0
+    if total <= 0:
+        return 0.0
+    return round(min(1.0, (stats.get("cached_tokens") or 0) / total), 4)
 
 
 def _buckets(window: str) -> tuple[int, int, int]:
@@ -113,13 +119,10 @@ def _buckets(window: str) -> tuple[int, int, int]:
 
 
 # 三个聚合都允许传入已取好的行，overview 里拉一次复用给三个，省两次全表读。
-# 全局停用的接口在这里就滤掉：它的历史记录也一起消失，管理页不会为死掉的站报健康度。
+# 全局停用的接口在 SQL 里就滤掉：它的历史记录也一起消失，管理页不会为死掉的站报健康度，
+# 也不会让停用协议的记录占掉 2000 行配额。
 def _all_rows() -> tuple[dict, ...]:
-    rows = db.recent_requests(db.LOG_KEEP_ROWS)
-    disabled = db.disabled_protocols()
-    if not disabled:
-        return rows
-    return tuple(row for row in rows if (row.get("protocol") or "") not in disabled)
+    return db.recent_requests(db.LOG_KEEP_ROWS, db.disabled_protocols())
 
 
 # ---------------------------------------------------------------- 时间线

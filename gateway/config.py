@@ -16,7 +16,11 @@ DEFAULT_HOST = "127.0.0.1"
 def load_port() -> int:
     try:
         raw = json.loads(SETTINGS_PATH.read_text("utf-8"))
-        port = int(raw.get("port", DEFAULT_PORT))
+        value = raw.get("port", DEFAULT_PORT)
+        # JSON 里的 true 会被 int() 收成 1 并通过范围检查
+        if isinstance(value, bool):
+            return DEFAULT_PORT
+        port = int(value)
     except (OSError, ValueError, TypeError):
         return DEFAULT_PORT
     return port if 1 <= port <= 65535 else DEFAULT_PORT

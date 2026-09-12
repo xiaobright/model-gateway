@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,8 +11,10 @@ SHORTCUT_NAME = "ModelGateway.lnk"
 
 
 def shortcut_path() -> Path:
-    appdata = Path.home() / "AppData" / "Roaming"
-    return appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / SHORTCUT_NAME
+    # 认 APPDATA 环境变量：用户目录被重定向时 Path.home() 会指错地方
+    appdata = os.environ.get("APPDATA")
+    base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    return base / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / SHORTCUT_NAME
 
 
 def is_enabled() -> bool:
@@ -32,7 +35,15 @@ def enable() -> None:
         "$s.Description = 'Model Gateway';"
         "$s.Save()"
     )
-    subprocess.run(["powershell", "-NoProfile", "-Command", script], check=True, capture_output=True)
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script], capture_output=True
+        )
+    except OSError as exc:
+        raise OSError(f"调用 PowerShell 失败：{exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or b"").decode("utf-8", "ignore").strip()[:200]
+        raise OSError(f"创建启动快捷方式失败：{detail or f'powershell 退出码 {proc.returncode}'}")
 
 
 def disable() -> None:

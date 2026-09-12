@@ -760,3 +760,65 @@ def test_capture_directories_do_not_collide_within_a_second(tmp_path, monkeypatc
     capture.finish(second)
     assert (first.dir / "stream.sse").read_bytes() == b"AAAA"
     assert (second.dir / "stream.sse").read_bytes() == b"BBBB"
+
+
+# ------------------------------------------------------------------ 管理/数据加固（P3）
+
+
+def test_ca_context_wraps_a_corrupt_certificate_as_value_error(tmp_path):
+    """文件在但内容不是 PEM 时抛的是 ssl.SSLError；必须统一成 ValueError，
+    「保存出口返回 400、转发按连不上降级」才不会各自漏成 500。"""
+    from gateway import upstream
+
+    bad = tmp_path / "bad.pem"
+    bad.write_text("definitely not a certificate", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="读不出来"):
+        upstream.ca_context(f"{upstream.CA_PREFIX}{bad}")
+
+
+def test_init_db_refuses_a_newer_schema(tmp_path, monkeypatch):
+    import sqlite3
+
+    from gateway import config, db
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "gateway.db")
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.execute(f"PRAGMA user_version={db.SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="升级"):
+        db.init_db()
+
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+    assert version == db.SCHEMA_VERSION + 1, "旧程序不能把新库的版本号往回盖"
+
+
+def test_cache_hit_rate_never_exceeds_100_percent():
+    from gateway.stats import cache_hit_rate
+
+    assert cache_hit_rate({"context_tokens": 100, "cached_tokens": 900}) == 1.0
+    assert cache_hit_rate({"context_tokens": 0, "cached_tokens": 5}) == 0.0
+    assert cache_hit_rate({"context_tokens": 1000, "cached_tokens": 250}) == 0.25
+
+
+def test_settings_port_ignores_booleans(tmp_path, monkeypatch):
+    from gateway import config
+
+    settings = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings)
+
+    settings.write_text('{"port": true}', encoding="utf-8")
+    assert config.load_port() == config.DEFAULT_PORT, "JSON true 不能被 int() 收成 1"
+
+    settings.write_text('{"port": 9000}', encoding="utf-8")
+    assert config.load_port() == 9000
+
+    settings.write_text('{"port": "abc"}', encoding="utf-8")
+    assert config.load_port() == config.DEFAULT_PORT

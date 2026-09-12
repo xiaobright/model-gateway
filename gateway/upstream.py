@@ -97,7 +97,12 @@ def ca_context(frag: str) -> ssl.SSLContext:
     if not ca.is_file():
         raise ValueError(f"#ca 指的证书文件不存在：{ca}")
     ctx = ssl.create_default_context()
-    ctx.load_verify_locations(cafile=str(ca))
+    try:
+        ctx.load_verify_locations(cafile=str(ca))
+    except (ssl.SSLError, OSError) as exc:
+        # 文件在但内容不是 PEM 时抛的是 ssl.SSLError（OSError 子类，不是 ValueError）：
+        # 统一包成 ValueError，保存出口和转发降级才共用同一种「配置坏了」的语义
+        raise ValueError(f"#ca 指的证书读不出来（{ca}）：{exc}") from exc
     return ctx
 
 

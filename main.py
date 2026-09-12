@@ -9,9 +9,19 @@ import webbrowser
 from gateway import config
 
 
+def _port_arg(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("端口必须是整数")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("端口要在 1-65535 之间")
+    return port
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Model Gateway")
-    parser.add_argument("--port", type=int, default=config.load_port())
+    parser.add_argument("--port", type=_port_arg, default=config.load_port())
     parser.add_argument("--tray", action="store_true", help="以托盘模式运行（Windows）")
     parser.add_argument("--no-tray", action="store_true", help="前台控制台模式")
     parser.add_argument("--open", action="store_true", dest="open_ui", help="启动后打开管理页")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -545,6 +546,13 @@ def _upgrade(path, stage: int) -> None:
 def init_db() -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = config.DB_PATH
+    version = _schema_version(path)
+    if version > SCHEMA_VERSION:
+        # 比程序新的库不能碰：旧代码会把 user_version 往回盖，之后按旧结构访问
+        raise RuntimeError(
+            f"数据库 schema 是 v{version}，比本程序支持的 v{SCHEMA_VERSION} 新；"
+            "请先升级程序，别用旧版本打开它"
+        )
     with _conn() as conn:
         # 新库建表；老库里已存在的表 IF NOT EXISTS 会跳过，重建交给迁移
         conn.executescript(_SCHEMA)
@@ -552,7 +560,7 @@ def init_db() -> None:
     stage = _schema_stage(path)
     if stage >= SCHEMA_VERSION:
         # 新库、或者形状已经最新但还没打过号的老库：补上号，以后就不用再按形状认了
-        if _schema_version(path) != SCHEMA_VERSION:
+        if version != SCHEMA_VERSION:
             _stamp(path, SCHEMA_VERSION)
         return
     _upgrade(path, stage)
@@ -885,6 +893,8 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
     活跃位、顺序都是**链内**（模型名 + 接口）的概念：同一模型名可以在另一种接口下
     另有一条独立链，两边的首选和优先级互不影响。"""
     with _conn() as conn:
+        # 先查后写要串行：并发双击新增同一条候选时，UNIQUE 约束会以 IntegrityError 冒到 500
+        conn.execute("BEGIN IMMEDIATE")
         exists = conn.execute(
             "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
             (model_name, group_id, remote_model),
@@ -1343,9 +1353,19 @@ def insert_request(
         )
 
 
-def recent_requests(limit: int = 50) -> tuple[dict, ...]:
+def recent_requests(limit: int = 50, exclude_protocols: Iterable[str] = ()) -> tuple[dict, ...]:
+    """最近 limit 条转发记录；exclude_protocols 里的接口在 SQL 里就滤掉（不占配额）。"""
+    excluded = tuple(sorted(set(exclude_protocols)))
     with _conn() as conn:
-        rows = conn.execute("SELECT * FROM request_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        if excluded:
+            marks = ",".join("?" for _ in excluded)
+            rows = conn.execute(
+                f"SELECT * FROM request_log WHERE protocol NOT IN ({marks})"
+                " ORDER BY id DESC LIMIT ?",
+                (*excluded, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM request_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return tuple(dict(r) for r in rows)
 
 
@@ -1374,6 +1394,8 @@ def set_setting(key: str, value: str) -> None:
 # 存「停用了哪些」而不是「启用了哪些」：新加一种协议默认就是启用的，不用补迁移。
 
 _DISABLED_PROTOCOLS_KEY = "disabled_protocols"
+# 开关是「读一整份 → 改一位 → 写回去」：并发切换两个协议时后写者会吞掉前一位
+_toggle_lock = threading.Lock()
 
 
 def disabled_protocols() -> frozenset[str]:
@@ -1394,12 +1416,13 @@ def protocol_enabled(protocol: str) -> bool:
 
 
 def set_protocol_enabled(protocol: str, enabled: bool) -> None:
-    current = set(disabled_protocols())
-    if enabled:
-        current.discard(protocol)
-    else:
-        current.add(protocol)
-    set_setting(_DISABLED_PROTOCOLS_KEY, json.dumps(sorted(current)))
+    with _toggle_lock:
+        current = set(disabled_protocols())
+        if enabled:
+            current.discard(protocol)
+        else:
+            current.add(protocol)
+        set_setting(_DISABLED_PROTOCOLS_KEY, json.dumps(sorted(current)))
 
 
 def clear_request_log() -> int:

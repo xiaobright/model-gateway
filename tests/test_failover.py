@@ -226,3 +226,17 @@ def test_site_level_failure_skips_the_rest_of_that_group(gateway):
         rows = wait_rows(gateway, 2)
         assert [(r["upstream"], r["attempt"]) for r in rows] == [("siteA", 1), ("siteB", 2)]
         assert rows_on(gateway, "siteA") == 1, "同一个站不该在一次请求里被打两遍"
+
+
+def test_deleting_a_group_clears_its_breaker(gateway):
+    """删掉的分组不该继续挂在断路器列表里，重启才消失。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a, _ = two_anthropic_sites(gateway, a, b)
+        a.fail_with(503)
+        for _ in range(2):
+            gateway.post("/v1/messages", json=msg("opus"))
+        breakers = gateway.get("/admin/api/failover").json()["breakers"]
+        assert any(x["group_id"] == g_a for x in breakers), "先确认它真的进了冷却"
+
+        assert gateway.delete(f"/admin/api/groups/{g_a}").status_code == 200
+        assert gateway.get("/admin/api/failover").json()["breakers"] == []

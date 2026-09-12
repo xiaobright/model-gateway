@@ -35,7 +35,8 @@ def _reject_reason(scope: dict) -> str | None:
         if headers.get("sec-fetch-site") == "cross-site":
             return "管理接口不接受跨站请求"
         origin = headers.get("origin", "")
-        if origin and origin != "null" and _hostname(origin).lower() not in LOOPBACK_HOSTS:
+        # Origin: null（sandboxed iframe / file:// 页面）同样不可信，一律按跨站处理
+        if origin and _hostname(origin).lower() not in LOOPBACK_HOSTS:
             return f"管理接口不接受跨站请求，Origin: {origin}"
     return None
 

@@ -81,7 +81,7 @@ def test_rejected_transfer_leaves_both_models_unchanged(gateway, reason):
         target="source" if reason == "same-model" else "   " if reason == "blank" else "target",
         mode="move",
     )
-    assert response.status_code in (400, 409), response.text
+    assert response.status_code in (400, 409, 422), response.text
     assert db.list_routes() == before
 
 

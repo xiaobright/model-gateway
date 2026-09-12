@@ -106,5 +106,8 @@ class TrayApp:
 
 def acquire_single_instance() -> bool:
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateMutexW(None, False, "ModelGateway_SingleInstance_Mutex")
+    handle = k32.CreateMutexW(None, False, "ModelGateway_SingleInstance_Mutex")
+    if not handle:
+        # 互斥体都建不出来（句柄耗尽之类）时别拦着启动：宁可双开也别打不开
+        return True
     return ctypes.get_last_error() != 183

@@ -111,6 +111,26 @@ def test_admin_api_rejects_cross_site_and_foreign_host(gateway):
     assert same_origin.status_code == 200
 
 
+def test_admin_api_rejects_origin_null(gateway):
+    """sandboxed iframe / file:// 页面会带 Origin: null —— 同样按跨站处理。"""
+    blocked = gateway.get("/admin/api/upstreams", headers={"Origin": "null"})
+    assert blocked.status_code == 403
+
+
+def test_whitespace_names_and_bad_base_urls_are_rejected(gateway):
+    blank = gateway.post("/admin/api/upstreams", json={"name": "   ", "base_url": "http://127.0.0.1:1"})
+    assert blank.status_code == 422, "只含空白的名字不能存成空串"
+
+    bad_scheme = gateway.post(
+        "/admin/api/upstreams", json={"name": "siteX", "base_url": "ftp://example.com"}
+    )
+    assert bad_scheme.status_code == 400
+    assert "站根" in bad_scheme.json()["detail"]
+
+    no_host = gateway.post("/admin/api/upstreams", json={"name": "siteX", "base_url": "http://"})
+    assert no_host.status_code == 400
+
+
 def test_static_assets_are_not_cached(gateway):
     """ES 模块的 import 是裸路径挂不了版本号，只能靠 no-store 保证改完刷新就生效。"""
     for path in ("/", "/static/app.js", "/static/views.js", "/static/style.css"):
