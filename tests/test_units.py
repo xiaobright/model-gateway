@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import urllib.request
 
 import httpx
@@ -155,6 +156,31 @@ def test_cancelling_as_headers_arrive_closes_the_response():
         assert response.is_closed
 
     asyncio.run(run())
+
+
+def test_waiting_for_headers_returns_as_soon_as_they_arrive():
+    """响应头一到就返回：不能把 50ms 的轮询节拍加在每个请求的关键路径上。"""
+    from gateway.proxy import _send_until_headers
+
+    response = httpx.Response(200, stream=httpx.ByteStream(b"unused"))
+
+    class Request:
+        async def is_disconnected(self):
+            return False
+
+    class Client:
+        async def send(self, prepared, *, stream):
+            await asyncio.sleep(0.001)
+            return response
+
+    async def run():
+        started = time.monotonic()
+        got = await _send_until_headers(Request(), Client(), object())
+        return got, time.monotonic() - started
+
+    got, elapsed = asyncio.run(run())
+    assert got is response
+    assert elapsed < 0.04, f"响应头 1ms 就回来了，不该等满 {elapsed * 1000:.0f}ms"
 
 
 def test_system_proxy_change_rebuilds_the_cached_client(monkeypatch):
@@ -315,6 +341,23 @@ def test_capture_stops_itself_after_the_requested_number(tmp_path, monkeypatch):
     assert capture.begin({"model": "c"}) is None
 
 
+def test_capture_directory_cannot_escape_its_root(tmp_path, monkeypatch):
+    """模型名来自客户端请求体，不能借它把抓包目录写到 captured_stream 外面。"""
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    capture.enable(3)
+
+    root = (tmp_path / capture.OUT_DIRNAME).resolve()
+    for model in (r"..\..\..\evil", "..", "a/b:c*d"):
+        cap = capture.begin({"model": model})
+        assert cap is not None, f"不安全的名字该被改写，而不是拒绝整条抓包：{model!r}"
+        assert cap.dir.resolve().parent == root, cap.dir
+        assert "\\" not in cap.dir.name and ":" not in cap.dir.name
+        capture.finish(cap)
+    assert not (tmp_path.parent / "evil").exists()
+
+
 def test_capture_honours_the_flag_file_deleted_from_outside(tmp_path, monkeypatch):
     """flag 文件是权威来源：外部直接删掉，进程内计数还剩下的也算停。"""
     from gateway import capture, config
@@ -414,26 +457,29 @@ def test_accept_encoding_is_rewritten_not_copied_from_the_client():
         )
 
 
-def test_undecodable_content_encoding_is_left_for_the_client():
-    """解不开的压缩不能摘 content-encoding —— 摘了客户端就不知道该怎么解了。
+def test_response_content_encoding_only_keeps_what_httpx_did_not_decode():
+    """解过的压缩层必须从头里去掉，没解掉的留给客户端 —— 多层时尤其要注意。
 
-    httpx 解压后响应头里的 content-encoding 还留着，所以「摘不摘」得看我们到底
-    解没解开：解开了才摘（我们转的就是明文），解不开就留着让客户端自己解。
+    httpx 按逗号拆 content-encoding 逐层解码（MultiDecoder）。老逻辑拿整串和单个
+    解码器名比相等，`gzip, br` 这类会被整段保留，而正文其实已经是明文：客户端再解
+    一次就烂了。可解/不可解、单层/多层/混合都钉在这里。
     """
     import httpx
 
     from gateway import proxy as proxy_mod
 
+    plain = httpx.Response(200)
+    assert proxy_mod._resp_encoding_to_keep(plain) == "", "没压缩 = 没有要留的编码"
+    identity = httpx.Response(200, headers={"content-encoding": "identity"})
+    assert proxy_mod._resp_encoding_to_keep(identity) == ""
     decodable = httpx.Response(200, headers={"content-encoding": "gzip"})
-    assert "content-encoding" in proxy_mod.RESP_DROP
-    assert proxy_mod._resp_drop(decodable) is proxy_mod.RESP_DROP, "解得开：照旧摘掉"
-
+    assert proxy_mod._resp_encoding_to_keep(decodable) == "", "解得开：摘头"
     unknown = httpx.Response(200, headers={"content-encoding": "snappy"})
-    assert "content-encoding" not in proxy_mod._resp_drop(unknown), "解不开：必须留给客户端"
-
-    plain = httpx.Response(200, headers={"content-encoding": "identity"})
-    assert proxy_mod._resp_drop(plain) is proxy_mod.RESP_DROP
-    assert proxy_mod._resp_drop(httpx.Response(200)) is proxy_mod.RESP_DROP, "没压缩也照旧"
+    assert proxy_mod._resp_encoding_to_keep(unknown) == "snappy", "解不开：留给客户端"
+    multi = httpx.Response(200, headers={"content-encoding": "gzip, deflate"})
+    assert proxy_mod._resp_encoding_to_keep(multi) == "", "两层都解得开：整头摘掉"
+    mixed = httpx.Response(200, headers={"content-encoding": "gzip, snappy"})
+    assert proxy_mod._resp_encoding_to_keep(mixed) == "snappy", "只留没解掉的那层"
 
 
 # ------------------------------------------------------------------ 请求改写
@@ -500,3 +546,82 @@ def test_rewrite_survives_a_broken_rules_table(monkeypatch):
     monkeypatch.setattr(rewrite, "_cache", {"raw": None, "rules": []})
     assert rewrite.rules() == []
     assert rewrite.apply({"messages": []}) == (None, 0)
+
+
+# ------------------------------------------------------------------ 并发读快照
+# 写发生在转发（事件循环线程），读发生在管理接口（FastAPI 对同步端点用线程池）。
+# 两边不打招呼地迭代/增删同一个 dict，就会给 /models、/inflight 甩 500。
+
+
+def _run_against_writer(work, write):
+    """开一个写线程跑 write()，主线程循环跑 work()，收集异常。"""
+    import sys
+    import threading
+
+    stop = threading.Event()
+    failures: list[BaseException] = []
+    old_switch = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # 逼线程交替；不调的话小字典迭代太快，撞不上
+
+    def writer():
+        while not stop.is_set():
+            write()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    try:
+        work(failures)
+    except BaseException as exc:
+        failures.append(exc)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        sys.setswitchinterval(old_switch)
+    return failures
+
+
+def test_failover_snapshot_is_safe_while_records_change(monkeypatch):
+    from gateway import failover
+
+    failover.reset()
+    monkeypatch.setattr(failover, "log", lambda *_a, **_k: None)
+    counter = {"i": 0}
+
+    def write():
+        i = counter["i"]
+        counter["i"] = i + 1
+        failover.note_fail(i % 40, 503, "g")
+        failover.note_ok(i % 40)
+
+    def work(out):
+        for _ in range(300):
+            failover.snapshot()
+
+    try:
+        failures = _run_against_writer(work, write)
+    finally:
+        failover.reset()
+    assert not failures, f"snapshot 与写入并发时炸了：{failures!r}"
+
+
+def test_inflight_snapshot_is_safe_while_calls_begin_and_finish():
+    from gateway import inflight
+
+    inflight.reset()
+
+    def write():
+        call = inflight.begin(
+            client="c", protocol="openai", model="m", stream=True, req_bytes=1
+        )
+        inflight.finish(call, status=200)
+
+    def work(out):
+        for _ in range(300):
+            inflight.snapshot()
+            inflight.counts()
+
+    try:
+        failures = _run_against_writer(work, write)
+    finally:
+        inflight.reset()
+    assert not failures, f"snapshot 与 begin/finish 并发时炸了：{failures!r}"
