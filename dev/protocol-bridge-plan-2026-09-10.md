@@ -420,7 +420,7 @@ role 的映射只收在 `_chat_role()` 一个函数里。
 - 真实库副本跑 v6 迁移：v5 → v6，两列都补上，43 条候选 / 2000 条记录一条不少，
   4 个暴露模型仍在、`resolve_chain` 正常，备份留了一份。
 - 新代码起在 8321 上（`--no-tray`），无头 Chrome 加载管理页：4 张模型卡都渲染出来，
-  控制台无报错，`rt-bridge-wrap` 结构在位。截图见 `dev/bridge-ui-smoke.png`。
+  控制台无报错，`rt-bridge-wrap` 结构在位（当时的截图已在开源清理时移除）。
   真实配置里没有 openai-chat 分组，所以**桥接标签没能在真机上看到**
   （标签本身由 `util.bridgeTag` 的单测覆盖）。
 
@@ -692,7 +692,7 @@ requirements.txt 已加。**重启网关生效**。
 
 **结论**：Codex 客户端直接配 DeepSeek 模型 id（如 `deepseek-v4-flash`）→ 自动回退
 兼容线格式 → 顶层 function 工具、无 namespace、无 developer、无 exec → 任何兼容
-Responses 的上游**零改动透传**即可用。这验证了用户的方案（2026-09-11）。
+Responses 的上游**零改动透传**即可用。这验证了当时的设想（2026-09-11）。
 
 ### 10.14 退役（2026-09-11 10:15）
 

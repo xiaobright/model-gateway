@@ -17,7 +17,7 @@
 | 最大障碍 | `encrypted_output` 造不出来（第 3 节）；`results[].snippet` 填不出来 |
 | 当前还值得做吗 | **先别做**。见第 6 节：`/alpha/search` 已两天没被调用 |
 
-## 1. DeepSeek 官方实测（用库里 g18 = deepseek/默认 的 key）
+## 1. DeepSeek 官方实测（用库里 DeepSeek 分组的 key）
 
 ### 1.1 基础
 
@@ -198,7 +198,7 @@ POST /v1/responses  model='deepseek-v4.1-flash'  upstream=站A
 
 1. 用户已经把 Codex 切到非目录模型的 slug（`deepseek-v4.1-flash`），走的是 fallback
    线格式；`/alpha/search` 只在 Codex 判定要联网时才打，**不是死了，是休眠**。
-   一旦需要搜索它还会回来，而且仍然打到 站B（目标仍是 g7 / `gpt-5.6-luna`）。
+   一旦需要搜索它还会回来，而且仍然打到 站B（目标仍是 `gpt-5.6-luna`）。
 2. **`web_search` 现在被塞在 `/v1/responses` 的 tools 里发给上游，而 DeepSeek 官方
    Responses 明确「忽略」内置工具**（官方文档 Tools 表 + 09-10 §2 实测都是这个结论）。
    站A 转的就是 DeepSeek —— 也就是说**这条路上的搜索现在是静默失效的**，
@@ -227,7 +227,7 @@ POST /v1/responses  model='deepseek-v4.1-flash'  upstream=站A
 
 用户补充了关键信息并做了决定：
 
-- **不稳定的真因是 上游 账号 401**，不是网络/并发。站B 部署在用户的 上游 上，
+- **不稳定的真因是上游账号 401**，不是网络/并发。站B 部署在自建的上游服务上，
   号被封/掉线时模型请求能路由到其它号，**但 `/alpha/search` 的 401 是直接透传回来的**，
   得手动切号重认证。→ 换搜索后端（含 DeepSeek 转换）解决不了这一类问题，
   DeepSeek key 一样会 401 / 余额耗尽。**转换方案的成本收益比因此进一步下降，已搁置。**
