@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import threading
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -88,6 +89,9 @@ class Call:
 
 _calls: dict[int, Call] = {}
 _ids = itertools.count(1)
+# 写发生在转发（事件循环线程），读发生在管理接口（FastAPI 对同步端点用线程池）——
+# 一边迭代、一边增删会让 /inflight、/stats 随机 500。RLock 允许 snapshot/_sweep 嵌套。
+_lock = threading.RLock()
 
 
 class ManualAbort(Exception):
@@ -112,14 +116,15 @@ async def wait_for_upstream(call: Call, operation: Awaitable[Any]) -> Any:
 
 def cancel(call_id: int) -> bool:
     """由 async 管理接口在网关的事件循环里调用；重复中断无副作用。"""
-    call = _calls.get(call_id)
-    if call is None or call.done_at:
-        return False
-    if not call.cancel_requested:
-        call.cancel_requested = True
-        if call.pending is not None:
-            call.pending.cancel()
-    return True
+    with _lock:
+        call = _calls.get(call_id)
+        if call is None or call.done_at:
+            return False
+        if not call.cancel_requested:
+            call.cancel_requested = True
+            if call.pending is not None:
+                call.pending.cancel()
+        return True
 
 
 # ---------------------------------------------------------------- 写（只有 proxy 调）
@@ -134,12 +139,13 @@ def begin(
     req_bytes: int,
     meta: bool = False,
 ) -> Call:
-    _sweep()
-    call = Call(
-        id=next(_ids), started=time.monotonic(), client=client, protocol=protocol,
-        model=model, stream=stream, req_bytes=req_bytes, meta=meta,
-    )
-    _calls[call.id] = call
+    with _lock:
+        _sweep()
+        call = Call(
+            id=next(_ids), started=time.monotonic(), client=client, protocol=protocol,
+            model=model, stream=stream, req_bytes=req_bytes, meta=meta,
+        )
+        _calls[call.id] = call
     return call
 
 
@@ -239,7 +245,8 @@ def finish(
 
 
 def reset() -> None:
-    _calls.clear()
+    with _lock:
+        _calls.clear()
 
 
 # ---------------------------------------------------------------- 清理
@@ -247,24 +254,28 @@ def reset() -> None:
 
 def _sweep() -> None:
     """漏掉的活跃条目扫走。真漏了得看得见，所以记一行日志而不是默默删。"""
-    now = time.monotonic()
-    for call in [c for c in _calls.values() if not c.done_at and now - c.started > STALE_SECONDS]:
-        log(
-            f"  inflight: 清掉一条挂了 {int(now - call.started)}s 的登记 "
-            f"model={call.model!r} upstream={call.upstream!r} phase={call.phase}"
-        )
-        _calls.pop(call.id, None)
+    with _lock:
+        now = time.monotonic()
+        stale = [c for c in _calls.values() if not c.done_at and now - c.started > STALE_SECONDS]
+        for call in stale:
+            _calls.pop(call.id, None)
+        for call in stale:
+            log(
+                f"  inflight: 清掉一条挂了 {int(now - call.started)}s 的登记 "
+                f"model={call.model!r} upstream={call.upstream!r} phase={call.phase}"
+            )
 
 
 def _trim() -> None:
     """结束的条目按时间和条数各裁一刀。"""
-    now = time.monotonic()
-    done = sorted(
-        (c for c in _calls.values() if c.done_at), key=lambda c: c.done_at, reverse=True
-    )
-    for i, call in enumerate(done):
-        if i >= KEEP_ROWS or now - call.done_at > KEEP_SECONDS:
-            _calls.pop(call.id, None)
+    with _lock:
+        now = time.monotonic()
+        done = sorted(
+            (c for c in _calls.values() if c.done_at), key=lambda c: c.done_at, reverse=True
+        )
+        for i, call in enumerate(done):
+            if i >= KEEP_ROWS or now - call.done_at > KEEP_SECONDS:
+                _calls.pop(call.id, None)
 
 
 # ---------------------------------------------------------------- 读
@@ -276,8 +287,9 @@ def counts() -> dict[str, int]:
     元数据请求（count_tokens）不计入：它是 Claude Code 自己算上下文占用用的，
     又多又快，混进来「进行中」就没法当忙闲指示看了。
     """
-    live = [c for c in _calls.values() if not c.done_at and not c.meta]
-    return {"requests": len(live), "streams": sum(1 for c in live if c.stream)}
+    with _lock:
+        live = [c for c in _calls.values() if not c.done_at and not c.meta]
+        return {"requests": len(live), "streams": sum(1 for c in live if c.stream)}
 
 
 def _as_dict(call: Call) -> dict[str, Any]:
@@ -314,12 +326,13 @@ def snapshot() -> dict[str, Any]:
     在跑的按开始时间正序：最先来的排最上，位置稳定，不会因为来了新请求就把
     正在看的那张卡片挤下去。刚结束的反过来，最近的在前。
     """
-    _sweep()
-    _trim()
-    live = sorted((c for c in _calls.values() if not c.done_at), key=lambda c: c.started)
-    done = sorted((c for c in _calls.values() if c.done_at), key=lambda c: -c.done_at)
-    return {
-        "calls": [_as_dict(c) for c in live],
-        "recent": [_as_dict(c) for c in done],
-        "counts": counts(),
-    }
+    with _lock:
+        _sweep()
+        _trim()
+        live = sorted((c for c in _calls.values() if not c.done_at), key=lambda c: c.started)
+        done = sorted((c for c in _calls.values() if c.done_at), key=lambda c: -c.done_at)
+        return {
+            "calls": [_as_dict(c) for c in live],
+            "recent": [_as_dict(c) for c in done],
+            "counts": counts(),
+        }

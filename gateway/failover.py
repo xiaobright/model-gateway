@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass
 from typing import Sequence
@@ -82,72 +83,82 @@ class _State:
 
 
 _states: dict[int, _State] = {}
+# 写发生在转发（事件循环线程），读发生在管理接口（FastAPI 对同步端点用线程池）——
+# 一边迭代、一边增删会让 /models、/inflight、/failover 随机 500。RLock 是因为
+# snapshot 拿锁后还会调 cooling()。
+_lock = threading.RLock()
 
 
 def note_ok(group_id: int) -> None:
-    st = _states.get(group_id)
-    if st is None:
-        return
-    if st.fails or st.until:
-        log(f"  failover: g{group_id} 恢复正常，清掉冷却")
-    _states.pop(group_id, None)
+    with _lock:
+        st = _states.get(group_id)
+        if st is None:
+            return
+        if st.fails or st.until:
+            log(f"  failover: g{group_id} 恢复正常，清掉冷却")
+        _states.pop(group_id, None)
 
 
 def note_fail(group_id: int, status: int, label: str = "") -> float:
     """记一次失败，返回这次要冷却多少秒（0 = 还没到阈值）。"""
-    st = _states.setdefault(group_id, _State())
-    st.fails += 1
-    st.last_status = status
-    if st.fails < COOL_AFTER:
-        return 0.0
-    # 第 COOL_AFTER 次开始冷却，之后每次翻倍
-    span = min(COOL_MAX, COOL_SECONDS * (2 ** (st.fails - COOL_AFTER)))
-    st.until = time.monotonic() + span
-    st.cooled += 1
-    log(f"  failover: {label or f'g{group_id}'} 连续失败 {st.fails} 次（{status}），冷却 {span:.0f}s")
-    return span
+    with _lock:
+        st = _states.setdefault(group_id, _State())
+        st.fails += 1
+        st.last_status = status
+        if st.fails < COOL_AFTER:
+            return 0.0
+        # 第 COOL_AFTER 次开始冷却，之后每次翻倍
+        span = min(COOL_MAX, COOL_SECONDS * (2 ** (st.fails - COOL_AFTER)))
+        st.until = time.monotonic() + span
+        st.cooled += 1
+        log(f"  failover: {label or f'g{group_id}'} 连续失败 {st.fails} 次（{status}），冷却 {span:.0f}s")
+        return span
 
 
 def cooling(group_id: int) -> float:
     """还要冷却多少秒；0 = 可以用。"""
-    st = _states.get(group_id)
-    if st is None or not st.until:
-        return 0.0
-    left = st.until - time.monotonic()
-    if left <= 0:
-        # 期满：留着 fails 不清零，这样它再失败一次就直接进更长的冷却（半开探测）
-        st.until = 0.0
-        return 0.0
-    return left
+    with _lock:
+        st = _states.get(group_id)
+        if st is None or not st.until:
+            return 0.0
+        left = st.until - time.monotonic()
+        if left <= 0:
+            # 期满：留着 fails 不清零，这样它再失败一次就直接进更长的冷却（半开探测）
+            st.until = 0.0
+            return 0.0
+        return left
 
 
 def clear(group_id: int) -> None:
     """手动切到这个候选时调用 —— 用户明确指定了，就立刻给它机会。"""
-    if _states.pop(group_id, None) is not None:
-        log(f"  failover: g{group_id} 的冷却被手动切换清掉了")
+    with _lock:
+        if _states.pop(group_id, None) is not None:
+            log(f"  failover: g{group_id} 的冷却被手动切换清掉了")
 
 
 def reset() -> None:
-    _states.clear()
+    with _lock:
+        _states.clear()
 
 
 def snapshot() -> list[dict]:
     """给管理接口用：当前有状态的分组。冷却剩余毫秒 + 连续失败次数。"""
-    out = []
-    for gid, st in _states.items():
-        left = cooling(gid)
-        if not left and not st.fails:
-            continue
-        out.append(
-            {
-                "group_id": gid,
-                "cooling_ms": int(left * 1000),
-                "fails": st.fails,
-                "last_status": st.last_status,
-                "cooled": st.cooled,
-            }
-        )
-    return sorted(out, key=lambda r: -r["cooling_ms"])
+    with _lock:
+        out = []
+        for gid, st in list(_states.items()):
+            left = cooling(gid)
+            if not left and not st.fails:
+                continue
+            out.append(
+                {
+                    "group_id": gid,
+                    "cooling_ms": int(left * 1000),
+                    "fails": st.fails,
+                    "last_status": st.last_status,
+                    "cooled": st.cooled,
+                }
+            )
+        return sorted(out, key=lambda r: -r["cooling_ms"])
 
 
 # ---------------------------------------------------------------- 同站重试
