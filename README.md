@@ -380,6 +380,39 @@ setx ANTHROPIC_DEFAULT_HAIKU_MODEL claude-haiku-4-5
 1.5 亿缓存 token，那边必须能自己回去），也不会悄悄改写你手动选的东西。另外 104 个 502 全是连不上、
 平均白等 16.6 秒，所以 connect 超时从 15 秒收到 8 秒。
 
+## 抓包
+
+遇到「下游说被截断、上游说自己正常」这类事，光看转发记录永远差最后一步：上游到底吐了什么字节。
+抓包是常驻功能，热开关，**不用改代码、不用重启**。
+
+开：
+
+```bash
+echo {} > data/capture-stream.flag          # 抓 1 条后自动停
+echo {"max":3} > data/capture-stream.flag   # 连抓 3 条
+```
+
+或者走管理接口：
+
+```
+GET  /admin/api/capture-stream                       看状态
+PUT  /admin/api/capture-stream {"enabled":true,"max":1}
+PUT  /admin/api/capture-stream {"enabled":false}
+GET  /admin/api/capture-stream/list                  列出已抓到的目录
+```
+
+**删掉 flag 文件立刻停。** 抓满条数也会自己删，不会出现「开了忘了关把磁盘写满」。
+产物在 `data/captured_stream/<时间戳>-<模型>/`：
+
+| 文件            | 内容                                                     |
+| --------------- | -------------------------------------------------------- |
+| `request.json`  | 客户端发来的原始请求体                                   |
+| `stream.sse`    | 上游回来的**每一个字节**（转发给客户端的也是这些字节）   |
+| `meta.json`     | 路径 / 模型 / 上游 / 状态码 / note / 字节数 / 观察器是否看到结束事件 / 请求头 / 响应头 |
+
+密钥一律不落盘：`authorization`、各种 `*-key` / `*-token` 头会被丢掉。
+单条流封顶 16MB，超了只截文件不影响转发；抓包本身写盘失败也只丢抓包，不影响转发。
+
 ## 只对本机开放
 
 - 仅监听 `127.0.0.1`，不对局域网开放

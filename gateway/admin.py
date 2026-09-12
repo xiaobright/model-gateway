@@ -10,7 +10,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import db, failover, inflight, protocols, proxy as proxy_mod
+from . import capture, db, failover, inflight, protocols, proxy as proxy_mod
 from . import stats as stats_mod
 from . import upstream as upstream_mod
 from .reqlog import log
@@ -109,6 +109,13 @@ class StandaloneSearchTargetIn(BaseModel):
 class CloneIn(BaseModel):
     # 兼容当前只有两种接口时的无请求体调用；有多个目标时必须明确指定。
     protocol: str | None = None
+
+
+class CaptureStreamIn(BaseModel):
+    """热开关抓包。max 是「抓满几条自动关」，不是字节上限。"""
+
+    enabled: bool = True
+    max: int = Field(default=1, ge=1, le=50)
 
 
 def _validate_protocol(protocol: str) -> str:
@@ -755,6 +762,54 @@ def get_inflight() -> dict[str, Any]:
 async def cancel_inflight(call_id: int) -> dict[str, bool]:
     # 取消 Future 必须在转发所在的事件循环里执行，不能用同步端点的线程池。
     return {"ok": True, "cancelled": inflight.cancel(call_id)}
+
+
+# ---------------------------------------------------------------- 抓包
+# 「下游说截断、上游说正常」这类问题，光看转发记录永远差最后一步：上游到底吐了什么字节。
+# 这里开一个热开关 —— 不用改代码、不用重启，开一下复现一次，原始 SSE 就躺在
+# data/captured_stream/<时间戳>-<模型>/ 里。开关本质是 data/capture-stream.flag 文件，
+# 所以手搓文件、直接删文件、走 API 三种方式等价，删了立刻停。
+
+
+@router.get("/capture-stream")
+def get_capture_stream() -> dict[str, Any]:
+    return capture.status()
+
+
+@router.put("/capture-stream")
+def put_capture_stream(payload: CaptureStreamIn) -> dict[str, Any]:
+    if not payload.enabled:
+        return capture.disable()
+    return capture.enable(payload.max)
+
+
+@router.get("/capture-stream/list")
+def get_capture_stream_list() -> dict[str, Any]:
+    """列出已经抓到的目录，最新的在前 —— 抓完直接从这拿路径。"""
+    root = capture.out_root()
+    if not root.exists():
+        return {"items": []}
+    items = []
+    for d in sorted(root.iterdir(), reverse=True):
+        if not d.is_dir():
+            continue
+        meta: dict[str, Any] = {}
+        try:
+            meta = json.loads((d / "meta.json").read_text("utf-8"))
+        except Exception:
+            pass
+        items.append(
+            {
+                "name": d.name,
+                "path": str(d),
+                "stream_bytes": meta.get("stream_bytes"),
+                "status": meta.get("status"),
+                "note": meta.get("note"),
+                "model": meta.get("model"),
+                "upstream": meta.get("upstream"),
+            }
+        )
+    return {"items": items[:50], "root": str(root)}
 
 
 # ---------------------------------------------------------------- 自动降级

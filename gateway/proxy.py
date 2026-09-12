@@ -12,7 +12,16 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, db, failover, inflight, naming, protocols, upstream as upstream_mod
+from . import (
+    capture,
+    config,
+    db,
+    failover,
+    inflight,
+    naming,
+    protocols,
+    upstream as upstream_mod,
+)
 from .reqlog import log
 from .upstream import endpoint as upstream_endpoint
 
@@ -861,6 +870,21 @@ async def forward(
     upstream_resp = resp
 
     async def relay() -> AsyncIterator[bytes]:
+        # 抓包只在 data/capture-stream.flag 存在时开，没开时 begin() 返回 None、
+        # 下面每块字节只是多一次空判断。写完 max 条自动删 flag，不用回来关。
+        cap = capture.begin(
+            {
+                "path": endpoint,
+                "model": asked,
+                "upstream": route.upstream.name,
+                "group": route.group_name,
+                "remote_model": route.remote_model,
+                "protocol": proto.name,
+                "requested_stream": bool(payload.get("stream")),
+                "req_headers": capture.sanitize_headers(request.headers),
+            },
+            body,
+        )
         sent = 0
         text_bytes = 0
         thinking = False
@@ -894,6 +918,8 @@ async def forward(
                         got = proto.extract_usage(bytes(head), b"")
                         inflight.usage(call, tokens_in=proto.context_tokens(got))
                 tail.extend(chunk)
+                if cap is not None:
+                    cap.feed(chunk)
                 # 观察器按完整 SSE 帧统计内容和结束事件；它不参与实际转发，解析出错也不能
                 # 影响下面的原始 chunk。
                 if observer is not None:
@@ -936,6 +962,16 @@ async def forward(
             else:
                 log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
+            if cap is not None:
+                capture.finish(
+                    cap,
+                    status=upstream_resp.status_code,
+                    note=note,
+                    sent=sent,
+                    observer_ended=(observer.ended if observer is not None else None),
+                    event_types=(dict(observer.event_types) if observer is not None else {}),
+                    resp_headers=capture.sanitize_headers(upstream_resp.headers),
+                )
             if json_body:
                 try:
                     json_payload = json.loads(json_body)

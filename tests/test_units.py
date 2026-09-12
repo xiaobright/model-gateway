@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import urllib.request
 
 import httpx
@@ -257,6 +258,118 @@ def test_input_item_census_handles_a_scalar_input():
 
     types, roles = _input_item_census({"input": "hello"})
     assert types == {"str": 1} and roles == {}
+
+
+# ------------------------------------------------------------------ 抓包
+# 抓包是「以后再出问题不用改代码」的兜底手段，所以它自己的开关语义必须准：
+# 关着的时候一个字节都不该落盘、一条都不该消耗；抓满要自己停。
+
+
+def test_capture_is_off_without_the_flag_file(tmp_path, monkeypatch):
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    capture.disable()
+
+    assert not capture.enabled()
+    assert capture.begin({"model": "m"}) is None, "没开抓包时 begin 必须返回 None"
+    assert not (tmp_path / capture.OUT_DIRNAME).exists(), "关着的时候不该建目录"
+
+
+def test_capture_writes_request_body_and_raw_stream(tmp_path, monkeypatch):
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    capture.enable(1)
+
+    cap = capture.begin({"model": "deepseek-chat", "path": "/v1/chat/completions"}, b'{"stream":true}')
+    assert cap is not None
+    cap.feed(b'data: {"delta":"a"}\n\n')
+    cap.feed(b"data: [DONE]\n\n")
+    capture.finish(cap, status=200, note="ok", sent=35)
+
+    out = cap.dir
+    assert (out / "request.json").read_bytes() == b'{"stream":true}'
+    assert (out / "stream.sse").read_bytes() == b'data: {"delta":"a"}\n\ndata: [DONE]\n\n'
+    meta = json.loads((out / "meta.json").read_text("utf-8"))
+    assert meta["status"] == 200 and meta["note"] == "ok"
+    assert meta["stream_bytes"] == 35 and meta["stream_capped"] is False
+    assert meta["model"] == "deepseek-chat"
+
+
+def test_capture_stops_itself_after_the_requested_number(tmp_path, monkeypatch):
+    """抓满 max 条自动删 flag —— 开了就忘了关也不会把磁盘写满。"""
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    capture.enable(2)
+
+    first = capture.begin({"model": "a"})
+    capture.finish(first)
+    assert capture.enabled(), "第二条还没抓，flag 不该没"
+
+    second = capture.begin({"model": "b"})
+    capture.finish(second)
+    assert not capture.enabled(), "抓满两条后必须自动停"
+    assert not (tmp_path / capture.FLAG_NAME).exists()
+    assert capture.begin({"model": "c"}) is None
+
+
+def test_capture_honours_the_flag_file_deleted_from_outside(tmp_path, monkeypatch):
+    """flag 文件是权威来源：外部直接删掉，进程内计数还剩下的也算停。"""
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    capture.enable(5)
+    (tmp_path / capture.FLAG_NAME).unlink()
+
+    assert not capture.enabled()
+    assert capture.begin({"model": "a"}) is None
+
+
+def test_capture_tolerates_a_garbage_flag_file(tmp_path, monkeypatch):
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    (tmp_path / capture.FLAG_NAME).write_text("not json at all", encoding="utf-8")
+
+    assert capture.enabled()
+    assert capture.status()["max"] == capture.DEFAULT_MAX_REQUESTS, "坏 JSON 按「抓 1 条」兜底"
+
+
+def test_capture_caps_a_huge_stream_without_breaking(tmp_path, monkeypatch):
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(capture, "MAX_STREAM_BYTES", 100)
+    capture.enable(1)
+
+    cap = capture.begin({"model": "big"})
+    cap.feed(b"x" * 250)
+    capture.finish(cap, status=200)
+
+    meta = json.loads((cap.dir / "meta.json").read_text("utf-8"))
+    assert len((cap.dir / "stream.sse").read_bytes()) == 100, "写盘封顶"
+    assert meta["stream_bytes"] == 250, "但真实字节数要照实记，不然看不出是被截的"
+    assert meta["stream_capped"] is True
+
+
+def test_capture_never_writes_secrets_into_meta(tmp_path, monkeypatch):
+    from gateway import capture
+
+    headers = {
+        "authorization": "Bearer sk-xxx",
+        "x-api-key": "secret",
+        "x-goog-api-key": "secret",
+        "x-some-token": "secret",
+        "content-type": "application/json",
+        "user-agent": "opencode/1.2.3",
+    }
+
+    clean = capture.sanitize_headers(headers)
+
+    assert clean == {"content-type": "application/json", "user-agent": "opencode/1.2.3"}
+    assert capture.sanitize_headers(None) == {}
 
 
 def test_accept_encoding_is_rewritten_not_copied_from_the_client():

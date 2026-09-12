@@ -726,3 +726,22 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
     db.init_db()   # 幂等
     assert len(db.list_groups()) == 5
     assert len(list(data_dir.glob("gateway.db.bak-*"))) == 1
+
+
+def test_capture_stream_switch_is_hot_and_visible_over_the_api(gateway, monkeypatch):
+    """抓包开关要能纯靠接口开着关 —— 出问题时不该再动一次代码。"""
+    from gateway import capture, config
+
+    # 管理接口走的是 config.DATA_DIR；fixture 已经把它指到临时目录了，这里只是拿个引用。
+    data_dir = config.DATA_DIR
+    capture.disable()
+
+    off = gateway.get("/admin/api/capture-stream").json()
+    assert off["enabled"] is False
+
+    on = gateway.put("/admin/api/capture-stream", json={"enabled": True, "max": 2}).json()
+    assert on["enabled"] is True and on["max"] == 2
+    assert (data_dir / capture.FLAG_NAME).exists()
+
+    assert gateway.put("/admin/api/capture-stream", json={"enabled": False}).json()["enabled"] is False
+    assert not (data_dir / capture.FLAG_NAME).exists()
