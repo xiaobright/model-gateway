@@ -83,6 +83,44 @@ REQ_DROP = {"host", "content-length", "transfer-encoding", "connection", "keep-a
 RESP_DROP = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
 REDACT_ON_CAPTURE = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
 
+def _resp_drop(upstream_resp: httpx.Response) -> set[str]:
+    """解不开的压缩就把 content-encoding 留给客户端，别摘。
+
+    RESP_DROP 默认摘掉 content-encoding，前提是 relay 用 aiter_bytes 已经解压过了。
+    但 httpx 只解 SUPPORTED_DECODERS 里有的编码：解不了时吐的是压缩原文，而响应头里的
+    content-encoding 还挂着（httpx 不会替你摘）。这时再摘头，客户端拿到的是一堆没标
+    压缩方式的二进制 —— opencode 那次「上游 200、下游没回复」就是这么来的。
+
+    所以：解得了才摘（我们已经解压了，客户端必须按明文读）；解不了就留着，让客户端
+    自己解。最多是我们这边观察不到内容、多打一条 truncated 日志，不至于把响应毁掉。
+    """
+    enc = (upstream_resp.headers.get("content-encoding") or "").strip().lower()
+    if not enc or enc == "identity":
+        return RESP_DROP
+    if enc in {name.strip() for name in accept_encoding().split(",")}:
+        return RESP_DROP
+    return RESP_DROP - {"content-encoding"}
+
+
+def accept_encoding() -> str:
+    """我们能解压什么，就向上游报什么 —— 决不能照抄客户端的 accept-encoding。
+
+    opencode 这类客户端会带 `accept-encoding: gzip, deflate, br, zstd`。原样透传时上游
+    可能挑 br，而 httpx 没装 brotli 就解不开，转发给客户端的是一坨压缩原文：客户端一个
+    SSE 事件都解析不出来（表现为「没回复」），网关这边因为等不到完成事件而记成 truncated
+    （2026-09-12 实锤，抓包看到上游 content-encoding: br、转发的 421 字节全是二进制）。
+    所以这个头必须由网关按自己真实的解码能力来报，而不是替客户端转达。
+    """
+    from httpx._decoders import SUPPORTED_DECODERS
+
+    names = [
+        (key.decode() if isinstance(key, bytes) else str(key))
+        for key in SUPPORTED_DECODERS
+        if (key.decode() if isinstance(key, bytes) else str(key)) != "identity"
+    ]
+    return ", ".join(sorted(names)) or "identity"
+
+
 HEAD_KEEP = 8192   # 开头留这么多：Anthropic 的输入 token 只在流开头的 message_start 里报一次
 TAIL_KEEP = 65536  # 末尾留这么多，用来抓 usage
 
@@ -423,6 +461,8 @@ def _build_headers(
 ) -> dict[str, str]:
     # ASGI 保证头名已经小写，所以下面用小写键既能覆盖客户端的同名头，也不会两份并存
     headers = {k: v for k, v in request.headers.items() if k.lower() not in REQ_DROP}
+    # 客户端报的压缩算法我们不一定解得了，一律换成网关自己这边的真实能力（见 accept_encoding）
+    headers["accept-encoding"] = accept_encoding()
     for key, value in proto.defaults.items():
         headers.setdefault(key, value)
     if upstream.api_key:
@@ -941,7 +981,9 @@ async def forward(
             with contextlib.suppress(Exception):
                 await upstream_resp.aclose()
 
-    passthrough = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in RESP_DROP}
+    passthrough = {
+        k: v for k, v in upstream_resp.headers.items() if k.lower() not in _resp_drop(upstream_resp)
+    }
     return StreamingResponse(
         relay(),
         status_code=upstream_resp.status_code,

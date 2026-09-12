@@ -257,3 +257,67 @@ def test_input_item_census_handles_a_scalar_input():
 
     types, roles = _input_item_census({"input": "hello"})
     assert types == {"str": 1} and roles == {}
+
+
+def test_accept_encoding_is_rewritten_not_copied_from_the_client():
+    """客户端报的压缩算法我们不一定解得了 —— 必须按网关自己的解码能力重写。
+
+    opencode 带 `accept-encoding: gzip, deflate, br, zstd`，上游挑了 br，而 httpx
+    没装 brotli 时解不开，转发给客户端的就是一坨压缩原文：客户端一个 SSE 事件都
+    解析不出来（表现为「没回复」），网关这边等不到完成事件，于是记 truncated。
+    """
+    from starlette.requests import Request
+
+    from gateway import protocols
+    from gateway import proxy as proxy_mod
+
+    class _Upstream:
+        api_key = "sk-test"
+        header_override = ""
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [
+                (b"accept-encoding", b"gzip, deflate, br, zstd"),
+                (b"content-type", b"application/json"),
+            ],
+            "query_string": b"",
+        }
+    )
+
+    sent = proxy_mod._build_headers(request, _Upstream(), protocols.OPENAI)
+
+    assert sent["accept-encoding"] == proxy_mod.accept_encoding()
+    # 报出去的每一种都得真的解得了，否则又是一坨压缩原文发给客户端
+    from httpx._decoders import SUPPORTED_DECODERS
+
+    for name in sent["accept-encoding"].split(","):
+        token = name.strip()
+        assert token in SUPPORTED_DECODERS or token.encode() in SUPPORTED_DECODERS, (
+            f"{token} 报了却解不开"
+        )
+
+
+def test_undecodable_content_encoding_is_left_for_the_client():
+    """解不开的压缩不能摘 content-encoding —— 摘了客户端就不知道该怎么解了。
+
+    httpx 解压后响应头里的 content-encoding 还留着，所以「摘不摘」得看我们到底
+    解没解开：解开了才摘（我们转的就是明文），解不开就留着让客户端自己解。
+    """
+    import httpx
+
+    from gateway import proxy as proxy_mod
+
+    decodable = httpx.Response(200, headers={"content-encoding": "gzip"})
+    assert "content-encoding" in proxy_mod.RESP_DROP
+    assert proxy_mod._resp_drop(decodable) is proxy_mod.RESP_DROP, "解得开：照旧摘掉"
+
+    unknown = httpx.Response(200, headers={"content-encoding": "snappy"})
+    assert "content-encoding" not in proxy_mod._resp_drop(unknown), "解不开：必须留给客户端"
+
+    plain = httpx.Response(200, headers={"content-encoding": "identity"})
+    assert proxy_mod._resp_drop(plain) is proxy_mod.RESP_DROP
+    assert proxy_mod._resp_drop(httpx.Response(200)) is proxy_mod.RESP_DROP, "没压缩也照旧"

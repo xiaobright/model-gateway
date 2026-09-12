@@ -2,6 +2,13 @@ fastapi>=0.115
 uvicorn>=0.30
 httpx>=0.27
 
+# 上游的压缩解码器。缺了 brotli 时 httpx 会照旧把 accept-encoding 里没有的编码原样放过，
+# 但它默认仍会替客户端转发 br/zstd 的选择 —— 结果是解不开的压缩原文直接转给客户端，
+# 客户端一个 SSE 事件都解析不出来（表现为「没回复」，网关记 truncated）。
+# 必须装：客户端（opencode）会带 accept-encoding: gzip, deflate, br, zstd。
+brotli>=1.1
+zstandard>=0.23
+
 # 上游 TLS 验证跟系统证书库走：卡巴斯基这类杀软的 HTTPS 扫描是 MITM，
 # httpx 自带的 CA 捆绑包不认它的根证书，没有这个就是 502 self-signed certificate
 truststore>=0.9
