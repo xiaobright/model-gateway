@@ -112,20 +112,22 @@ let liveAppliedSeq = 0;
 const configRefresh = createRefreshQueue(
   async () => {
     const presets = await api('GET', '/admin/api/egress-presets').catch(() => null);
-    const [upstreams, routes, failover, searchTarget, rewriteRules] = await Promise.all([
+    const [upstreams, routes, failover, searchTarget, rewriteRules, stallTimeout] = await Promise.all([
       api('GET', '/admin/api/upstreams'),
       api('GET', '/admin/api/models'),
       api('GET', '/admin/api/failover'),
       api('GET', '/admin/api/standalone-search-target').catch(() => null),
       api('GET', '/admin/api/rewrite-rules').catch(() => null),
+      api('GET', '/admin/api/stall-timeout').catch(() => null),
     ]);
-    return { presets, upstreams, routes, failover, searchTarget, rewriteRules };
+    return { presets, upstreams, routes, failover, searchTarget, rewriteRules, stallTimeout };
   },
   (data, args) => {
     state.egressVps = data.presets ? data.presets.vps : null;
     state.upstreams = data.upstreams;
     state.routes = data.routes;
     state.searchTarget = data.searchTarget;
+    if (data.stallTimeout) state.stallTimeout = data.stallTimeout.seconds;
     if (args.seq >= failoverAppliedSeq) {
       failoverAppliedSeq = args.seq;
       state.failover = data.failover;
@@ -1471,6 +1473,21 @@ const ACTIONS = {
     }
     views.renderRoutes();
     toast(`${PROTO_LABEL[fo]} 自动降级已${el.checked ? '开启' : '关闭'}`, 'ok');
+  },
+
+  /* 上游发呆超时：全局一个值。卡住时按手动打断处理，让下游重发（0 = 关闭）。
+     不走自动降级 —— 偶发卡住通常只影响一条连接，换站会让同一条请求被处理两遍。 */
+  'stall-timeout': async (_d, el) => {
+    const seconds = Math.max(0, Math.min(3600, Number(el.value) || 0));
+    const data = await api('PUT', '/admin/api/stall-timeout', { seconds });
+    state.stallTimeout = data.seconds;
+    el.value = String(data.seconds);
+    toast(
+      data.seconds
+        ? `上游 ${data.seconds} 秒没有新字节将自动打断`
+        : '已关闭上游发呆自动打断',
+      'ok',
+    );
   },
 
   /* 候选在链上前移 / 后移一位。即时生效，不用保存 */

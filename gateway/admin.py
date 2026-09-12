@@ -877,6 +877,22 @@ def post_failover(payload: FailoverIn) -> dict[str, Any]:
     return {"enabled": failover.all_enabled()}
 
 
+# 上游发呆超时：全局设置（不分接口）。卡住时按「手动打断」处理，让下游重发，
+# 不走自动降级 —— 见 proxy.forward 里的收尾注释。
+class StallTimeoutIn(BaseModel):
+    seconds: float = Field(ge=0, le=3600)
+
+
+@router.get("/stall-timeout")
+def get_stall_timeout() -> dict[str, float]:
+    return {"seconds": proxy_mod.stall_timeout()}
+
+
+@router.put("/stall-timeout")
+def put_stall_timeout(payload: StallTimeoutIn) -> dict[str, float]:
+    return {"seconds": proxy_mod.set_stall_timeout(payload.seconds)}
+
+
 @router.delete("/models")
 def remove_model_route(
     model_name: str = Query(default="", description="模型名"),

@@ -5,7 +5,61 @@ from __future__ import annotations
 import time
 import pytest
 
-from helpers import wait_for_row, MockUpstream, add_upstream, add_group, provider_id, add_route, route_id, msg, parse_sse_events
+from helpers import (
+    wait_for_row, wait_rows, rows_on, MockUpstream, add_upstream, add_group,
+    provider_id, add_route, route_id, msg, parse_sse_events,
+)
+
+
+def test_stalled_headers_are_aborted_without_failover(gateway):
+    """单条连接卡住（并发其它请求正常）时只打断这一条、给下游重发的机会。
+
+    真库里的偶发卡住常常只影响一条连接；换站会让同一条请求在别的站被处理两遍，
+    而且站本身是好的，不该进冷却。
+    """
+    from gateway import db
+
+    db.set_setting("stall_timeout_s", "0.5")
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_a, "opus-a")
+        add_route(gateway, "opus", g_b, "opus-b")
+        a.sick["hang_headers"] = True  # 收下请求，但连响应头都不给
+
+        began = time.monotonic()
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        elapsed = time.monotonic() - began
+
+        assert resp.status_code == 504, resp.text
+        assert elapsed < 5, f"不应该等到 httpx 的 600 秒 read 超时（{elapsed:.1f}s）"
+        rows = wait_rows(gateway, 1)
+        assert (rows[0]["upstream"], rows[0]["note"]) == ("siteA", "stall_timeout")
+        assert rows_on(gateway, "siteB") == 0, "不降级：本来就不是站的问题"
+        assert gateway.get("/admin/api/failover").json()["breakers"] == [], "站没坏，不进冷却"
+
+
+def test_stalled_stream_is_cut_so_downstream_can_retry(gateway):
+    """已经开流后上游不再出字节：切断这条流，下游收不到完成事件就会自己重发。"""
+    from gateway import db
+
+    db.set_setting("stall_timeout_s", "0.5")
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_a, "opus-a")
+        add_route(gateway, "opus", g_b, "opus-b")
+
+        with gateway.stream(
+            "POST", "/v1/messages", json=msg("opus", stream=True, mode="stalled")
+        ) as stream:
+            raw = "".join(stream.iter_text())
+
+        assert "message_stop" not in raw, "流被切断，客户端据此判断需要重发"
+        rows = wait_rows(gateway, 1)
+        assert rows[0]["note"] == "stall_timeout"
+        assert rows_on(gateway, "siteB") == 0, "不降级"
+        assert gateway.get("/admin/api/failover").json()["breakers"] == []
 
 
 @pytest.mark.network

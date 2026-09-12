@@ -61,6 +61,9 @@ async def fake_upstream_request(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             status, headers={"content-type": "application/json"}, stream=HangingBody()
         )
+    if getattr(upstream, "sick", {}).get("hang_headers"):
+        # 连响应头都不给：测「上游发呆超时自动打断」用（真人也常说「卡着不返回」）
+        await asyncio.Event().wait()
     return await httpx.ASGITransport(app=upstream.app).handle_async_request(request)
 
 
@@ -321,6 +324,9 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                         "type": "content_block_delta", "index": 0,
                         "delta": {"type": "text_delta", "text": DELTA_TEXT},
                     })
+                if mode == "stalled":
+                    # 开了流就不再出字节，也不发结束事件：测「发呆超时自动打断」
+                    await asyncio.Event().wait()
                 if mode == "thinking":
                     # 思维链：发来的是总结过的，但计费按完整的算
                     yield sse("content_block_delta", {

@@ -289,11 +289,18 @@ function chipHtml(model, c, showGroup, showRemote, activeRouteId, proto) {
    会把开关压成 0 宽、只剩个滑块糊在文字上。 */
 function failoverSwitches(list) {
   const on = (state.failover && state.failover.enabled) || {};
-  return list.map((p) => `<label class="fo-item" title="打不通就按候选顺序换下一个">
+  const switches = list.map((p) => `<label class="fo-item" title="打不通就按候选顺序换下一个">
       <input type="checkbox" class="switch" ${on[p] ? 'checked' : ''}
              data-act="toggle-failover" data-fo="${p}">
       <span>${list.length > 1 ? esc(PROTO_LABEL[p] || p) + ' ' : '自动'}降级</span>
     </label>`).join('');
+  // 发呆超时是全局设置，两个摆放位置（模型路由卡头 / 实时页）都跟着普通开关走
+  const stall = state.stallTimeout ?? 15;
+  return switches + `<label class="fo-item" title="上游超过这段时间没有任何新字节（含等响应头）就打断这条请求，让客户端重发；不触发自动降级。0 = 关闭">
+      <input type="number" class="stall-input" min="0" max="3600" step="1" value="${stall}"
+             data-act="stall-timeout">
+      <span>秒无新字节自动打断</span>
+    </label>`;
 }
 
 function failoverBox() {
@@ -778,6 +785,7 @@ const NOTE_LABEL = {
   upstream_abort: ['crit', '上游断流'],
   client_abort: ['', '客户端断开'],
   manual_abort: ['', '手动中断'],
+  stall_timeout: ['warn', '卡住超时'],
   // 这一次失败被自动降级接住了：客户端没看到它，但钱和时间是真花了，所以照样留痕
   failed_over: ['warn', '已降级'],
 };

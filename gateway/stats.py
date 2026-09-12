@@ -30,7 +30,10 @@ DEFAULT_WINDOW = "1h"
 
 # 这些收尾都不是一次成功完成的请求，用于健康度和失败计数。client_abort 的责任在下游，
 # 但它同样不能在统计卡片里被算成成功；日志里的 note 仍保留了责任边界。
-BAD_NOTES = frozenset({"connect_failed", "upstream_abort", "truncated", "client_abort", "manual_abort"})
+BAD_NOTES = frozenset({
+    "connect_failed", "upstream_abort", "truncated", "client_abort", "manual_abort",
+    "stall_timeout",
+})
 
 # ---------------------------------------------------------------- 活跃流
 

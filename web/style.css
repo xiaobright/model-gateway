@@ -1168,6 +1168,12 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .fo-item .switch { width: 32px; height: 19px; margin: 0; }
 .fo-item .switch::after { width: 15px; height: 15px; }
 .fo-item .switch:checked::after { transform: translateX(13px); }
+/* 发呆超时输入框：跟开关一样保持轻量，别把卡头撑高 */
+.fo-item .stall-input {
+  width: 4.2em; padding: 2px 4px; margin: 0; text-align: right;
+  font-size: 12px; color: var(--ink-2);
+  border: 1px solid var(--line-2); border-radius: 6px; background: transparent;
+}
 /* 圆片右侧的两个动作（改配置 / 移除）：平时收成 0 宽，指过去才展开 */
 .chip-x, .chip-e {
   display: grid; place-items: center; width: 0; height: 20px; margin-right: 0;

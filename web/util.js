@@ -39,6 +39,8 @@ export const state = {
   protocolEnabled: {},
   // Codex Alpha Search 的专用上游（/admin/api/standalone-search-target）：{group_id, model}
   searchTarget: null,
+  // 上游发呆超时秒数（/admin/api/stall-timeout）；0 = 关闭，null = 还没加载
+  stallTimeout: null,
 };
 
 /** 接口是否启用。没拿到开关状态时按启用处理，避免首屏把东西全藏起来。 */

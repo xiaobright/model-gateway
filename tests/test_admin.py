@@ -117,6 +117,15 @@ def test_admin_api_rejects_origin_null(gateway):
     assert blocked.status_code == 403
 
 
+def test_stall_timeout_setting_roundtrip_and_range(gateway):
+    """发呆超时：默认 15 秒，可改，0 = 关闭，超过上限被拒。"""
+    assert gateway.get("/admin/api/stall-timeout").json()["seconds"] == 15
+    assert gateway.put("/admin/api/stall-timeout", json={"seconds": 30}).json()["seconds"] == 30
+    assert gateway.get("/admin/api/stall-timeout").json()["seconds"] == 30
+    assert gateway.put("/admin/api/stall-timeout", json={"seconds": 0}).json()["seconds"] == 0
+    assert gateway.put("/admin/api/stall-timeout", json={"seconds": 99999}).status_code == 422
+
+
 def test_whitespace_names_and_bad_base_urls_are_rejected(gateway):
     blank = gateway.post("/admin/api/upstreams", json={"name": "   ", "base_url": "http://127.0.0.1:1"})
     assert blank.status_code == 422, "只含空白的名字不能存成空串"

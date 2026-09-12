@@ -40,6 +40,28 @@ LOOPBACK = ("127.0.0.1", "localhost", "[::1]")
 EGRESS_SYSTEM = ""        # 跟随系统代理：httpx 自己去读环境变量和注册表
 EGRESS_DIRECT = "direct"  # 直连：把系统代理也关掉
 
+# 上游发呆超时：这么久没有任何新字节（含等响应头）就按「卡住」打断这条请求，
+# 让下游的客户端自己重发。不触发自动降级 —— 真库里的偶发卡住常常只影响一条连接
+# （并发其它请求都正常），换站会让同一条请求被处理两遍。0 = 关闭。
+STALL_TIMEOUT_KEY = "stall_timeout_s"
+DEFAULT_STALL_TIMEOUT_S = 15.0
+MAX_STALL_TIMEOUT_S = 3600.0
+
+
+def stall_timeout() -> float:
+    raw = db.get_setting(STALL_TIMEOUT_KEY, "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_STALL_TIMEOUT_S
+    return min(MAX_STALL_TIMEOUT_S, max(0.0, value))
+
+
+def set_stall_timeout(seconds: float) -> float:
+    value = min(MAX_STALL_TIMEOUT_S, max(0.0, float(seconds)))
+    db.set_setting(STALL_TIMEOUT_KEY, f"{value:g}")
+    return value
+
 
 def loopback_mounts() -> dict[str, httpx.AsyncHTTPTransport]:
     # 每个 client 要有自己的 transport（transport 自带连接池，会随 client 一起关闭）
@@ -225,20 +247,29 @@ RESPONSE_POLL = 0.05
 
 
 async def _send_until_headers(
-    request: Request, client: httpx.AsyncClient, prepared: httpx.Request
+    request: Request, client: httpx.AsyncClient, prepared: httpx.Request, stall_s: float = 0.0
 ) -> httpx.Response:
-    """等待响应头，同时让下游断开能够取消尚未完成的发送。
+    """等待响应头，同时让下游断开/上游发呆都能取消尚未完成的发送。
 
     `httpx.AsyncClient.send()` 会一直等到响应头，relay 还没开始之前没有其它取消点。
     Request.is_disconnected() 是非阻塞检查，短暂让出事件循环即可避免把下游断开拖到
-    上游 read/connect timeout 才收尾。
+    上游 read/connect timeout 才收尾。stall_s > 0 时，这么久没等到响应头就抛
+    UpstreamStall（调用方按「这条连接卡住」打断，给下游重发的机会）。
     """
     task = asyncio.create_task(client.send(prepared, stream=True))
+    deadline = time.monotonic() + stall_s if stall_s > 0 else None
     try:
         while True:
+            if task.done():
+                return await task
+            timeout = RESPONSE_POLL
+            if deadline is not None:
+                timeout = min(timeout, max(0.0, deadline - time.monotonic()))
+                if timeout <= 0:
+                    raise inflight.UpstreamStall
             # 可被完成唤醒的等待：响应头一到就返回，不能让 50ms 的轮询节拍变成
             # 每个请求的关键路径延迟（断开检测仍是每 RESPONSE_POLL 一次）
-            done, _ = await asyncio.wait({task}, timeout=RESPONSE_POLL)
+            done, _ = await asyncio.wait({task}, timeout=timeout)
             if task in done:
                 return await task
             if await request.is_disconnected():
@@ -623,6 +654,7 @@ async def forward(
         candidates = failover.order_chain(chain) if can_failover else [chain[0]]
 
     started = time.monotonic()
+    stall_s = stall_timeout()
     resp: httpx.Response | None = None
     route = candidates[0]
     remote = ""
@@ -718,6 +750,7 @@ async def forward(
                     request,
                     client,
                     client.build_request("POST", url, content=sent_body, headers=headers),
+                    stall_s=stall_s,
                 ),
             )
         except inflight.ManualAbort:
@@ -758,6 +791,29 @@ async def forward(
                     usage=NO_USAGE, note="client_abort", attempt=attempt,
                 )
             raise
+        except inflight.UpstreamStall:
+            # 上游在这个候选上连响应头都不给：不降级、不重试 —— 并发的其它请求都正常，
+            # 这是单条连接卡住，换站只会让同一条请求被处理两遍。按手动打断同一套收尾：
+            # 留下记录，让下游客户端自己重发（504 会被各家的重试逻辑接住）。
+            elapsed = time.monotonic() - began
+            log(
+                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} -> 504 "
+                f"(上游 {stall_s:g}s 没有给出响应头，按卡住打断) after {elapsed:.1f}s"
+                f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
+            )
+            inflight.finish(call, status=504, note="stall_timeout")
+            if record:
+                _record(
+                    request=request, route=route, proto=proto, model=asked,
+                    remote_model=remote, status=504, stream_flag=stream_flag,
+                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    usage=NO_USAGE, note="stall_timeout", attempt=attempt,
+                )
+            return _error(
+                proto,
+                504,
+                f"上游 {route.upstream.name} {stall_s:g}s 内没有响应，已按卡住打断；请重发请求",
+            )
         except (httpx.HTTPError, ValueError) as exc:
             fail, resp = exc, None
             elapsed = time.monotonic() - began
@@ -954,7 +1010,9 @@ async def forward(
         try:
             while True:
                 try:
-                    chunk = await inflight.wait_for_upstream(call, anext(chunks))
+                    chunk = await inflight.wait_for_upstream(
+                        call, anext(chunks), timeout=stall_s
+                    )
                 except StopAsyncIteration:
                     break
                 inflight.phase(call, inflight.STREAM)
@@ -998,6 +1056,14 @@ async def forward(
         except inflight.ManualAbort:
             note = "manual_abort"
             log(f"  manually stopped after {sent}B")
+        except inflight.UpstreamStall:
+            # 上游开着流但不再出字节（也没有完成事件）：和手动打断一样切断这条流，
+            # 下游收不到完成事件就会自己重发；不换站、不影响并发的其它请求
+            note = "stall_timeout"
+            log(
+                f"  WARN 上游 {stall_s:g}s 没有新字节，按卡住打断"
+                f" status={upstream_resp.status_code} resp={sent}B（等下游重发）"
+            )
         except httpx.HTTPError as exc:
             note = "upstream_abort"
             log(f"  stream aborted: {exc.__class__.__name__}: {exc} after {sent}B")
