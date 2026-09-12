@@ -118,8 +118,8 @@ def test_admin_api_rejects_origin_null(gateway):
 
 
 def test_stall_timeout_setting_roundtrip_and_range(gateway):
-    """发呆超时：默认 15 秒，可改，0 = 关闭，超过上限被拒。"""
-    assert gateway.get("/admin/api/stall-timeout").json()["seconds"] == 15
+    """发呆超时：默认 20 秒，可改，0 = 关闭，超过上限被拒。"""
+    assert gateway.get("/admin/api/stall-timeout").json()["seconds"] == 20
     assert gateway.put("/admin/api/stall-timeout", json={"seconds": 30}).json()["seconds"] == 30
     assert gateway.get("/admin/api/stall-timeout").json()["seconds"] == 30
     assert gateway.put("/admin/api/stall-timeout", json={"seconds": 0}).json()["seconds"] == 0

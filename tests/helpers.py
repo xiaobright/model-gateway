@@ -61,9 +61,6 @@ async def fake_upstream_request(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             status, headers={"content-type": "application/json"}, stream=HangingBody()
         )
-    if getattr(upstream, "sick", {}).get("hang_headers"):
-        # 连响应头都不给：测「上游发呆超时自动打断」用（真人也常说「卡着不返回」）
-        await asyncio.Event().wait()
     return await httpx.ASGITransport(app=upstream.app).handle_async_request(request)
 
 
@@ -318,6 +315,9 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                                   "cache_read_input_tokens": 900, "output_tokens": 1},
                     },
                 })
+                if mode == "slow_first_token":
+                    # 首字很慢：先只给 message_start，模型算一阵才吐第一个字（公益站常见）
+                    await asyncio.sleep(float(body.get("first_token_delay") or 0.5))
                 for _ in range(deltas):
                     await asyncio.sleep(pause)
                     yield sse("content_block_delta", {

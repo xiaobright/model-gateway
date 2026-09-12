@@ -102,18 +102,20 @@ class UpstreamStall(Exception):
     """上游在发呆超时内没有给出响应头或下一个字节。"""
 
 
-async def wait_for_upstream(call: Call, operation: Awaitable[Any], timeout: float = 0.0) -> Any:
+async def wait_for_upstream(
+    call: Call, operation: Awaitable[Any], timeout: float | None = None
+) -> Any:
     """登记当前上游等待，让管理接口能立即取消卡住的 send/read。
 
-    timeout > 0 时是发呆超时：这段时间内没等到结果就取消等待并抛 UpstreamStall，
-    由调用方决定是换候选还是切断这条流。
+    timeout 给了就是发呆超时：这段时间内没等到结果就取消等待并抛 UpstreamStall，
+    由调用方决定是换候选还是切断这条流；None = 不限时（等响应头、等首字都用它）。
     """
     pending = asyncio.ensure_future(operation)
     call.pending = pending
     if call.cancel_requested:
         pending.cancel()
     try:
-        if timeout and timeout > 0:
+        if timeout is not None:
             return await asyncio.wait_for(pending, timeout)
         return await pending
     except asyncio.CancelledError:

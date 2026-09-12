@@ -295,11 +295,11 @@ function failoverSwitches(list) {
       <span>${list.length > 1 ? esc(PROTO_LABEL[p] || p) + ' ' : '自动'}降级</span>
     </label>`).join('');
   // 发呆超时是全局设置，两个摆放位置（模型路由卡头 / 实时页）都跟着普通开关走
-  const stall = state.stallTimeout ?? 15;
-  return switches + `<label class="fo-item" title="上游超过这段时间没有任何新字节（含等响应头）就打断这条请求，让客户端重发；不触发自动降级。0 = 关闭">
+  const stall = state.stallTimeout ?? 20;
+  return switches + `<label class="fo-item" title="开始出内容后，超过这段时间没有新的正文/推理/工具参数就打断这条请求，让客户端重发；等响应头和等第一个字不计时，也不触发自动降级。0 = 关闭">
       <input type="number" class="stall-input" min="0" max="3600" step="1" value="${stall}"
              data-act="stall-timeout">
-      <span>秒无新字节自动打断</span>
+      <span>秒没有新内容自动打断</span>
     </label>`;
 }
 

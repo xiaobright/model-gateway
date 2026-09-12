@@ -1484,7 +1484,7 @@ const ACTIONS = {
     el.value = String(data.seconds);
     toast(
       data.seconds
-        ? `上游 ${data.seconds} 秒没有新字节将自动打断`
+        ? `吐字后 ${data.seconds} 秒没有新内容将自动打断`
         : '已关闭上游发呆自动打断',
       'ok',
     );

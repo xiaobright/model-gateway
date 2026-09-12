@@ -47,6 +47,10 @@ _OPENAI_THINK = re.compile(rb"reasoning_summary")
 # reasoning_content，有的站叫 reasoning），两个都认
 _CHAT_TEXT = _string_field("content")
 _CHAT_THINK = re.compile(rb'"(?:reasoning_content|reasoning)":\s*"((?:[^"\\]|\\.)*)"')
+# 工具参数的增量也算「开始吐字」：Anthropic 用 partial_json，Chat 用 arguments
+# （Responses 的工具参数和正文一样走 "delta"）。发呆超时靠它决定从什么时候开始计时，
+# 不认这些的话，只出工具调用的流会被当成「一直没吐字」。
+_TOOL_DELTA = re.compile(rb'"(?:partial_json|arguments)":\s*"')
 
 
 def _last(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
@@ -377,6 +381,8 @@ class SSEObserver:
         self.ended = False
         self.text_bytes = 0
         self.thinking = False
+        # 正文/推理/工具参数增量出现过几次。「吐字」之后发呆超时才计时，见 proxy relay
+        self.content_events = 0
         # 没有事件边界的超大帧：只丢观察缓冲，绝不拖慢或拖垮转发
         self.oversized_frames = 0
         # Compaction is opaque state. Keep only event metadata and ciphertext
@@ -435,7 +441,11 @@ class SSEObserver:
             self.thinking = self.thinking or think
         except Exception:
             # 统计只是观察，坏 JSON / 奇怪编码不能让下游断流。
-            pass
+            got, think = 0, False
+        # 每来一次正文/推理/工具参数增量算一次「吐字」。消息开始、usage、结束事件
+        # 都不算 —— 发呆超时只看这个计数有没有往前走。
+        if got or think or _TOOL_DELTA.search(frame):
+            self.content_events += 1
 
         data_text = data_bytes.decode("utf-8", "ignore").strip()
         payload: object = None

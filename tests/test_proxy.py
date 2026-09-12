@@ -11,36 +11,38 @@ from helpers import (
 )
 
 
-def test_stalled_headers_are_aborted_without_failover(gateway):
-    """单条连接卡住（并发其它请求正常）时只打断这一条、给下游重发的机会。
+@pytest.mark.network
+def test_slow_first_token_is_not_cut(gateway):
+    """首字慢不打断：只收到 message_start、一两分钟没吐字是模型在算，不是卡住。
 
-    真库里的偶发卡住常常只影响一条连接；换站会让同一条请求在别的站被处理两遍，
-    而且站本身是好的，不该进冷却。
+    真库里的公益站首字经常要一两分钟；发呆超时只在开始吐字之后才生效。
+    走真实 socket —— 进程内 ASGITransport 会整包缓冲，模拟不了流式停顿。
     """
     from gateway import db
 
-    db.set_setting("stall_timeout_s", "0.5")
-    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+    db.set_setting("stall_timeout_s", "0.2")
+    with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA", "anthropic")
-        g_b = add_upstream(gateway, b, "siteB", "anthropic")
         add_route(gateway, "opus", g_a, "opus-a")
-        add_route(gateway, "opus", g_b, "opus-b")
-        a.sick["hang_headers"] = True  # 收下请求，但连响应头都不给
 
-        began = time.monotonic()
-        resp = gateway.post("/v1/messages", json=msg("opus"))
-        elapsed = time.monotonic() - began
+        with gateway.stream(
+            "POST",
+            "/v1/messages",
+            json=msg("opus", stream=True, mode="slow_first_token", first_token_delay=0.8),
+        ) as stream:
+            raw = "".join(stream.iter_text())
 
-        assert resp.status_code == 504, resp.text
-        assert elapsed < 5, f"不应该等到 httpx 的 600 秒 read 超时（{elapsed:.1f}s）"
-        rows = wait_rows(gateway, 1)
-        assert (rows[0]["upstream"], rows[0]["note"]) == ("siteA", "stall_timeout")
-        assert rows_on(gateway, "siteB") == 0, "不降级：本来就不是站的问题"
-        assert gateway.get("/admin/api/failover").json()["breakers"] == [], "站没坏，不进冷却"
+        assert "message_stop" in raw, "首字慢是正常的，不能按卡住打断"
+        row = wait_for_row(gateway)
+        assert row["note"] == "ok", f"不该标异常，实际是 {row['note']}"
 
 
+@pytest.mark.network
 def test_stalled_stream_is_cut_so_downstream_can_retry(gateway):
-    """已经开流后上游不再出字节：切断这条流，下游收不到完成事件就会自己重发。"""
+    """吐字之后上游不再出内容：切断这条流，下游收不到完成事件就会自己重发。
+
+    走真实 socket：进程内 ASGITransport 会整包缓冲，只有网络路径才有「吐字后停住」。
+    """
     from gateway import db
 
     db.set_setting("stall_timeout_s", "0.5")

@@ -32,6 +32,37 @@ def test_sse_observer_spans_chunks_and_counts_content_once():
     assert observer.ended, "完成事件跨 chunk 也必须识别"
 
 
+def test_sse_observer_counts_only_real_content_as_output_start():
+    """发呆超时从「吐字」开始计时：message_start / usage / 结束事件都不算，
+    正文、推理和工具参数增量要算。"""
+    from gateway.protocols import ANTHROPIC, SSEObserver
+
+    observer = SSEObserver(ANTHROPIC)
+    observer.feed(b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n')
+    assert observer.content_events == 0, "消息开始不算吐字"
+
+    observer.feed(
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"input_json_delta","partial_json":"{\\"path\\""}}\n\n'
+    )
+    assert observer.content_events == 1, "工具参数增量也算吐字"
+
+    observer.feed(
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"thinking_delta","thinking":"hmm"}}\n\n'
+    )
+    assert observer.content_events == 2, "推理增量也算"
+
+    observer.feed(
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+        b'"usage":{"output_tokens":5}}\n\n'
+    )
+    assert observer.content_events == 2, "usage / 结束类事件不算新内容"
+
+    observer.feed(b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+    assert observer.ended and observer.content_events == 2, "结束事件本身不算吐字"
+
+
 def test_sse_observer_requires_the_protocol_specific_event():
     from gateway.protocols import ANTHROPIC, SSEObserver
 
@@ -181,33 +212,6 @@ def test_waiting_for_headers_returns_as_soon_as_they_arrive():
     got, elapsed = asyncio.run(run())
     assert got is response
     assert elapsed < 0.04, f"响应头 1ms 就回来了，不该等满 {elapsed * 1000:.0f}ms"
-
-
-def test_waiting_for_headers_gives_up_when_upstream_goes_quiet():
-    """上游连响应头都不给时，发呆超时要取消 send 并抛 UpstreamStall。"""
-    from gateway import inflight
-    from gateway.proxy import _send_until_headers
-
-    cancelled = asyncio.Event()
-
-    class Request:
-        async def is_disconnected(self):
-            return False
-
-    class Client:
-        async def send(self, prepared, *, stream):
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-    async def run():
-        with pytest.raises(inflight.UpstreamStall):
-            await _send_until_headers(Request(), Client(), object(), stall_s=0.05)
-
-    asyncio.run(run())
-    assert cancelled.is_set(), "发呆超时后必须取消还没完成的 send"
 
 
 def test_wait_for_upstream_maps_timeout_to_stall():
