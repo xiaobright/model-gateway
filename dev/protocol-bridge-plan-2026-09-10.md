@@ -607,7 +607,7 @@ web_search）原样留在 input（原生扩展上游不受影响、不认的上�
 
 **证据链**（三方互证）：
 
-1. **官方抓包**（`<参考目录>\codex-stream-recorder`，5 月 21 日 Codex 直连 GPT-5.5，
+1. **官方抓包**（本机 `codex-stream-recorder` 记录，5 月 21 日 Codex 直连 GPT-5.5，
    4 个会话）：reasoning item 的 added 形状是
    `{id, type, encrypted_content, summary: []}` —— **summary 是空数组**；每个 item
    （reasoning/web_search/message/工具）都有**独立递增的 output_index**；message item
