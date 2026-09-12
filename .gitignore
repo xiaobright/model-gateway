@@ -4,6 +4,7 @@ data/
 *.egg-info/
 .pytest_cache/
 .playwright-mcp/
+.workbuddy-ai/
 /gateway.db
 dev/liquid-qa/
 dev/orbit-shot.png
