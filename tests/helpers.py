@@ -184,7 +184,7 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                 else:
                     yield b"data: [DONE]\n\n"
                 if mode == "lingering":
-                    # 发完完成事件却不收连接，等客户端自己走（站A 这类站的行为）
+                    # 发完完成事件却不收连接，等客户端自己走（有的站就是这样）
                     await asyncio.sleep(20)
 
             return StreamingResponse(gen(), media_type="text/event-stream")

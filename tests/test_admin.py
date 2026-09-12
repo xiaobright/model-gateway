@@ -17,7 +17,7 @@ def test_duplicate_upstream_name_is_409_not_500(gateway):
 
 
 def test_duplicate_base_url_is_rejected_with_a_hint_about_groups(gateway):
-    """站D / DDD2 那种「同一个站建成两个供应商」正是分组要解决的问题，别让它再发生。"""
+    """同一个站被建成两个供应商那种情况正是分组要解决的问题，别让它再发生。"""
     with MockUpstream("siteA") as a:
         add_upstream(gateway, a, "siteA")
         dup = gateway.post("/admin/api/upstreams", json={"name": "siteA-2", "base_url": a.base_url})
@@ -186,7 +186,7 @@ def test_moving_a_group_merges_two_providers(gateway):
         assert cand["candidates"][0]["upstream_name"] == "keep"
         assert cand["candidates"][0]["group_name"] == "luna"
         # base_url 在供应商上，所以搬完之后这把 key 就走 keep 的地址了 —— 这正是合并想要的效果
-        # （站D / DDD2 两个域名本来就是同一个后端）。反过来说，两边地址不等价就别合。
+        # （两个域名本来就是同一个后端）。反过来说，两边地址不等价就别合。
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).json()["upstream"] == "siteA"
 
         assert gateway.delete(f"/admin/api/upstreams/{provider_id(gateway, 'stray')}").status_code == 200

@@ -293,11 +293,11 @@
             <textarea id="up-retry" rows="3" placeholder='[{"status":400,"times":2},{"status":503,"times":2,"delay_ms":300}]'></textarea>
           </label>
           <div class="field-row" style="margin-top:8px">
-            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="workbuddy">站A · 400×2</button>
-            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="capacity">站B · 503×2</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="transient400">偶发 400，同站再试 2 次</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="capacity">容量 503，隔 300ms 再试 2 次</button>
           </div>
           <span class="dim" style="font-size:12px;margin-top:6px;display:block">
-            站A 的 400、站B 的 capacity 503 都靠这个在网关里吞掉，客户端不停。
+            上游偶发 400、或 capacity 503 这类「下一发就好」的毛病，都靠这个在网关里吞掉，客户端不停。
           </span>
         </div>
       </details>

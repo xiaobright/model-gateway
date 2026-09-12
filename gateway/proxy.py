@@ -542,7 +542,7 @@ async def forward(
     # Standalone Codex search does not run on the model's Responses provider.
     # When a search-only group is configured, put it first even if that group
     # has no ordinary route for this model.  It receives the requested model
-    # unchanged, allowing 上游 to select its own Alpha Search credential/alias.
+    # unchanged, allowing the upstream to select its own Alpha Search credential/alias.
     # Avoid retrying the same group through its normal candidate later.
     chain = (
         (search_target,) + tuple(route for route in normal_chain if route.group_id != search_target.group_id)

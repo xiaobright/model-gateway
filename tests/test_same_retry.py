@@ -32,7 +32,7 @@ def _set_retry(client, upstream_id: int, rules: str, **extra) -> None:
 
 
 def test_same_retry_400_then_success(gateway):
-    """站A 那种：偶发 400，下一发就好。同站吞掉，客户端只看见 200。"""
+    """偶发 400 那种：下一发就好。同站吞掉，客户端只看见 200。"""
     with MockUpstream("siteA") as a:
         g = add_upstream(gateway, a, "siteA", "openai-chat")
         up = provider_id(gateway, "siteA")

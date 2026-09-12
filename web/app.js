@@ -565,7 +565,7 @@ function markRetry() {
 }
 
 const RETRY_PRESETS = {
-  workbuddy: '[{"status":400,"times":2,"delay_ms":0}]',
+  transient400: '[{"status":400,"times":2,"delay_ms":0}]',
   capacity: '[{"status":503,"times":2,"delay_ms":300}]',
 };
 
@@ -1417,7 +1417,7 @@ const ACTIONS = {
   },
 
   /* 自动降级开关。按接口分开：Claude 侧的中转站坏得勤、值得自动换；
-     GPT 侧除了 站A 都是要花钱的站，花钱图稳定，得手动确认。
+     GPT 侧几乎都是要花钱的站，花钱图稳定，得手动确认。
      属性名用 data-fo 而不是 data-iface —— 后者被模型路由那个分段选择器占了，
      开关会连带把筛选也切掉（preset-fp 当初就踩过这个坑）。 */
   'toggle-failover': async ({ fo }, el) => {

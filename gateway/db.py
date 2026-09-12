@@ -410,24 +410,6 @@ def _normalize_base_urls(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE upstreams SET base_url=? WHERE id=?", (fixed, row["id"]))
 
 
-def _seed_same_retry_presets(conn: sqlite3.Connection) -> None:
-    """给已知痛点站写上同站重试预置（只在空时填一次）。
-
-    站A 的 400 是 调用端 偶发、下一发就好；站B 的 503 是
-    OpenAI capacity（返回很快，Codex 收到就停）。以后新情况在管理页自己加。
-    """
-    presets = (
-        ("站A", '[{"status":400,"times":2,"delay_ms":0}]'),
-        ("站B", '[{"status":503,"times":2,"delay_ms":300}]'),
-    )
-    for name, rules in presets:
-        conn.execute(
-            "UPDATE upstreams SET retry_rules=?"
-            " WHERE name=? AND (retry_rules IS NULL OR retry_rules='')",
-            (rules, name),
-        )
-
-
 def _backfill_log_protocol(conn: sqlite3.Connection) -> None:
     """老记录没有协议列，而它们全是 /v1/responses 打进来的。回填一下，
     「实测格式」那列才有东西可看。"""
@@ -539,7 +521,6 @@ def _upgrade(path, stage: int) -> None:
         # 补列必须在**重建表之前**：旧版 _migrate_route_ids 是 INSERT ... SELECT，
         # 要从老表上读 priority，而老库根本没这一列 —— 先补上才不会报 no such column
         _add_missing_columns(conn)
-        _seed_same_retry_presets(conn)
         if stage == 0:
             # 最老那一代一步到位：每个供应商变成一个分组，候选直接建成最新形状
             _migrate_to_groups(conn)
@@ -1173,7 +1154,7 @@ def _group_route(conn: sqlite3.Connection, group_id: int, model_name: str) -> Ro
     Alpha Search is a separate Codex endpoint: its provider credential can be
     capable of search even when it is not a Responses candidate for the model
     currently selected in Codex.  Keep that decision explicit and use the
-    incoming model name unchanged, so 上游 can apply its own model aliases and
+    incoming model name unchanged, so the upstream can apply its own model aliases and
     credential policy.
     """
     row = conn.execute(

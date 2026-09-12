@@ -145,7 +145,7 @@ def test_standalone_web_search_fails_over_on_unsupported_endpoint(gateway):
 
 
 def test_standalone_web_search_uses_configured_search_group(gateway):
-    """Search can use one 上游 group even when Responses is routed elsewhere."""
+    """Search can use one search-only upstream group even when Responses is routed elsewhere."""
     from gateway import db
 
     with MockUpstream("model-site") as model_site, MockUpstream("search-site") as search_site:

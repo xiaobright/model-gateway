@@ -112,7 +112,7 @@ def test_failover_gives_up_after_three_attempts(gateway):
 
 
 def test_breaker_stops_paying_for_a_dead_site(gateway):
-    """真库里 站A 连续失败过 60 次、平均每次白等 16.6 秒 —— 连着坏就得躲开它，
+    """真库里有站连续失败过 60 次、平均每次白等 16.6 秒 —— 连着坏就得躲开它，
     否则每个请求都要重新交一遍学费。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a, _ = two_anthropic_sites(gateway, a, b)
@@ -149,7 +149,7 @@ def test_manual_switch_clears_the_cooldown(gateway):
 
 
 def test_route_order_decides_who_is_tried_next(gateway):
-    """圆片从左到右就是尝试顺序，站H 这种最稳的排最后当保底。"""
+    """圆片从左到右就是尝试顺序，最稳的那个站排最后当保底。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b, MockUpstream("siteC") as c:
         g_a, g_b = two_anthropic_sites(gateway, a, b)
         g_c = add_upstream(gateway, c, "siteC", "anthropic")
