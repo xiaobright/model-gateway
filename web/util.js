@@ -55,7 +55,11 @@ export const fmtInt = (n) => (n ?? 0).toLocaleString('zh-CN');
 export function fmtTokens(n) {
   if (n === null || n === undefined) return '-';
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'K';
+  if (n >= 1e4) {
+    const k = n / 1e3;
+    // 999,950 这类四舍五入后是 1000.0K：该进位到 M，不能显示成一百万的千位数
+    return k >= 999.95 ? (n / 1e6).toFixed(1) + 'M' : k.toFixed(1) + 'K';
+  }
   return String(n);
 }
 

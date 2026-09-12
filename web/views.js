@@ -111,7 +111,9 @@ export function renderKpis() {
   };
   fillSpark('live', points.map((p) => p.n), 'var(--accent)');
   fillSpark('req', points.map((p) => p.n), 'var(--accent)');
-  fillSpark('p95', points.map((p) => (p.n ? p.to / p.n : 0)), 'var(--warn)');
+  // P95 没有分桶值：宁可空着，也不拿「每请求输出 token」冒充延迟
+  const p95Spark = $('kpis').querySelector('[data-spark="p95"]');
+  if (p95Spark) p95Spark.innerHTML = '';
 }
 
 /* ================================================================ 概览：时间线 / 健康 / 热度 */
@@ -167,6 +169,7 @@ export function renderHealth() {
       <span class="h-n dim">${fmtInt(u.n)} 次</span>
     </div>`;
   }).join('');
+  if (host.innerHTML === next) return;  // 轮询重画不用重播入场动画
   host.innerHTML = next;
   enterStagger(host.children);
 }
@@ -178,6 +181,11 @@ export function renderHot() {
   if (!rows.length) { host.innerHTML = EMPTY; return; }
 
   const max = Math.max(...rows.map((m) => m.n), 1);
+
+  // 15 秒轮询：数据没变就不重建，条形的过渡动画和展开状态都不该被重播
+  const sig = JSON.stringify(rows);
+  if (host.dataset.sig === sig && host.children.length) return;
+  host.dataset.sig = sig;
 
   // 记住旧宽度，重建后先把新条拉回旧宽度再放开，就有"此消彼长"的形变
   const prev = new Map();
@@ -284,7 +292,7 @@ function failoverSwitches(list) {
   return list.map((p) => `<label class="fo-item" title="打不通就按候选顺序换下一个">
       <input type="checkbox" class="switch" ${on[p] ? 'checked' : ''}
              data-act="toggle-failover" data-fo="${p}">
-      <span>${list.length > 1 ? PROTO_LABEL[p] + ' ' : '自动'}降级</span>
+      <span>${list.length > 1 ? esc(PROTO_LABEL[p] || p) + ' ' : '自动'}降级</span>
     </label>`).join('');
 }
 
@@ -329,7 +337,8 @@ export function renderRoutes() {
   const hot = new Map(((state.overview && state.overview.models) || []).map((m) => [m.model, m]));
   const multi = multiGroupIds();
 
-  $('route-list').innerHTML = list.map((g) => {
+  const host = $('route-list');
+  const html = list.map((g) => {
     const dead = g.active_route_id === null
       ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>无可用上游</span>'
       : g.preferred_route_id !== null && g.preferred_route_id !== g.active_route_id
@@ -337,7 +346,7 @@ export function renderRoutes() {
     // 「全部」视图里两种接口混在一起，得标出来谁是谁
     const ifaceTag = !iface && g.protocol
       ? ` <span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
-        + ` title="在 ${esc(PROTO_PATH[g.protocol] || '')} 下暴露">${PROTO_LABEL[g.protocol]}</span>` : '';
+        + ` title="在 ${esc(PROTO_PATH[g.protocol] || '')} 下暴露">${esc(PROTO_LABEL[g.protocol] || '')}</span>` : '';
     const stat = hot.get(g.model_name);
     const usage = stat
       ? `<span class="route-usage" title="最近 2000 条里的请求数 · P95 ${fmtSec(stat.p95)}">${fmtInt(stat.n)} 次</span>`
@@ -361,6 +370,12 @@ export function renderRoutes() {
       </div>
     </div>`;
   }).join('');
+  if (host.innerHTML !== html) {
+    // 内容没变就不碰 DOM：滚动位置（scroll-y 容器）不该每 15 秒被打回顶部
+    const keep = host.scrollTop;
+    host.innerHTML = html;
+    host.scrollTop = keep;
+  }
 }
 
 /* ================================================================ 实时请求 */
@@ -451,7 +466,7 @@ function callHtml(c) {
 
   const bits = [
     esc(c.client || 'unknown'),
-    PROTO_LABEL[c.protocol] || esc(c.protocol),
+    esc(PROTO_LABEL[c.protocol] || c.protocol),
     c.stream ? '流式' : '非流式',
     upText(c),
   ];
@@ -620,7 +635,7 @@ function modelTags(names) {
 function groupRow(u, g) {
   const names = catalogOfGroup(g.id);
   const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
-    + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${PROTO_LABEL[g.protocol] || '?'}</span>`;
+      + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${esc(PROTO_LABEL[g.protocol] || '?')}</span>`;
   return `<tr class="grp-row">
     <td class="grp-name">${esc(g.name)} ${tag}${g.enabled ? '' : ' <span class="tag">停用</span>'}</td>
     <td class="mono dim nowrap">${maskKey(g.api_key)}</td>
@@ -651,7 +666,7 @@ export function renderUpGroups() {
   $('up-groups').innerHTML = groups.map((g) => {
     const n = catalogOfGroup(g.id).length;
     const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
-      + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${PROTO_LABEL[g.protocol] || '?'}</span>`;
+    + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${esc(PROTO_LABEL[g.protocol] || '?')}</span>`;
     return `<div class="ug-row">
       <span class="ug-name">${esc(g.name)}</span>${tag}
       <span class="ug-key">${maskKey(g.api_key)}</span>

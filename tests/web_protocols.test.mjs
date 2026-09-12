@@ -7,6 +7,7 @@ import {
   PROTO_PATH,
   PROTO_SHORT,
   PROTOCOLS,
+  fmtTokens,
   setProtocolMetadata,
 } from '../web/util.js';
 import { createRefreshQueue } from '../web/async-state.js';
@@ -34,6 +35,12 @@ assert.equal(PROTO_SHORT['anthropic'], 'Anthropic');
 assert.equal(PROTO_SHORT['test-third'], 'Test Third', '没给 short 就退回完整标签');
 assert.equal(PROTO_PATH['test-third'], '/test/third');
 assert.equal(PROTO_CLIENT['test-third'], 'Test Client');
+
+// 千位与百万位之间的进位：999,950 四舍五入后是 1000.0K，必须显示成 1.0M
+assert.equal(fmtTokens(9994), '9994');
+assert.equal(fmtTokens(15000), '15.0K');
+assert.equal(fmtTokens(999950), '1.0M');
+assert.equal(fmtTokens(2500000), '2.5M');
 
 assert.throws(
   () => setProtocolMetadata([{ name: 'test-third', label: '', path: '/x', client: 'Test' }]),

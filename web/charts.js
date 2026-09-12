@@ -4,6 +4,8 @@
    - Catmull-Rom 三次样条插值，消除折线的机械生硬感
    - vector-effect="non-scaling-stroke" 锁定线宽 */
 
+import { esc } from './util.js';
+
 const NS = 'http://www.w3.org/2000/svg';
 const VW = 300;   // 虚拟坐标系宽
 const VH = 100;   // 虚拟坐标系高
@@ -259,7 +261,7 @@ export function areaChart(points, bucket, { onHover } = {}) {
 }
 
 function defaultTip(p) {
-  return `<b>${p.n || 0}</b> 次${p.err ? ` · <span class="tip-err">${p.err} 失败</span>` : ''}`
+  return `<b>${p.n || 0}</b> 次${p.err ? ` · <span class="tip-err">${esc(p.err)} 失败</span>` : ''}`
     + `<br><span class="dim">出 ${fmtK(p.to)} tok</span>`;
 }
 
@@ -272,8 +274,12 @@ function fmtK(v) {
 
 function pickAxis(len) {
   if (len <= 1) return [0];
-  const count = len > 40 ? 4 : 5;
-  return Array.from({ length: count }, (_, k) => Math.round((k / (count - 1)) * (len - 1)));
+  // 桶数少时 count 不能超过 len，否则 Math.round 会算出重复下标，标签叠在一起
+  const count = Math.min(len, len > 40 ? 4 : 5);
+  const picks = Array.from(
+    { length: count }, (_, k) => Math.round((k / (count - 1)) * (len - 1)),
+  );
+  return [...new Set(picks)];
 }
 
 function axisLabel(epochSec, bucket) {

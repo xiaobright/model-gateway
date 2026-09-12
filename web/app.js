@@ -502,12 +502,17 @@ async function probeUpstream() {
   if (state.editing === null) return toast('先保存这个供应商，再测出口', 'err');
   const host = $('up-egress-hint');
   host.textContent = '正在从每扇门各打一次…';
-  const data = await api('POST', `/admin/api/upstreams/${state.editing}/probe`);
-  host.innerHTML = data.results.map((r) => {
-    const dot = r.ok ? (r.status < 400 ? 'good' : 'warn') : 'crit';
-    const what = r.ok ? `${r.status}` : esc(r.error.slice(0, 60));
-    return `<span class="dot dot-${dot}"></span>${esc(r.label)} ${what} <span class="dim">${r.ms}ms</span>`;
-  }).join(' &nbsp; ') + '<br><span class="dim">拿到状态码就算这扇门能到站（401 也算 —— 问的是网络，不是 key）</span>';
+  try {
+    const data = await api('POST', `/admin/api/upstreams/${state.editing}/probe`);
+    if (!Array.isArray(data.results)) throw new Error('响应里没有 results');
+    host.innerHTML = data.results.map((r) => {
+      const dot = r.ok ? (r.status < 400 ? 'good' : 'warn') : 'crit';
+      const what = r.ok ? `${r.status}` : esc(r.error.slice(0, 60));
+      return `<span class="dot dot-${dot}"></span>${esc(r.label)} ${what} <span class="dim">${r.ms}ms</span>`;
+    }).join(' &nbsp; ') + '<br><span class="dim">拿到状态码就算这扇门能到站（401 也算 —— 问的是网络，不是 key）</span>';
+  } catch (e) {
+    host.textContent = `测出口失败：${e.message}`;
+  }
 }
 
 function openUpstream(id) {
@@ -526,7 +531,7 @@ function openUpstream(id) {
 
   const hint = $('up-groups-hint');
   hint.hidden = Boolean(u);
-  if (!u) hint.innerHTML = '保存后就能在这里加第一个分组：选接口（Anthropic / OpenAI）＋ 填那把 key。';
+  if (!u) hint.innerHTML = '保存后就能在这里加第一个分组：选接口（Anthropic Messages / OpenAI Responses / Chat Completions）＋ 填那把 key。';
   $('up-dialog').showModal();
   views.renderUpGroups();      // 已有的供应商在这儿直接管分组，不用回列表里展开
   $('up-name').focus();
@@ -583,6 +588,9 @@ function upstreamPayload(source = null, enabled = null) {
 async function saveUpstream() {
   const payload = upstreamPayload();
   if (!payload.name || !payload.base_url) return toast('名称和 Base URL 都要填', 'err');
+  if (egressKind() === 'proxy' && !payload.egress) {
+    return toast('「走指定代理」得填代理地址；想跟随系统代理就选那一项', 'err');
+  }
   if (payload.header_override) {
     try {
       const parsed = JSON.parse(payload.header_override);
@@ -602,19 +610,27 @@ async function saveUpstream() {
   if (state.editing === null) {
     const created = await api('POST', '/admin/api/upstreams', payload);
     // 供应商弹窗不关：分组就在它下半部分管。新建的供应商还没有分组、用不了，
-    // 所以直接把分组弹窗叠上去；关掉那层就回到这儿，新分组已经列在下面了
+    // 所以直接把分组弹窗叠上去；关掉那层就回到这儿，新分组已经列在下面了。
+    // 请求在途时弹窗被关掉的话，就别为一个放弃的流程再叠分组弹窗。
+    const stillEditing = $('up-dialog').open && state.editing === null;
+    await refreshConfig();
+    if (!stillEditing) {
+      toast('已保存', 'ok');
+      return;
+    }
     state.editing = created.id;
     $('up-title').textContent = `编辑供应商：${created.name}`;
     $('up-groups-hint').hidden = true;
-    await refreshConfig();
     toast('已保存，接着建第一个分组', 'ok');
     openGroup(created.id, null);
     return;
   }
-  await api('PUT', `/admin/api/upstreams/${state.editing}`, payload);
+  const editingAt = state.editing;
+  await api('PUT', `/admin/api/upstreams/${editingAt}`, payload);
+  await refreshConfig();
+  if (state.editing !== editingAt) return;  // 迟到响应：别去动另一个供应商的表单
   toast('已保存', 'ok');
   markOverride();
-  await refreshConfig();
 }
 
 /* ---------------------------------------------------------------- 分组弹窗 */
@@ -623,7 +639,7 @@ async function saveUpstream() {
    两把 key 能拉到的东西常常不一样，这也是分组存在的理由。 */
 function fillIfaceSelect(selectId, value) {
   $(selectId).innerHTML = PROTOCOLS.map((p) =>
-    `<option value="${p}">${PROTO_LABEL[p]}　${PROTO_PATH[p]} · ${PROTO_CLIENT[p]}</option>`).join('');
+    `<option value="${p}">${esc(PROTO_LABEL[p])}　${esc(PROTO_PATH[p])} · ${esc(PROTO_CLIENT[p])}</option>`).join('');
   $(selectId).value = value;
 }
 
@@ -925,7 +941,7 @@ function fillRemoteList(gid) {
   $('rt-remote-list').innerHTML = names.map((n) => `<option value="${esc(n)}"></option>`).join('');
 
   // 加候选时，同一个分组下已经挂着的那几条真名不能再重复（后端会 409），先说清楚
-  const dup = state.editingCand ? [] : takenRemotes($('rt-model').value.trim(), gid);
+  const dup = state.editingCand ? [] : takenRemotes($('rt-model').value.trim(), gid, $('rt-iface').value);
   if (dup.length) {
     hint.innerHTML = `这个分组下已经有 <b>${dup.length}</b> 条这个模型的候选`
       + `（${dup.map(esc).join('、')}），再加一条得换个真名`;
@@ -941,9 +957,11 @@ function fillRemoteList(gid) {
   if (!pulledNames && !remoteBusy.has(gid) && !remoteDead.has(gid)) pullRemoteList(gid);
 }
 
-/** 这个模型在这个分组下已经占用的上游真名 */
-function takenRemotes(model, gid) {
-  const row = model ? state.routes.find((r) => r.model_name === model) : null;
+/** 这个模型在这个分组下已经占用的上游真名（同名多协议时必须按接口定位链） */
+function takenRemotes(model, gid, proto = '') {
+  const row = model
+    ? state.routes.find((r) => r.model_name === model && (!proto || r.protocol === proto))
+    : null;
   if (!row) return [];
   return row.candidates.filter((c) => c.group_id === gid).map((c) => c.remote_model);
 }
@@ -1037,8 +1055,11 @@ function syncSearchFields() {
     : '当前：跟着被搜索模型自己的候选链走（默认）。';
 }
 
+let searchDialogSeq = 0;
+
 function openSearch() {
   if (!PROTOCOLS.length) return toast('协议选项还没加载完成，请稍后重试', 'err');
+  searchDialogSeq += 1;
   const target = state.searchTarget || {};
   const gid = target.group_id ? Number(target.group_id) : null;
   const up = gid ? upstreamOfGroup(gid) : null;
@@ -1054,10 +1075,12 @@ function openSearch() {
 }
 
 async function saveSearch() {
+  const seq = searchDialogSeq;
   const uid = $('sr-upstream').value;
+  let message;
   if (!uid) {
     await api('PUT', '/admin/api/standalone-search-target', { group_id: null, model: null });
-    toast('搜索上游已恢复为跟随候选链', 'ok');
+    message = '搜索上游已恢复为跟随候选链';
   } else {
     const gid = Number($('sr-group').value);
     if (!gid) return toast('这个供应商没有可用的 OpenAI 分组', 'err');
@@ -1065,27 +1088,35 @@ async function saveSearch() {
     await api('PUT', '/admin/api/standalone-search-target', {
       group_id: gid, model: model || null,
     });
-    toast('搜索上游已保存', 'ok');
+    message = '搜索上游已保存';
   }
-  $('search-dialog').close();
   await refreshConfig();
+  // 请求在途时弹窗被关掉又重开：旧响应不能去关新会话的弹窗
+  if (seq !== searchDialogSeq) return;
+  $('search-dialog').close();
+  toast(message, 'ok');
 }
 
 /* ------------------------------------------------- 上游敏感词绕行（请求改写） */
 
 /* 规则直接用 JSON 原文编辑：跟「请求头覆写」一个路子 —— 这类低频、形状自由的配置，
    与其做一堆表单积木，不如让人直接改 JSON，写错了让后端挡回来。 */
+let rewriteDirty = false;
+
 function renderRewriteRules(data) {
   const box = $('rewrite-rules');
   if (!box) return;
-  const rules = (data && data.rules) || [];
+  if (data == null) return;  // GET 失败：别拿空表覆盖正在编辑或上次成功的内容
+  const rules = data.rules || [];
   state.rewriteRules = rules;
-  // 正在编辑时别把人打的字冲掉
-  if (document.activeElement !== box) {
+  // 有未保存的编辑（失焦也算）时别回填，15 秒轮询/弹窗关闭都走这里
+  if (!rewriteDirty && document.activeElement !== box) {
     box.value = rules.length ? JSON.stringify(rules, null, 2) : '';
   }
   const count = $('rewrite-count');
-  if (count) count.textContent = rules.length ? `${rules.length} 条` : '未启用';
+  if (count) {
+    count.textContent = rewriteDirty ? '未保存' : (rules.length ? `${rules.length} 条` : '未启用');
+  }
 }
 
 async function saveRewrite() {
@@ -1101,6 +1132,7 @@ async function saveRewrite() {
     if (!Array.isArray(rules)) return toast('要是一个数组：[{"from":"x","to":"y"}]', 'err');
   }
   const saved = await api('PUT', '/admin/api/rewrite-rules', { rules });
+  rewriteDirty = false;
   renderRewriteRules(saved);
   toast(rules.length ? `已保存 ${rules.length} 条规则` : '已清空规则', 'ok');
 }
@@ -1223,7 +1255,7 @@ const ACTIONS = {
     const last = up && (up.groups || []).length === 1;
     const okay = await confirmBox({
       title: '删除分组',
-      body: `要删掉 <b>${esc(up ? up.name : '?')}</b> 下的 ${PROTO_LABEL[g ? g.protocol : ''] || ''}`
+      body: `要删掉 <b>${esc(up ? up.name : '?')}</b> 下的 ${esc(PROTO_LABEL[g ? g.protocol : ''] || '')}`
         + ` 分组 <b>${esc(g ? g.name : id)}</b>，连带它的 ${n} 条模型候选。`
         + '<br><br>这把 key 也会一起没掉。只想临时停用的话，把它的开关关掉就行。'
         + (last ? '<br><br>它是这个供应商唯一的分组，删完这个站就没有可用的 key 了。' : ''),
@@ -1360,11 +1392,12 @@ const ACTIONS = {
         );
       }
     } finally {
+      // 中途失败也要把界面拉回真实状态：前面几条已经删掉了，不能只等重开弹窗
       endModelWrites(token, names);
-    }
-    if (isCurrentGroupEdit(token)) {
-      await refreshConfig();
-      renderPicker();
+      if (isCurrentGroupEdit(token)) {
+        await refreshConfig();
+        renderPicker();
+      }
     }
     toast(`去掉了 ${names.length} 个`, 'ok');
   },
@@ -1430,7 +1463,8 @@ const ACTIONS = {
       // flip the switch back visually.
       const seq = ++failoverRequestSeq;
       failoverAppliedSeq = seq;
-      state.failover = result;
+      // POST 只回 enabled；breakers 是/ inflight 带来的，不能整体替换掉
+      state.failover = { ...(state.failover || {}), ...result };
     } catch (e) {
       el.checked = !el.checked;
       throw e;
@@ -1443,7 +1477,8 @@ const ACTIONS = {
   'move-cand': async ({ dir }) => {
     const cand = state.editingCand;
     if (!cand) return;
-    const row = state.routes.find((r) => r.model_name === cand.model);
+    const row = state.routes.find((r) =>
+      r.model_name === cand.model && (!cand.proto || r.protocol === cand.proto));
     if (!row) return;
     const ids = row.candidates.map((c) => c.route_id);
     const at = ids.indexOf(cand.rid);
@@ -1495,7 +1530,7 @@ const ACTIONS = {
     const other = state.routes.find((r) => r.model_name === model && r.protocol !== proto);
     const okay = await confirmBox({
       title: '删除模型',
-      body: `删掉 <b>${esc(model)}</b> 在${PROTO_LABEL[proto] || proto || '该接口'}下的全部 ${n} 条候选，`
+      body: `删掉 <b>${esc(model)}</b> 在${esc(PROTO_LABEL[proto] || proto || '该接口')}下的全部 ${n} 条候选，`
         + `它将不再从这个接口的 /v1/models 里暴露。`
         + (other ? '<br><br>它在其它接口下还有候选，不受影响。' : '')
         + '<br><br>上游站点本身不受影响，之后还能重新导入。',
@@ -1619,6 +1654,11 @@ $('rt-iface').addEventListener('change', () => {
 $('up-base').addEventListener('input', baseHint);
 $('up-override').addEventListener('input', markOverride);
 $('up-retry').addEventListener('input', markRetry);
+$('rewrite-rules').addEventListener('input', () => {
+  rewriteDirty = true;
+  const count = $('rewrite-count');
+  if (count) count.textContent = '未保存';
+});
 $('up-egress-kind').addEventListener('change', egressHint);
 
 /* 手填模型名：回车直接加，别提交整个表单（那是保存分组的按钮）。
