@@ -377,6 +377,8 @@ class SSEObserver:
         self.ended = False
         self.text_bytes = 0
         self.thinking = False
+        # 没有事件边界的超大帧：只丢观察缓冲，绝不拖慢或拖垮转发
+        self.oversized_frames = 0
         # Compaction is opaque state. Keep only event metadata and ciphertext
         # length so diagnostics can prove its presence without persisting it.
         self.compaction_items: list[dict[str, object]] = []
@@ -385,14 +387,30 @@ class SSEObserver:
         self.event_types: dict[str, int] = {}
         self.payload_types: dict[str, int] = {}
 
+    MAX_BUFFER_BYTES = 4 * 1024 * 1024
+
     def feed(self, chunk: bytes) -> None:
         self._buffer.extend(chunk)
         while True:
             match = re.search(rb"\r?\n\r?\n", self._buffer)
             if match is None:
+                if len(self._buffer) > self.MAX_BUFFER_BYTES:
+                    # 很久等不到空行（超大单帧，或上游挂的是伪 SSE）：丢掉重来。
+                    # 观察器只做统计，不能在这里无上限吃内存。
+                    self._buffer.clear()
+                    self.oversized_frames += 1
                 return
             frame = bytes(self._buffer[: match.start()])
             del self._buffer[: match.end()]
+            self._observe_frame(frame)
+
+    def flush(self) -> None:
+        """上游 EOF：把最后一个没以空行收尾的帧也看掉，别把完整流误记成 truncated。"""
+        if not self._buffer:
+            return
+        frame = bytes(self._buffer).rstrip(b"\r\n")
+        self._buffer.clear()
+        if frame:
             self._observe_frame(frame)
 
     def _observe_frame(self, frame: bytes) -> None:
@@ -434,12 +452,14 @@ class SSEObserver:
         if event in self.proto.end_event_types:
             self.ended = True
             return
+        # data 里的结束标记要独立于 event 头判断：中转站可能给 [DONE] 套一个
+        # 未知的 event 名，只认 event 就会漏掉这段兜底
+        if data_text in self.proto.end_data_markers:
+            self.ended = True
+            return
         if event:
             # 有 event 头时以它为准；否则一个正文里的 type 字段可能把非结束事件
             # 错当成结束。没有 event 头的上游才使用 data JSON 的 type 兜底。
-            return
-        if data_text in self.proto.end_data_markers:
-            self.ended = True
             return
         if isinstance(payload, dict) and payload.get("type") in self.proto.end_event_types:
             self.ended = True

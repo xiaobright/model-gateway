@@ -6,11 +6,12 @@ import json
 import time
 import urllib.request
 from collections.abc import Mapping
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from . import (
     capture,
@@ -87,11 +88,22 @@ def client_args(egress: str) -> dict:
     return args
 
 
-REQ_DROP = {"host", "content-length", "transfer-encoding", "connection", "keep-alive"}
+# 逐跳头（RFC 7230 8.1.2.2）：只属于当前这一跳，代理必须剥掉；Connection 头里
+# 点名的 token 同样算逐跳，见 _connection_tokens
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "content-length", "host", "te", "trailer",
+    "transfer-encoding", "upgrade", "proxy-authorization", "proxy-authenticate",
+}
+REQ_DROP = _HOP_BY_HOP
 # content-encoding/content-length 必须去掉：relay 用 aiter_bytes 解压后转发，
-# 客户端拿到的是未压缩字节流（上游的 usage/完成事件检测也依赖解压后的内容）
-RESP_DROP = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
-REDACT_ON_CAPTURE = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+# 客户端拿到的是未压缩字节流（上游的 usage/完成事件检测也依赖解压后的内容）。
+# 多段编码的残余头由 _resp_encoding_to_keep 单独重写。
+RESP_DROP = _HOP_BY_HOP | {"content-encoding"}
+
+
+def _connection_tokens(headers: Any) -> set[str]:
+    """Connection: keep-alive, x-foo 里点名的头也是逐跳的，必须一起剥。"""
+    return {t.strip().lower() for t in headers.get("connection", "").split(",") if t.strip()}
 
 def _resp_encoding_to_keep(upstream_resp: httpx.Response) -> str:
     """httpx 按它支持的解码器逐层解压；返回还要留给客户端的 content-encoding。
@@ -141,6 +153,8 @@ def accept_encoding() -> str:
 
 HEAD_KEEP = 8192   # 开头留这么多：Anthropic 的输入 token 只在流开头的 message_start 里报一次
 TAIL_KEEP = 65536  # 末尾留这么多，用来抓 usage
+# 非流式响应要收齐了才能解析 usage；大响应封顶，别在网关里额外留一份全量副本
+MAX_JSON_OBSERVE_BYTES = 16 * 1024 * 1024
 
 # 连上游都没连上时的 usage：一个数都没有
 NO_USAGE: protocols.Usage = (None, None, None, None)
@@ -172,9 +186,11 @@ async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
     loop = asyncio.get_running_loop()
     if _client_loop is not loop:
         # 换 loop 了（托盘模式下服务跑在另一个线程里）。旧 client 的连接池绑着上一个
-        # loop，留着就是泄漏一批连接和 fd —— 而且它们已经没人能用了
-        await aclose_client()
+        # loop，留着就是泄漏一批连接和 fd —— 而且它们已经没人能用了。
+        # 先占坑再清理：否则两个并发请求同时进这段，后完成者会把先完成者刚建的
+        # client 一起清掉（那段连接池就没人关了）
         _client_loop = loop
+        await aclose_client()
     cache_key: object = (
         (EGRESS_SYSTEM, _system_proxy_signature())
         if egress == EGRESS_SYSTEM else egress
@@ -189,13 +205,16 @@ async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
 
 
 async def aclose_client() -> None:
-    global _client_loop
-    for client in list(_clients.values()):
+    # 先摘快照再关：并发 get_client 在等待期间新建的 client 不能被后到的清理扫掉。
+    # 不在这里改 _client_loop —— 谁切换 loop 谁负责记，清理只负责关连接。
+    snapshot = list(_clients.items())
+    for key, client in snapshot:
+        if _clients.get(key) is client:
+            del _clients[key]
+    for _, client in snapshot:
         if not client.is_closed:
             with contextlib.suppress(Exception):
                 await client.aclose()
-    _clients.clear()
-    _client_loop = None
 
 
 class ClientDisconnected(Exception):
@@ -325,7 +344,7 @@ def _maybe_capture_headers(request: Request, payload: dict, body_len: int) -> No
     if not flag.exists():
         return
     dump = {
-        k: ("<redacted>" if k.lower() in REDACT_ON_CAPTURE else v)
+        k: ("<redacted>" if capture.is_secret_header(k) else v)
         for k, v in request.headers.items()
     }
     input_types, input_roles = _input_item_census(payload)
@@ -482,7 +501,8 @@ def _build_headers(
     want_1m: bool = False,
 ) -> dict[str, str]:
     # ASGI 保证头名已经小写，所以下面用小写键既能覆盖客户端的同名头，也不会两份并存
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in REQ_DROP}
+    drop = REQ_DROP | _connection_tokens(request.headers)
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in drop}
     # 客户端报的压缩算法我们不一定解得了，一律换成网关自己这边的真实能力（见 accept_encoding）
     headers["accept-encoding"] = accept_encoding()
     for key, value in proto.defaults.items():
@@ -524,7 +544,12 @@ async def forward(
     if not db.protocol_enabled(proto.name):
         log(f"POST {endpoint} -> 404 ({proto.name} 接口已全局停用)")
         return _error(proto, 404, f"{proto.label} 接口已全局停用，请在管理页的接口开关里启用")
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        # 大请求体上传到一半客户端走了：连接已经没了，但别在日志里留一坨 ASGI 异常栈
+        log(f"POST {endpoint} -> 499 (客户端在请求体上传中途断开)")
+        return _error(proto, 499, "客户端已断开")
     try:
         payload = json.loads(body)
         if not isinstance(payload, dict):
@@ -605,6 +630,8 @@ async def forward(
     attempt = 0
     index = 0
     fail: Exception | None = None
+    # 最后一次真正发出去的候选（不是「下一个要试的」）：502 文案只能怪它
+    last_route: db.Route | None = None
     # 这个请求里站级失败过的分组。整个跳掉（含它下面同模型的其它候选）：同一个站
     # 绝不在一次请求里立刻重试。模型级的 404 不进这里 —— 那是名字的问题不是站的问题
     dead_groups: set[int] = set()
@@ -659,6 +686,7 @@ async def forward(
                 log(f"  已经耗了 {time.monotonic() - started:.0f}s，不再开新尝试")
                 break
 
+        last_route = route
         # 上游只认它那边的真名。[1m] 是 Claude Code 自己的档位约定，请求侧和配置侧都可能带，一并摘掉
         remote, remote_flag = naming.split_model(route.remote_model)
         want_1m = naming.wants_1m(flag) or naming.wants_1m(remote_flag)
@@ -777,6 +805,8 @@ async def forward(
                 break
             continue
 
+        # 这次拿到响应头了，之前候选的连接异常不再算数
+        fail = None
         inflight.phase(call, inflight.WAIT, status=resp.status_code)
         # 带了 stateful 字段的请求不降级，日志里标出来 —— 排查「为什么这条没换站」时靠它
         detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}" if stateful else ""
@@ -873,10 +903,11 @@ async def forward(
         index = nxt
 
     if resp is None:
+        blamed = last_route or route
         if fail is not None:
-            why = f"上游 {route.upstream.name} 请求失败: {fail}"
+            why = f"上游 {blamed.upstream.name} 请求失败: {fail}"
         else:
-            why = f"上游 {route.upstream.name} 没能给出可用的响应"
+            why = f"上游 {blamed.upstream.name} 没能给出可用的响应"
         if attempt > 1:
             why += f"（试过 {attempt} 个候选）"
         inflight.finish(call, status=502, note="connect_failed")
@@ -913,6 +944,7 @@ async def forward(
         content_type = upstream_resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         observer = protocols.SSEObserver(proto) if content_type == "text/event-stream" else None
         json_body = bytearray()
+        json_capped = False
         head = bytearray()
         tail = bytearray()
         note = "ok"
@@ -954,7 +986,11 @@ async def forward(
                         log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
                 else:
                     # JSON 要收齐后再统计，字符串和 UTF-8 字符也可能被网络切开。
-                    json_body.extend(chunk)
+                    room = MAX_JSON_OBSERVE_BYTES - len(json_body)
+                    if room > 0:
+                        json_body.extend(chunk[:room])
+                    if len(chunk) > room:
+                        json_capped = True
                 if len(tail) > TAIL_KEEP:
                     del tail[: len(tail) - TAIL_KEEP]
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
@@ -974,6 +1010,9 @@ async def forward(
             log(f"  client left after {sent}B (completed={completed})")
             raise
         else:
+            if observer is not None:
+                # 上游 EOF：没有空行收尾的最后一个帧也要看，不能把完整流误记成 truncated
+                observer.flush()
             # 只有「上游说 200 且是流式」时缺完成事件才算被截断，4xx/5xx 本来就没有完成事件
             if observer is not None and upstream_resp.status_code < 300 and not observer.ended:
                 note = "truncated"
@@ -991,7 +1030,9 @@ async def forward(
                     event_types=(dict(observer.event_types) if observer is not None else {}),
                     resp_headers=capture.sanitize_headers(upstream_resp.headers),
                 )
-            if json_body:
+            if json_capped:
+                log(f"  JSON observe skipped: 响应体超过 {MAX_JSON_OBSERVE_BYTES // 1048576}MB，不解析 usage")
+            if json_body and not json_capped:
                 try:
                     json_payload = json.loads(json_body)
                     if isinstance(json_payload, dict):
@@ -1036,9 +1077,8 @@ async def forward(
             with contextlib.suppress(Exception):
                 await upstream_resp.aclose()
 
-    passthrough = {
-        k: v for k, v in upstream_resp.headers.items() if k.lower() not in RESP_DROP
-    }
+    drop = RESP_DROP | _connection_tokens(upstream_resp.headers)
+    passthrough = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in drop}
     # 解过的层不能留在头里（客户端会拿明文再解一次），没解掉的必须写回去
     keep_encoding = _resp_encoding_to_keep(upstream_resp)
     if keep_encoding:

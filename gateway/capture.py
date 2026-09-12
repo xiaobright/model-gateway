@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import time
@@ -43,8 +44,9 @@ MAX_STREAM_BYTES = 16 * 1024 * 1024  # 单条流封顶 16MB，超了截断但继
 DEFAULT_MAX_REQUESTS = 1
 
 # 进程内剩余条数。flag 文件是权威来源：外部直接删文件也能立刻生效，
-# 这里的计数只是为了避免同一次运行里反复读盘。
-_state: dict[str, int] = {"remaining": 0}
+# 这里的计数只是为了避免同一次运行里反复读盘。begin 时就占名额，抓满不再补发。
+_state: dict[str, int] = {"remaining": 0, "active": 0}
+_seq = itertools.count(1)  # 目录序号：同一秒、同一个模型也不会互相覆盖
 
 
 def flag_path() -> Path:
@@ -89,6 +91,12 @@ _SECRET_HEADERS = {
 _SECRET_SUFFIXES = ("-key", "-token", "-secret", "-auth")
 
 
+def is_secret_header(name: str) -> bool:
+    """这个名字的头是不是密钥。抓包落盘的每一处都必须用这同一份判定。"""
+    name = str(name).lower()
+    return name in _SECRET_HEADERS or name.endswith(_SECRET_SUFFIXES)
+
+
 def sanitize_headers(headers: Any) -> dict[str, str]:
     """转成普通 dict 并丢掉鉴权头。传什么都行，坏了返回 {}。"""
     out: dict[str, str] = {}
@@ -98,10 +106,9 @@ def sanitize_headers(headers: Any) -> dict[str, str]:
         return out
     for raw_name, value in items:
         try:
-            name = str(raw_name).lower()
-            if name in _SECRET_HEADERS or name.endswith(_SECRET_SUFFIXES):
+            if is_secret_header(raw_name):
                 continue
-            out[name] = str(value)
+            out[str(raw_name).lower()] = str(value)
         except Exception:
             continue
     return out
@@ -147,7 +154,7 @@ class StreamCapture:
         model = re.sub(r"[^A-Za-z0-9._-]+", "_", str(meta.get("model") or "unknown"))[:40]
         model = model.strip("._") or "unknown"
         root = _out_root().resolve()
-        target = (root / f"{stamp}-{model}").resolve()
+        target = (root / f"{stamp}-{next(_seq):03d}-{model}").resolve()
         if target.parent != root:
             raise ValueError(f"抓包目录名不合法：{meta.get('model')!r}")
         self.dir = target
@@ -209,22 +216,29 @@ def begin(meta: Mapping[str, Any], request_body: bytes | None = None) -> StreamC
     if not enabled():
         _state["remaining"] = 0
         return None
-    if _state["remaining"] <= 0:
+    # 名额在 begin 时占住：并发开抓不能各自都看到「还有余额」然后一起超发。
+    # active == 0 才补额 —— 否则「全部在飞、还没 finish」会被误当成计数过期。
+    if _state["remaining"] <= 0 and _state["active"] == 0:
         _state["remaining"] = _read_spec()["max"]
+    if _state["remaining"] <= 0:
+        return None
     try:
-        return StreamCapture(meta, request_body)
+        cap = StreamCapture(meta, request_body)
     except Exception:
         return None
+    _state["remaining"] -= 1
+    _state["active"] += 1
+    return cap
 
 
 def finish(cap: StreamCapture | None, **extra: Any) -> None:
-    """收尾并递减计数；抓满自动关（删 flag）。"""
+    """收尾并检查是否抓满；抓满自动关（删 flag）。"""
     if cap is None:
         return
     try:
         cap.finish(**extra)
     finally:
-        _state["remaining"] = max(0, _state["remaining"] - 1)
+        _state["active"] = max(0, _state["active"] - 1)
         if _state["remaining"] <= 0:
             try:
                 flag_path().unlink()

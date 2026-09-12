@@ -625,3 +625,138 @@ def test_inflight_snapshot_is_safe_while_calls_begin_and_finish():
     finally:
         inflight.reset()
     assert not failures, f"snapshot 与 begin/finish 并发时炸了：{failures!r}"
+
+
+# ------------------------------------------------------------------ 转发加固（P3）
+
+
+def test_sse_observer_flushes_a_final_frame_without_blank_line():
+    from gateway.protocols import OPENAI, SSEObserver
+
+    observer = SSEObserver(OPENAI)
+    observer.feed(b"data: [DONE]\n")
+    assert not observer.ended, "帧没收到空行前不能提前判完"
+    observer.flush()
+    assert observer.ended, "上游 EOF 要收掉没有空行收尾的最后一帧"
+
+
+def test_sse_observer_accepts_done_marker_even_with_an_event_header():
+    from gateway.protocols import OPENAI, SSEObserver
+
+    observer = SSEObserver(OPENAI)
+    observer.feed(b"event: proxy-note\ndata: [DONE]\n\n")
+    assert observer.ended, "[DONE] 是描述符里的兜底，不能被未知 event 名屏蔽"
+
+
+def test_sse_observer_bounds_an_event_that_never_ends():
+    from gateway.protocols import OPENAI, SSEObserver
+
+    observer = SSEObserver(OPENAI)
+    observer.MAX_BUFFER_BYTES = 1024
+    observer.feed(b"data: " + b"x" * 5000)
+    assert len(observer._buffer) <= 1024, "看不到事件边界的流不能无限吃内存"
+    assert observer.oversized_frames == 1
+
+
+def test_hop_by_hop_headers_are_stripped():
+    from starlette.requests import Request
+
+    from gateway import protocols
+    from gateway import proxy as proxy_mod
+
+    class _Upstream:
+        api_key = "sk-test"
+        header_override = ""
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [
+                (b"connection", b"keep-alive, x-hop-custom"),
+                (b"x-hop-custom", b"1"),
+                (b"te", b"trailers"),
+                (b"proxy-authorization", b"Basic x"),
+                (b"upgrade", b"websocket"),
+                (b"x-keep", b"1"),
+                (b"content-type", b"application/json"),
+            ],
+            "query_string": b"",
+        }
+    )
+
+    sent = proxy_mod._build_headers(request, _Upstream(), protocols.OPENAI)
+
+    for name in ("x-hop-custom", "te", "proxy-authorization", "upgrade", "connection"):
+        assert name not in sent, f"{name} 是逐跳头，不能转给上游"
+    assert sent["x-keep"] == "1" and sent["content-type"] == "application/json"
+
+
+def test_header_capture_uses_the_same_secret_list_as_stream_capture(tmp_path, monkeypatch):
+    from starlette.requests import Request
+
+    from gateway import config
+    from gateway import proxy as proxy_mod
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    (tmp_path / "capture.flag").write_text("", encoding="utf-8")
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [
+                (b"authorization", b"Bearer sk-x"),
+                (b"x-auth-token", b"secret"),
+                (b"x-some-key", b"secret"),
+                (b"x-codex-beta-features", b"keep-me"),
+                (b"content-type", b"application/json"),
+            ],
+            "query_string": b"",
+        }
+    )
+
+    proxy_mod._maybe_capture_headers(request, {}, 0)
+
+    dump = json.loads((tmp_path / "captured_headers.json").read_text("utf-8"))
+    assert dump["authorization"] == "<redacted>"
+    assert dump["x-auth-token"] == "<redacted>", "后缀规则要和 capture.sanitize_headers 一致"
+    assert dump["x-some-key"] == "<redacted>"
+    assert dump["x-codex-beta-features"] == "keep-me"
+    assert not (tmp_path / "capture.flag").exists(), "抓一次就收旗"
+
+
+def test_capture_does_not_overbook_under_concurrent_begins(tmp_path, monkeypatch):
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    capture.enable(2)
+
+    first = capture.begin({"model": "a"})
+    second = capture.begin({"model": "b"})
+    assert first is not None and second is not None
+    assert capture.begin({"model": "c"}) is None, "名额在 begin 时就要占住，不能等 finish"
+
+    capture.finish(first)
+    capture.finish(second)
+    assert not capture.enabled()
+
+
+def test_capture_directories_do_not_collide_within_a_second(tmp_path, monkeypatch):
+    from gateway import capture, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    capture.enable(2)
+
+    first = capture.begin({"model": "same"})
+    second = capture.begin({"model": "same"})
+    assert first is not None and second is not None
+    assert first.dir != second.dir
+
+    first.feed(b"AAAA")
+    second.feed(b"BBBB")
+    capture.finish(first)
+    capture.finish(second)
+    assert (first.dir / "stream.sse").read_bytes() == b"AAAA"
+    assert (second.dir / "stream.sse").read_bytes() == b"BBBB"
