@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -141,8 +142,15 @@ class StreamCapture:
 
     def __init__(self, meta: Mapping[str, Any], request_body: bytes | None) -> None:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        model = str(meta.get("model") or "unknown")[:40].replace("/", "_")
-        self.dir = _out_root() / f"{stamp}-{model}"
+        # 模型名来自客户端请求体，会进目录名 —— 只留一组安全字符，`\`、`:`、`..`
+        # 这类在 Windows 上是路径分隔/保留字符，原样拼进去能逃出 captured_stream。
+        model = re.sub(r"[^A-Za-z0-9._-]+", "_", str(meta.get("model") or "unknown"))[:40]
+        model = model.strip("._") or "unknown"
+        root = _out_root().resolve()
+        target = (root / f"{stamp}-{model}").resolve()
+        if target.parent != root:
+            raise ValueError(f"抓包目录名不合法：{meta.get('model')!r}")
+        self.dir = target
         self.dir.mkdir(parents=True, exist_ok=True)
         self.meta: dict[str, Any] = dict(meta)
         self._bytes = 0
