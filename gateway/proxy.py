@@ -93,23 +93,31 @@ REQ_DROP = {"host", "content-length", "transfer-encoding", "connection", "keep-a
 RESP_DROP = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
 REDACT_ON_CAPTURE = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
 
-def _resp_drop(upstream_resp: httpx.Response) -> set[str]:
-    """解不开的压缩就把 content-encoding 留给客户端，别摘。
+def _resp_encoding_to_keep(upstream_resp: httpx.Response) -> str:
+    """httpx 按它支持的解码器逐层解压；返回还要留给客户端的 content-encoding。
 
     RESP_DROP 默认摘掉 content-encoding，前提是 relay 用 aiter_bytes 已经解压过了。
-    但 httpx 只解 SUPPORTED_DECODERS 里有的编码：解不了时吐的是压缩原文，而响应头里的
-    content-encoding 还挂着（httpx 不会替你摘）。这时再摘头，客户端拿到的是一堆没标
-    压缩方式的二进制 —— opencode 那次「上游 200、下游没回复」就是这么来的。
+    但响应头可能是逗号分隔的多层（`gzip, br`），httpx 只解自己支持的那几层：解过的
+    层必须从头里去掉（不然客户端会拿明文再解一次），没解掉的留着让客户端自己解。
+    老逻辑拿整串去和单个解码器名比相等，多层时就整段保留了 —— 和 opencode 那次
+    「上游 200、下游没回复」同类，只是触发条件更窄。
 
-    所以：解得了才摘（我们已经解压了，客户端必须按明文读）；解不了就留着，让客户端
-    自己解。最多是我们这边观察不到内容、多打一条 truncated 日志，不至于把响应毁掉。
+    返回空串 = 全部已解压，调用方摘掉 content-encoding。
     """
-    enc = (upstream_resp.headers.get("content-encoding") or "").strip().lower()
-    if not enc or enc == "identity":
-        return RESP_DROP
-    if enc in {name.strip() for name in accept_encoding().split(",")}:
-        return RESP_DROP
-    return RESP_DROP - {"content-encoding"}
+    from httpx._decoders import SUPPORTED_DECODERS
+
+    supported = {
+        (key.decode() if isinstance(key, bytes) else str(key)).lower()
+        for key in SUPPORTED_DECODERS
+    }
+    supported.add("identity")
+    values = upstream_resp.headers.get_list("content-encoding", split_commas=True)
+    remaining = [
+        token.strip()
+        for token in values
+        if token.strip() and token.strip().lower() not in supported
+    ]
+    return ", ".join(remaining)
 
 
 def accept_encoding() -> str:
@@ -208,13 +216,17 @@ async def _send_until_headers(
     """
     task = asyncio.create_task(client.send(prepared, stream=True))
     try:
-        while not task.done():
+        while True:
+            # 可被完成唤醒的等待：响应头一到就返回，不能让 50ms 的轮询节拍变成
+            # 每个请求的关键路径延迟（断开检测仍是每 RESPONSE_POLL 一次）
+            done, _ = await asyncio.wait({task}, timeout=RESPONSE_POLL)
+            if task in done:
+                return await task
             if await request.is_disconnected():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
                 raise ClientDisconnected
-            await asyncio.sleep(RESPONSE_POLL)
         return await task
     except BaseException:
         # 取消恰好撞上响应头到达时，send 的任务可能已经完成，也要归还那条连接。
@@ -1025,8 +1037,12 @@ async def forward(
                 await upstream_resp.aclose()
 
     passthrough = {
-        k: v for k, v in upstream_resp.headers.items() if k.lower() not in _resp_drop(upstream_resp)
+        k: v for k, v in upstream_resp.headers.items() if k.lower() not in RESP_DROP
     }
+    # 解过的层不能留在头里（客户端会拿明文再解一次），没解掉的必须写回去
+    keep_encoding = _resp_encoding_to_keep(upstream_resp)
+    if keep_encoding:
+        passthrough["content-encoding"] = keep_encoding
     return StreamingResponse(
         relay(),
         status_code=upstream_resp.status_code,
