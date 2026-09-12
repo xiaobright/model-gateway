@@ -8,9 +8,9 @@ from typing import Any, Iterable, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from . import capture, db, failover, inflight, protocols, proxy as proxy_mod
+from . import capture, db, failover, inflight, protocols, proxy as proxy_mod, rewrite
 from . import stats as stats_mod
 from . import upstream as upstream_mod
 from .reqlog import log
@@ -109,6 +109,20 @@ class StandaloneSearchTargetIn(BaseModel):
 class CloneIn(BaseModel):
     # 兼容当前只有两种接口时的无请求体调用；有多个目标时必须明确指定。
     protocol: str | None = None
+
+
+class RewriteRuleIn(BaseModel):
+    """一条绕行规则。`from` 是 Python 关键字，所以字段名叫 from_、对外仍叫 from。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", min_length=1)
+    # 留空 = 把那段删掉
+    to: str = ""
+
+
+class RewriteRulesIn(BaseModel):
+    rules: list[RewriteRuleIn] = Field(default_factory=list)
 
 
 class CaptureStreamIn(BaseModel):
@@ -810,6 +824,25 @@ def get_capture_stream_list() -> dict[str, Any]:
             }
         )
     return {"items": items[:50], "root": str(root)}
+
+
+# ---------------------------------------------------------------- 请求改写
+# 上游的内容审核是黑盒，会误伤固定提示词（opencode 的标题生成器每轮必中
+# sensitive_words_detected，而上游不会告诉你命中了哪个词）。网关猜不出来，所以只能
+# 「踩到一条配一条」：转发前按规则表对请求体文本做字面替换。默认空表 = 一个字节都不改。
+
+
+@router.get("/rewrite-rules")
+def get_rewrite_rules() -> dict[str, Any]:
+    return {"rules": rewrite.rules()}
+
+
+@router.put("/rewrite-rules")
+def put_rewrite_rules(payload: RewriteRulesIn) -> dict[str, Any]:
+    if len(payload.rules) > rewrite.MAX_RULES:
+        raise HTTPException(400, f"最多 {rewrite.MAX_RULES} 条规则")
+    items = [{"from": r.from_, "to": r.to} for r in payload.rules]
+    return {"rules": rewrite.save(items)}
 
 
 # ---------------------------------------------------------------- 自动降级

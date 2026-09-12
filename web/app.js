@@ -112,13 +112,14 @@ let liveAppliedSeq = 0;
 const configRefresh = createRefreshQueue(
   async () => {
     const presets = await api('GET', '/admin/api/egress-presets').catch(() => null);
-    const [upstreams, routes, failover, searchTarget] = await Promise.all([
+    const [upstreams, routes, failover, searchTarget, rewriteRules] = await Promise.all([
       api('GET', '/admin/api/upstreams'),
       api('GET', '/admin/api/models'),
       api('GET', '/admin/api/failover'),
       api('GET', '/admin/api/standalone-search-target').catch(() => null),
+      api('GET', '/admin/api/rewrite-rules').catch(() => null),
     ]);
-    return { presets, upstreams, routes, failover, searchTarget };
+    return { presets, upstreams, routes, failover, searchTarget, rewriteRules };
   },
   (data, args) => {
     state.egressVps = data.presets ? data.presets.vps : null;
@@ -133,6 +134,7 @@ const configRefresh = createRefreshQueue(
     views.renderRoutes();
     views.renderUpstreams();
     renderSearchTarget();
+    renderRewriteRules(data.rewriteRules);
     syncPickerChecks();
   },
 );
@@ -1069,10 +1071,46 @@ async function saveSearch() {
   await refreshConfig();
 }
 
+/* ------------------------------------------------- 上游敏感词绕行（请求改写） */
+
+/* 规则直接用 JSON 原文编辑：跟「请求头覆写」一个路子 —— 这类低频、形状自由的配置，
+   与其做一堆表单积木，不如让人直接改 JSON，写错了让后端挡回来。 */
+function renderRewriteRules(data) {
+  const box = $('rewrite-rules');
+  if (!box) return;
+  const rules = (data && data.rules) || [];
+  state.rewriteRules = rules;
+  // 正在编辑时别把人打的字冲掉
+  if (document.activeElement !== box) {
+    box.value = rules.length ? JSON.stringify(rules, null, 2) : '';
+  }
+  const count = $('rewrite-count');
+  if (count) count.textContent = rules.length ? `${rules.length} 条` : '未启用';
+}
+
+async function saveRewrite() {
+  const box = $('rewrite-rules');
+  const text = (box.value || '').trim();
+  let rules = [];
+  if (text) {
+    try {
+      rules = JSON.parse(text);
+    } catch {
+      return toast('不是合法 JSON，改好再保存', 'err');
+    }
+    if (!Array.isArray(rules)) return toast('要是一个数组：[{"from":"x","to":"y"}]', 'err');
+  }
+  const saved = await api('PUT', '/admin/api/rewrite-rules', { rules });
+  renderRewriteRules(saved);
+  toast(rules.length ? `已保存 ${rules.length} 条规则` : '已清空规则', 'ok');
+}
+
 /* ---------------------------------------------------------------- 动作表 */
 
 const ACTIONS = {
   'copy-endpoint': copyEndpoint,
+
+  'save-rewrite': saveRewrite,
 
   'copy-text': async ({ text }) => {
     try {

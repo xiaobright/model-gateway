@@ -434,3 +434,69 @@ def test_undecodable_content_encoding_is_left_for_the_client():
     plain = httpx.Response(200, headers={"content-encoding": "identity"})
     assert proxy_mod._resp_drop(plain) is proxy_mod.RESP_DROP
     assert proxy_mod._resp_drop(httpx.Response(200)) is proxy_mod.RESP_DROP, "没压缩也照旧"
+
+
+# ------------------------------------------------------------------ 请求改写
+# 上游敏感词审核是黑盒，网关只能「踩到一条配一条」：转发前按规则表做字面替换。
+# 这套东西会改用户请求内容，所以「没配规则时一个字节都不动」必须是硬保证。
+
+
+def test_rewrite_does_nothing_without_rules(monkeypatch):
+    from gateway import rewrite
+
+    monkeypatch.setattr(rewrite, "rules", lambda: [])
+    payload = {"model": "m", "messages": [{"role": "user", "content": "hello"}]}
+
+    assert rewrite.apply(payload) == (None, 0), "没配规则就原样转发，连对象都不重建"
+
+
+def test_rewrite_replaces_text_in_nested_strings(monkeypatch):
+    from gateway import rewrite
+
+    monkeypatch.setattr(
+        rewrite,
+        "rules",
+        lambda: [{"from": "- keep: one, two, three", "to": "keep: one, two, three"}],
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": "x\n- keep: one, two, three\ny"},
+            {"role": "user", "content": [{"type": "text", "text": "keep me"}]},
+        ],
+        "tools": [{"function": {"description": "clean"}}],
+    }
+
+    new, hits = rewrite.apply(payload)
+
+    assert hits == 1
+    assert "- keep: one, two, three" not in new["messages"][0]["content"]
+    assert "keep: one, two, three" in new["messages"][0]["content"]
+    # 没命中的分支原样保留（同一对象，不做无谓拷贝）
+    assert new["messages"][1] is payload["messages"][1]
+    assert new["tools"] is payload["tools"]
+
+
+def test_rewrite_to_empty_string_deletes_the_phrase(monkeypatch):
+    from gateway import rewrite
+
+    monkeypatch.setattr(rewrite, "rules", lambda: [{"from": "BAD", "to": ""}])
+    new, hits = rewrite.apply({"messages": [{"content": "a BAD b"}]})
+    assert hits == 1 and new["messages"][0]["content"] == "a  b"
+
+
+def test_rewrite_ignores_rules_that_would_change_nothing(monkeypatch):
+    """from == to 的规则没人会故意配，配了也不该触发重新序列化。"""
+    from gateway import rewrite
+
+    monkeypatch.setattr(rewrite, "rules", lambda: [{"from": "same", "to": "same"}])
+    assert rewrite.apply({"messages": [{"content": "same"}]}) == (None, 0)
+
+
+def test_rewrite_survives_a_broken_rules_table(monkeypatch):
+    """配坏了不能拖垮转发：坏 JSON 按「没有规则」处理。"""
+    from gateway import rewrite
+
+    monkeypatch.setattr(rewrite, "raw", lambda: "{not json")
+    monkeypatch.setattr(rewrite, "_cache", {"raw": None, "rules": []})
+    assert rewrite.rules() == []
+    assert rewrite.apply({"messages": []}) == (None, 0)

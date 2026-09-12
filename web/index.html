@@ -178,6 +178,27 @@
           </table>
         </div>
       </section>
+
+      <section class="card" data-flat>
+        <div class="card-head"><h2>敏感词绕行</h2><span class="count" id="rewrite-count"></span></div>
+        <div class="card-body">
+          <label class="field">JSON 数组。转发前把请求体里的 <code>from</code> 原样换成 <code>to</code>
+            （<code>to</code> 留空 = 删掉那段）。上游的敏感词审核是黑盒，会误伤固定提示词 ——
+            命中一次就配一条。
+            <textarea id="rewrite-rules" rows="4" spellcheck="false"
+              placeholder='[{"from": "<上游误报的原文>", "to": "<改成什么样子>"}]'></textarea>
+          </label>
+          <div class="field-row" style="margin-top:8px">
+            <span class="dim" id="rewrite-msg" aria-live="polite"></span>
+            <span class="grow"></span>
+            <button type="button" class="btn btn-sm" data-act="save-rewrite">保存规则</button>
+          </div>
+          <span class="dim" style="font-size:12px;margin-top:6px;display:block">
+            <b>会改你的请求内容</b>：替换对请求体里所有字符串生效（messages、system、工具描述都在内），
+            规则要写得足够具体。默认为空 —— 一个字节都不改。
+          </span>
+        </div>
+      </section>
     </section>
 
     <!-- ---------- 转发记录 ---------- -->

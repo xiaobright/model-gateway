@@ -20,6 +20,7 @@ from . import (
     inflight,
     naming,
     protocols,
+    rewrite,
     upstream as upstream_mod,
 )
 from .reqlog import log
@@ -519,6 +520,12 @@ async def forward(
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return _error(proto, 400, "请求体不是合法 JSON")
 
+    # 上游内容审核误报绕行：按规则表对请求体文本做字面替换（默认空表 = 什么都不做）
+    scrubbed, rewrite_hits = rewrite.apply(payload)
+    if scrubbed is not None:
+        payload = scrubbed
+        log(f"POST {endpoint} 敏感词绕行：命中 {rewrite_hits} 处")
+
     compaction_capture = (
         _compaction_capture_requested(endpoint)
         and (config.DATA_DIR / "compaction_capture.flag").exists()
@@ -644,7 +651,7 @@ async def forward(
         remote, remote_flag = naming.split_model(route.remote_model)
         want_1m = naming.wants_1m(flag) or naming.wants_1m(remote_flag)
         sent_body = body
-        if remote != requested:
+        if remote != requested or rewrite_hits:
             # ensure_ascii=False：否则中文请求体会涨三到六倍。
             sent_body = json.dumps(
                 {**payload, "model": remote}, ensure_ascii=False, separators=(",", ":")

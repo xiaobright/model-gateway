@@ -745,3 +745,50 @@ def test_capture_stream_switch_is_hot_and_visible_over_the_api(gateway, monkeypa
 
     assert gateway.put("/admin/api/capture-stream", json={"enabled": False}).json()["enabled"] is False
     assert not (data_dir / capture.FLAG_NAME).exists()
+
+
+def test_rewrite_rules_reach_the_upstream(gateway):
+    """配了规则，转发给上游的请求体就得是改过的 —— apply() 由单测覆盖，这里测接线。"""
+    import json
+
+    phrase = "- keep: one, two, three"
+    fixed = "keep: one, two, three"
+
+    with MockUpstream("siteA") as a:
+        gid = add_upstream(gateway, a, "siteA", "openai")  # 建站 + 建分组，返回分组 id
+        add_route(gateway, "gpt-rewrite", gid)
+
+        saved = gateway.put("/admin/api/rewrite-rules", json={"rules": [{"from": phrase, "to": fixed}]})
+        assert saved.status_code == 200
+        assert saved.json()["rules"][0]["from"] == phrase
+
+        resp = gateway.post("/v1/responses", json={
+            "model": "gpt-rewrite",
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": f"x\n{phrase}"}]}],
+        })
+        assert resp.status_code == 200, resp.text
+
+        sent = json.dumps(a.last_responses_request(), ensure_ascii=False)
+        assert phrase not in sent, "触发上游误报的那行必须被洗掉"
+        assert fixed in sent
+
+    # 规则是全局的，用完清掉，别污染别的用例
+    assert gateway.put("/admin/api/rewrite-rules", json={"rules": []}).json()["rules"] == []
+
+
+def test_rewrite_rules_round_trip_and_start_empty(gateway):
+    assert gateway.get("/admin/api/rewrite-rules").json()["rules"] == []
+    put = gateway.put("/admin/api/rewrite-rules", json={
+        "rules": [{"from": "a", "to": "b"}, {"from": "c", "to": ""}],
+    })
+    assert put.status_code == 200
+    assert gateway.get("/admin/api/rewrite-rules").json()["rules"] == [
+        {"from": "a", "to": "b"}, {"from": "c", "to": ""},
+    ]
+    assert gateway.put("/admin/api/rewrite-rules", json={"rules": []}).json()["rules"] == []
+
+
+def test_rewrite_rule_requires_a_non_empty_from(gateway):
+    bad = gateway.put("/admin/api/rewrite-rules", json={"rules": [{"to": "b"}]})
+    assert bad.status_code == 422, "没有 from 的规则会被 FastAPI 挡在门外"
