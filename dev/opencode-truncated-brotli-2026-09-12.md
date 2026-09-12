@@ -1,13 +1,20 @@
-# opencode 请求「被截断」——真因是 Brotli（2026-09-12）
+# opencode 没回复：一次压缩格式处理故障（2026-09-12）
 
-## 0. 结论
+**一句话：上游有回复，但用了旧网关处理不正确的压缩格式，客户端因此读不出来。** 这次不是“模型没有回答”。
+
+当时补齐了解码依赖，并修了压缩请求头和响应头处理；还发现标题生成提示词有两处固定误报，后来用可配置替换规则处理。
+下文保留原始现象、样本和当时的验证输出，**本次文档整理没有重新发请求或重跑测试**。
+
+现在遇到类似问题请先看[抓包步骤与隐私提醒](maintenance.md#抓包排查)，不要仅凭 `truncated` 就认定同一个原因。
+
+## 0. 当时确认的两个问题
 
 | 现象 | 真因 | 处置 |
 | --- | --- | --- |
 | opencode 收不到任何回复；网关记 `note=truncated`，上游 站A 记 200 | 上游用 **Brotli** 压缩（`content-encoding: br`），网关 venv 没装 `brotli`，httpx 解不开，**把 421 字节压缩原文原样转发** | 装 `brotli` + `zstandard`；并让网关按自己真实能力重写 `accept-encoding`（不再照抄客户端） |
-| 每轮开头两条 `500`（167B） | 站A 敏感词过滤误报，命中 opencode 标题生成器提示词里的一行 | 上游策略，网关改不了；不影响主回复，只是标题生成失败 |
+| 每轮开头两条 `500`（167B） | 站A 误报 opencode 标题生成提示词；最初找到一行，后续确认有两处 | 与主回复的压缩故障分开处理，后来配置了两条最小文本替换，见第 6 节 |
 
-不是并发、不是超时、不是包太大、不是工具数量。之前所有合成探针（9KB / 21KB / 41KB / 72KB，
+在这次排查中，没有证据指向并发、超时、包大小或工具数量。之前的合成测试请求（9KB / 21KB / 41KB / 72KB，
 1~15 个工具）全部正常，正因为它们都没踩到压缩这条线。
 
 ## 1. 症状
@@ -29,7 +36,7 @@
 
 ## 2. 抓包
 
-新加的常驻抓包（见 README「抓包」一节）开 20 条，用 `opencode run` 非交互复现一次即拿到原始字节。
+当时开启抓包记录 20 条，用 `opencode run` 复现后取得了转发时的响应字节。这是当时操作记录；日常排查优先只开一到三条，见[维护说明](maintenance.md#抓包排查)。
 
 `meta.json` 的响应头一眼看穿：
 
@@ -67,8 +74,8 @@ data 字段不等于 `[DONE]`，所以 `observer.ended` 一直是 False，网关
 
 ## 3. 根因
 
-```bash
-$ .venv/Scripts/python.exe -c "from httpx._decoders import SUPPORTED_DECODERS; print(SUPPORTED_DECODERS)"
+```text
+当时执行：.venv/Scripts/python.exe -c "from httpx._decoders import SUPPORTED_DECODERS; print(SUPPORTED_DECODERS)"
 {'identity': IdentityDecoder, 'gzip': GZipDecoder, 'deflate': DeflateDecoder}
 ```
 
@@ -93,10 +100,10 @@ identity/gzip。curl 默认也不带 `accept-encoding`。**只有 opencode（bun
 1. `gateway/proxy.py`
    - 新增 `accept_encoding()`：从 `httpx._decoders.SUPPORTED_DECODERS` 读真实能力。
    - `_build_headers()` 里 `headers["accept-encoding"] = accept_encoding()`，
-     不再照抄客户端。放在 auth / beta 之后、`header_override` 之前，所以分组的
+      不再照抄客户端。放在 auth / beta 之后、`header_override` 之前，所以供应商的
      「请求头覆写」仍能盖掉它。
 2. `requirements.txt`：加 `brotli>=1.1`、`zstandard>=0.23`（httpx 有这两个包才会启用
-   对应解码器）。已装：brotli 1.2.0、zstandard 0.25.0，现在
+    对应解码器）。当时安装的版本：brotli 1.2.0、zstandard 0.25.0，安装后
    `SUPPORTED_DECODERS = {identity, gzip, deflate, br, zstd}`。
 3. `tests/test_units.py::test_accept_encoding_is_rewritten_not_copied_from_the_client`
    —— 断言报出去的每一种编码 httpx 都真的解得了。
@@ -138,7 +145,7 @@ $ opencode run "只回复两个字：你好"
 ✗ 行34: 〈触发行 B〉  —— 一个示例对，把中间的 → 换成 -> 即过审
 ```
 
-（原文不录在这里，见管理页「敏感词绕行」里的实际规则 —— 写进文档等于把雷又种回仓库。）
+（触发原文不写进文档，只保留在规则配置里，避免以后把仓库内容发给同类上游时再次触发。）
 
 两条都换掉后整段提示词 200：
 
@@ -155,11 +162,11 @@ $ opencode run "只回复两个字：你好"
 配好上面两条后实测：标题生成请求从 500 变 200（resp 从 167B → 73KB，text=1075B），
 每轮那两次白跑消失。
 
-这不是「过滤层」——上游黑名单是黑盒，网关无法预知，只能踩到一条配一条。
+这不是自动审核或隐私过滤：网关不知道上游的完整规则，只对用户明确配置的固定文本做替换。
 
 ## 7. 下次再遇到「上游说正常、下游说截断」
 
-1. `echo {"max":3} > data/capture-stream.flag`
-2. 复现一次
-3. 看 `data/captured_stream/<时间戳>-<模型>/meta.json` 的 `resp_headers` 和 `stream.sse`
-4. 抓完 flag 会自动消失；想提前停就删文件
+1. 按[维护说明](maintenance.md#抓包排查)确认隐私风险，开启一条或少量抓包。
+2. 复现一次，记下时间。
+3. 查看对应目录 `meta.json` 的 `resp_headers`，再与 `stream.sse` 的实际内容对照。
+4. 确认开关已关闭；已生成的文件不会自动删除，是否保留另行决定，不要直接公开。

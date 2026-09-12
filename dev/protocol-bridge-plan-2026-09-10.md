@@ -1,8 +1,21 @@
-# 协议桥接方案：Responses 客户端 → Chat Completions 上游
+# 接口格式转换实验（已停用）
 
-> 交接文档（2026-09-10）。**方向已定**：客户端发 Responses API（Codex），上游只有 OpenAI
-> Chat Completions 站。转换是双向的：请求 responses→chat，响应 chat→responses（含流式）。
-> 接手方先读第 0 节，再把第 8 节的待确认决策拍板，然后按第 7 节里程碑开工。
+## 先看最终结果
+
+当时想解决的问题是：Codex 发 Responses 格式，但某些站点只有 Chat Completions 格式，因此试着在网关里转换请求和回复。这就是下文的“桥接”。
+
+实验曾实现并测试过，后来发现：在**当时的 Codex 版本和已测试组合里**，更换客户端使用的模型名就能让它发送兼容请求，不必继续维护转换代码。
+因此桥接和请求规范化代码于 **2026-09-11 移除**，记录的移除提交为 `c676ab0`。**当前版本不做格式转换。**
+
+这不等于所有模型、站点或新版本客户端都已兼容，只是当时选择了更简单的用法。
+模型名与请求格式的调查另见[版本相关记录](codex-responses-lite-config-2026-09-11.md)。
+
+**下面保留原计划和每一阶段记录，供追溯，不要照着重新实施。** 前面写的“还没完成”“接手后第一件事”等内容，可能已被后面的记录更新；最终结果在第 10.14 节。
+代码位置、测试数量、版本及本机配置均指各段记录的时间，不是当前运行状态。
+
+---
+
+以下是 2026-09-10 的原交接内容：客户端请求 Responses，上游接收 Chat Completions；请求与回复都需要转换，包含逐段返回的流式回复。
 
 ## 0. 接手须知
 
@@ -82,7 +95,7 @@
 | `streaming_iterator.py:1173` | `_emit_response_completed_event`（带 usage） |
 | `custom_tools.py` 全部 | `extract_custom_tool_names`:42、`is_custom_tool_call`:53、`serialize_tool_call_arguments`:58、`unwrap_custom_tool_arguments`:73、`build_tool_call_item_kwargs`:95、`convert_custom_tool_to_function_tool`:156 |
 
-### 黄金测试（用来生成我们的单测语料）
+### 参考测试（用来准备本项目的测试样例）
 
 `tests/test_litellm/responses/litellm_completion_transformation/`：
 
@@ -380,7 +393,9 @@ role 的映射只收在 `_chat_role()` 一个函数里。
 | 孤立 tool 结果 | 只并进**前面那条** assistant | 前面没有 assistant 时插一条独立的 | 历史被压缩后那条 assistant 往往也没了，`role:tool` 紧跟 user 是非法历史 |
 | 事件名 | — | 与 litellm 一致 | custom 工具也发 `response.function_call_arguments.*`（litellm 从不发 `custom_tool_call_input.*`），Codex 认这个 |
 
-**没有**改动的部分（照抄，别自作聪明去「修」）：`role`-only 首帧会让 message item 占掉
+> 以下是这一阶段的判断，后来第 10.12 节发现它不适合当时的 Codex 并作了修改，不要当成应继续保留的规则。
+
+这一阶段没有改动的部分：`role`-only 首帧会让 message item 占掉
 那次唯一的 `output_item.added`，后面的推理只以 delta 出现、不宣告 reasoning item。
 两个 item 都用 `output_index 0`，宣告两个会让客户端按 index 归并时错乱。
 
@@ -494,7 +509,7 @@ fixture 也改成真实形状（工具包在 `functions` 容器里）。新增 5
 （`tools_shape` / `additional_tools_shape`，递归展开、长串截断）—— 下一个形状变化
 应该能在第一跑就看出来，而不是靠转发记录里的 dropped 列表反推。
 
-### 10.9 交接状态（2026-09-10 21:40，额度用尽前快照）
+### 10.9 当晚 21:40 的阶段记录（已被后续进展更新）
 
 **一句话**：桥接本体（M0–M4）全部完成且 217 passed；M5 真机验收进行到第 2/3 关——
 两个真 bug（`developer` role、`namespace` 容器）都已修复，**第 3 跑还没人跑过**。
@@ -512,7 +527,7 @@ fixture 也改成真实形状（工具包在 `functions` 容器里）。新增 5
 | 4. 长参数 | 第 5 步 60 行补丁不缺段 | ⬜ 同上 |
 | 5. 多轮回放 | 第 6 步之后模型不丢上下文 | ⬜ 同上 |
 
-**改动清单**（全部未提交，工作区是干净起点，`git status` 看一遍即可）：
+**当时的改动清单**（开始时工作区干净，此时以下改动尚未提交）：
 
 - 新增 `gateway/bridge/`（errors/tools/request/response/stream）、`tests/test_bridge_*.py` 4 个、
   `tests/fixture/codex_responses_request.json`、`dev/bridge-smoke-prompt.md`
@@ -570,7 +585,7 @@ Codex 报告里的问题逐条判读（结论：**没有一个是桥接的**）�
 
 回归 **218 passed**（+1：抓包机制）。
 
-### 10.11 DSML 之谜破案：透传层无罪，规范化补上（2026-09-10 22:45）
+### 10.11 工具调用被写成普通文本：DSML 问题（2026-09-10 22:45）
 
 **现象**：Codex 走网关接 DeepSeek Responses 上游（第三方的和官方的都试了），模型把
 工具调用用 `<｜DSML｜…>` 标记吐在正文里，工具一次都调不出来。
@@ -598,10 +613,10 @@ web_search）原样留在 input（原生扩展上游不受影响、不认的上�
 返回规范的 `function_call`（`{"command": ["ls", "-la"]}`），全文无 DSML。
 回归 **223 passed**（+5：`tests/test_normalize.py`）。
 
-**注意**：重启网关后生效。第三方 DeepSeek Responses 上游按同样原理被治好——
-它们和官方一样只差这一个规范化。
+**当时需要重启网关才生效。** 如果第三方上游有同样的格式问题，这种处理可能有帮助；
+上面的测试不能证明所有第三方上游都只差这一步。该规范化代码后来也已移除，见第 10.14 节。
 
-### 10.12 流式感与折叠破案：litellm 的 item 宣告策略在 Codex 上是错的（2026-09-10 23:50）
+### 10.12 回复一次性出现、思考过程不折叠（2026-09-10 23:50）
 
 **现象**：桥接流的回复「感觉不是流式」「思考过程不折叠」。
 
@@ -652,7 +667,7 @@ web_search）原样留在 input（原生扩展上游不受影响、不认的上�
 断言：summary==[]、双 item 宣告顺序、正文 delta 挂 message item）。
 **待真机**：Codex 跑一轮看流式感与折叠是否恢复。
 
-### 10.13 次日清晨双案：杀软 MITM 与 code-mode 的 exec（2026-09-11 09:30）
+### 10.13 杀毒软件影响证书验证，以及 exec 工具不兼容（2026-09-11 09:30）
 
 **案一：502 SSL self-signed certificate（DeepSeek 官方）**
 
@@ -677,7 +692,7 @@ requirements.txt 已加。**重启网关生效**。
   拉活目录并按 ETag 刷新，与 0.153.4 内置的 models.json 未必一致，per-model 开关
   在灰度）。内置目录里 sol/terra 都标了 code_mode_only，但运行时以活目录为准。
 
-**§10.12 补遗 —— developer-role 之谜彻底闭环**（client.rs:936-955）：
+**补充：为什么请求会带 developer 角色**（当时的 client.rs:936-955）：
 
 - `use_responses_lite=true`（gpt-5.6-* 等 catalog 模型）：顶层无 instructions、无
   tools；系统提示词 = `role:"developer"` 的 message item；工具装进 `AdditionalTools`
@@ -690,18 +705,18 @@ requirements.txt 已加。**重启网关生效**。
 `apply_patch_tool_type: None`（无 apply_patch 工具，模型经 shell 用 apply_patch）、
 `tool_mode: None`（**无 custom exec**）。
 
-**结论**：Codex 客户端直接配 DeepSeek 模型 id（如 `deepseek-v4-flash`）→ 自动回退
-兼容线格式 → 顶层 function 工具、无 namespace、无 developer、无 exec → 任何兼容
-Responses 的上游**零改动透传**即可用。这验证了当时的设想（2026-09-11）。
+**当时的结论**：Codex 配 DeepSeek 模型名（如 `deepseek-v4-flash`）后使用了更通用的请求格式，
+已测试的组合可以直接转发使用。这个结果不能推广为“任何兼容 Responses 的上游都支持所有工具”，也不能保证后续客户端版本不再改变格式。
 
-### 10.14 退役（2026-09-11 10:15）
+### 10.14 停用转换功能（2026-09-11 10:15）
 
 真机冒烟确认：Codex 配第三方模型 slug（deepseek-v4-flash）走 fallback 兼容格式，
 纯透传 6 步全过 —— 桥接与 normalize 失去触发路径，从工作区移除（commit c676ab0）。
 
-完整代码永久可回捞：
-- 桥接层 + 全部集成：`git checkout c3e9c6f -- gateway/bridge/`（或整库看该提交）
-- normalize：b0784dc
-- 桥接的流式/折叠修复（stream.py）：c3e9c6f 里的版本已含
+历史版本线索：
 
-若哪天要再接「gpt-5.6-* 模型名 + 仅 Chat 上游」的组合，从 c3e9c6f 捞回即可。
+- 桥接及流式/折叠修复：`c3e9c6f`。
+- 请求规范化（normalize）：`b0784dc`。
+- 本地仍保留对应提交时，可以用只读命令 `git show c3e9c6f:gateway/bridge/stream.py` 查看旧实现。
+
+这些是查阅位置，不是恢复步骤。不能只复制几个旧文件就认为今天仍能工作；若以后确有需求，要先核对客户端格式、数据库和现有转发规则，再决定是否值得重做。

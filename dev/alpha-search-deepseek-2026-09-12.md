@@ -1,6 +1,16 @@
-# Alpha Search 换后端调查：DeepSeek Anthropic / Tavily（2026-09-12）
+# 给独立搜索换服务的调查（2026-09-12，方案未采用）
 
-只做调查与实测，未改网关配置、未改任何代码。
+## 先看最后的决定
+
+**当时决定不在网关增加搜索转换，改用客户端已有的 Tavily MCP 工具。** MCP 在这里就是客户端直接调用搜索服务的工具连接，不需要网关帮它改格式。
+
+原因是：DeepSeek 虽然当时能通过另一种接口搜索，但不能直接替换 Codex 的 `/v1/alpha/search`；搜索结果格式和加密状态的兼容性没有验证完整，继续做转换不划算。
+后续用户还补充了上游账号 401 的情况，最终决定见第 8 节。
+
+> 下面保留当日实测、估算和讨论，**不是正在实施的计划**。站点状态、价格、免费额度和客户端行为都没有在本次文档整理中重新验证。
+> 第 8 节记录了当时的客户端配置改动，不代表今天仍是该配置。网关当前规则见[维护说明](maintenance.md#搜索与压缩)。
+
+本次原调查未改网关配置或代码；文末另记了客户端侧的调整。
 
 起因：站B 的 `/v1/alpha/search` 不稳（09-10 10:51 那次挂了 344s 才被客户端断开），
 问能不能换成 DeepSeek 官方的 Anthropic 端点做搜索，或者用 Tavily 做兼容层。
@@ -12,10 +22,10 @@
 | DeepSeek 官方有 `/v1/alpha/search` 吗 | **没有**，404 |
 | DeepSeek 官方 Responses 支持 `web_search` 吗 | **不支持**，官方文档写明「忽略」 |
 | DeepSeek 官方能搜索吗 | **能，但只在 Anthropic 端点**（`web_search_20250305` / `web_search_20260209`） |
-| 官方搜索免费吗 | **不免费**。无独立条目，但结果按 input token 计费，实测一次 45,738 input tokens |
-| 换成 DeepSeek 要多少转换 | 见第 4 节，约 **750~850 行**（含配置/前端/测试） |
-| 最大障碍 | `encrypted_output` 造不出来（第 3 节）；`results[].snippet` 填不出来 |
-| 当前还值得做吗 | **先别做**。见第 6 节：`/alpha/search` 已两天没被调用 |
+| 官方搜索免费吗 | 不能按免费处理。当次返回 45,738 input tokens；费用估算见第 1.4 节，不是账单核验 |
+| 换成 DeepSeek 要多少转换 | 第 4 节有当时的粗估，尚未实现，不是工期承诺 |
+| 最大障碍 | 无法生成可被原服务认可的 `encrypted_output`；样本里也没有可直接填入 `snippet` 的正文摘要 |
+| 最终有没有做 | **没有。** 第 8 节记录了改用 Tavily MCP 的决定 |
 
 ## 1. DeepSeek 官方实测（用库里 DeepSeek 分组的 key）
 
@@ -26,7 +36,8 @@ GET  /v1/models              -> deepseek-flash, deepseek-v4-pro
 POST /v1/alpha/search        -> 404
 ```
 
-注意模型名：`deepseek-v4-flash` 已下线，现在叫 **`deepseek-flash`**（旧名仍可调，按 Flash 计费）。
+当时模型列表列出的是 **`deepseek-flash`**；原记录说旧名 `deepseek-v4-flash` 仍可调用。
+列表没列旧名不等于旧名已彻底下线，当前名称和计费方式需要重新确认。
 
 ### 1.2 Anthropic 端点的搜索工具名
 
@@ -64,7 +75,7 @@ stop_reason: max_tokens（被 1024 截断，不是自然结束）
 **没有 snippet / 文本摘要** —— 可读内容只有 title/url，正文是 DeepSeek 自己的密文，
 我们解不开。所以搜索到的正文只能靠模型写在 `text` 里的综述间接拿到。
 
-### 1.4 usage（这是"免不免费"的答案）
+### 1.4 返回的用量和当时的费用估算
 
 ```json
 {"input_tokens": 45738, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 512,
@@ -72,12 +83,12 @@ stop_reason: max_tokens（被 1024 截断，不是自然结束）
  "server_tool_use": {"web_search_requests": 2}}
 ```
 
-- 有独立的 `server_tool_use.web_search_requests` 计数，但**定价页没有搜索这一项**。
-- 搜索结果正文会被拼进上下文算 input token：一次搜索（2 个 query × 10 条）吃掉 **4.5 万 input**。
-- 按 `deepseek-flash` 折算：空闲时段 ≈ **0.05 元/次**，高峰时段 ≈ **0.10 元/次**。
-  便宜，但**不是免费**。（用 v4-pro 会贵 4.5~9 倍，别用。）
+- 返回中有 `server_tool_use.web_search_requests` 计数；原调查没有在当时定价页找到独立搜索条目。
+- 这一次请求包含 2 次查询，每次 10 条结果，上游报告约 **4.5 万 input tokens**。这不是每次搜索固定的用量。
+- 原记录按当时 `deepseek-flash` 价格估算：空闲时段约 **0.05 元/次**，高峰时段约 **0.10 元/次**；并估计 v4-pro 更贵。
+  这些没有在本次整理中复核，也没有对照实际账单，不能当作当前报价或免费承诺。
 
-## 2. 站B `/v1/alpha/search` 的真实响应形状
+## 2. 当时站B的搜索接口返回了什么
 
 探针（`gpt-5.6-luna`）：200，7.48s，75,879 B。顶层只有三个字段：
 
@@ -85,7 +96,7 @@ stop_reason: max_tokens（被 1024 截断，不是自然结束）
 | --- | --- |
 | `output` | 字符串，**25,532 字符** —— 模型写的研究综述，内含 `citeturn30search0` 引用标记 |
 | `results` | 数组，**33 项**，`{type:"text_result", domain, ref_id, snippet, title, url}`，`ref_id` 形如 `turn30search0` |
-| `encrypted_output` | 字符串，**35,108 字符**，Fernet 令牌（`gAAAAAB` 前缀） |
+| `encrypted_output` | 字符串，**35,108 字符**，`gAAAAAB` 前缀，外观与 Fernet 令牌结构相符；未解密 |
 
 请求侧形状（与 09-10 那份一致）：
 
@@ -95,10 +106,10 @@ stop_reason: max_tokens（被 1024 截断，不是自然结束）
  "settings":{"external_web_access":"live"}}
 ```
 
-**关键点：`output` 不是搜索结果列表，是服务端搜索 agent 写的带引用综述。**
+**关键点：`output` 是带引用的综述，不是搜索结果列表。**
 `results` 里的 `ref_id` 和 `output` 里的 `cite...` 一一对应，Codex 拿它渲染引用角标。
 
-## 3. `encrypted_output` 是什么（能不能造）
+## 3. 加密字段：看到了什么，还不知道什么
 
 解 base64 后 26,329 字节，version byte `0x80`，符合 Fernet 结构
 （`1 + 8(ts) + 16(IV) + ciphertext + 32(HMAC)`）。
@@ -111,19 +122,17 @@ stop_reason: max_tokens（被 1024 截断，不是自然结束）
 差                  = 464 字节
 ```
 
-→ **明文 ≈ `output` 加约 460 字节的信封（大概是 turn / search id 之类的元数据）。**
-它**不额外携带搜索正文**（33 篇全文绝不可能压进 26 KB）。
+上面只能说明长度接近，**不能据此知道加密前是什么，也不能证明它没有携带额外内容**。
+原文把“可能是综述加元数据”进一步写成“省略不丢内容、不影响本轮回答”，证据不足，不能沿用为结论。
 
-推论：
+当时能明确区分的是：
 
-- 语义上**省略它不丢内容** —— `output` 明文已经把实质给了客户端。
-- 但它是**服务端对称密钥**签出来的，我们造不出来。用途是下一轮 Codex 把它原样回传，
-  服务端能解密并**验证这段搜索结果确实是服务端签发的**（防客户端伪造搜索内容）。
-- 所以省略它 = 下一轮丢失「可验证的服务端搜索上下文」，但**不影响本轮回答**。
-- **Codex 到底是不是强依赖它（反序列化非 Option 就报错）—— 没验，这是唯一的未知项。**
-  仓库里 `tests/helpers.py:226` 的 mock 给的是 `encrypted_output: None`，说明当初默认可以为空。
+- 没有对应服务的密钥和实现，不能自己生成一个等价、能被该服务认可的加密字段。
+- 客户端是否允许省略、下一轮会怎样使用、是否影响引用或继续搜索，都没有完整验证。
+- 测试模拟响应里使用 `encrypted_output: None`，只能说明那个测试接受这种输入，不能证明真实 Codex 或上游接受。
+- 所以“可不可以不带它”是待验证项，不是已经成立的转换方案。
 
-## 4. 换成 DeepSeek Anthropic 的转换规格与工作量
+## 4. 当时设想的转换方式（未实现）
 
 ### 4.1 请求侧 `/alpha/search` → Anthropic messages
 
@@ -150,7 +159,9 @@ encrypted_output <- null                                   # 造不出来
 引用标记 `citeturn0search0`（U+E200 私有区）要不要往 `output` 里插，是可选项：
 插得对 Codex 才有角标，插错了更糟，v1 建议**不插**。
 
-### 4.3 工作量
+### 4.3 当时粗估的工作量
+
+以下保留原估算供回顾。没有完整解决加密字段、引用和多轮兼容问题之前，代码行数不能代表实际工作量，时间也不是承诺。
 
 | 模块 | 行数 | 说明 |
 | --- | --- | --- |
@@ -162,21 +173,21 @@ encrypted_output <- null                                   # 造不出来
 | 测试 | ~200 | 照现有 4 个 search 用例的写法 |
 | **合计** | **~780** | **约 1.5~2 个工作日** |
 
-## 5. Tavily 路线
+## 5. 如果改成 Tavily，需要做什么
 
 - Tavily 只给搜索结果（title/url/content/score），**不给综述**。要凑出 站B 那种
   25 KB 带引用综述，得**再调一次 LLM 写** —— 两段式，多一轮延迟和成本。
 - 好处：结果**可读**（有 content），`results[].snippet` 能填上，引用能对齐。
   这正是 DeepSeek 路线填不出来的那一格。
-- 坏处：多一个账号、多一次 LLM 调用、免费额度 1000 次/月。
+- 代价：多一个账号；如果仍要伪装成同一搜索接口，还需额外调用模型写综述。原记录提到的免费额度见后记，以服务当前条款为准，不把 credits 等同于固定请求次数。
 - `<参考目录>\moon-bridge-cf\internal\extension\websearch\` 里有现成实现
   （`tavily.go` 74 行客户端 + `orchestrator.go`）。**但方向不对**：它的 Orchestrator 是
   包住 **Anthropic client**、拦截模型吐出的 `web_search` tool_use 后本地执行，服务的是
   Claude Code 那条链路；它不接 `/alpha/search`。能抄的只有那 74 行 HTTP 客户端。
 
-## 6. 现状：`/alpha/search` 已经两天没人调用了
+## 6. 当时可见日志里，没有最近两天的独立搜索请求
 
-按天统计（`data/gateway.log`）：
+当时对可见的 `data/gateway.log` 做了统计（不是完整历史或全天审计）：
 
 ```
 09-09   18 次
@@ -194,66 +205,52 @@ POST /v1/responses  model='deepseek-v4.1-flash'  upstream=站A
                     tools=16[function×10, custom, namespace×2, tool_search, web_search]
 ```
 
-两点：
+这份样本说明，请求里有 `web_search` 工具定义，但**有定义不等于搜索执行过**。
 
-1. 用户已经把 Codex 切到非目录模型的 slug（`deepseek-v4.1-flash`），走的是 fallback
-   线格式；`/alpha/search` 只在 Codex 判定要联网时才打，**不是死了，是休眠**。
-   一旦需要搜索它还会回来，而且仍然打到 站B（目标仍是 `gpt-5.6-luna`）。
-2. **`web_search` 现在被塞在 `/v1/responses` 的 tools 里发给上游，而 DeepSeek 官方
-   Responses 明确「忽略」内置工具**（官方文档 Tools 表 + 09-10 §2 实测都是这个结论）。
-   站A 转的就是 DeepSeek —— 也就是说**这条路上的搜索现在是静默失效的**，
-   模型根本不会产出 `web_search_call`（全日志 0 次）。
+原调查中，DeepSeek 官方 Responses 的测试没有执行这个内置搜索工具。对于第三方站A，还不能仅凭模型名称推断它的全部行为。
+当时没有找到搜索调用事件，但也不能由此断言所有请求都不会搜索。
 
-## 7. 建议
+同样，某段日志里没有 `/alpha/search`，不能保证“以后需要时一定会自动恢复”。是否发请求取决于客户端版本、模型配置和工具选择；后记中还记录了随后关闭独立搜索声明的操作。
+
+## 7. 最终决定前讨论过的建议（不是待办）
 
 按性价比排序：
 
-1. **先别做 DeepSeek 转换。** 最大收益（换掉不稳定的 站B）被 `encrypted_output`
-   卡住，而这个函数两天才用几十次、一次才几十毫秒到几秒。780 行换这个不划算。
-2. **先做便宜的（~80 行，2 小时）**：
-   - `/alpha/search` 加**单请求超时**（现在能挂 344s，客户端自己断才结束）；
+1. **先不做 DeepSeek 转换。** `encrypted_output` 等兼容性尚未验证，不能只按预估代码量决定投入。
+2. 当时讨论过改善等待和错误提示：
+    - 给 `/alpha/search` 设置等待上限（当时有等待 344s 的记录）；
    - 支持**多个搜索候选**而不只是单个 `standalone_search_target_group_id`；
    - 超时/失败时**明确的错误响应**而不是空等。
-   这直接治「不稳」，且不影响现有透传语义。
-3. **真正值得投入的是第 6 节第 2 点**：`/v1/responses` 里的 `web_search` 被上游忽略，
-   这可是每一轮都在发生的。要治它只有两条路 —— 换一个真做服务端搜索的 Responses
-   上游，或者网关自己把 `web_search` 拦下来代执行（moon-bridge Orchestrator 那个模式，
-   但要做成 Responses 版）。这是另一个量级的工程，得先拍板要不要。
-4. 如果哪天真要动 DeepSeek 转换，**先花 30 分钟验一件事**：起一个本地 mock 只返回
+    这类改动只能限制等待或提供备用，不保证解决账号问题。当前代码已有统一的“发呆超时”，不能把这里的旧建议当成现版本完全没有超时；详见[维护说明](maintenance.md#等待时间)。
+3. 先确认实际使用的 Responses 上游是否执行内置搜索。若不能，可换支持的上游，或直接使用客户端搜索工具；不必首先在网关重做一套搜索。
+4. 如果以后仍想研究转换，应先用本地模拟服务验证：只返回
    `output` + `results`、**不带** `encrypted_output`，把它设为搜索目标，看 Codex 认不认。
-   认 → 方案成立；不认 → 直接放弃这条路线。
+    客户端接受只能证明这一项检查通过，引用、多轮请求和失败处理仍要验证，不能直接宣布整个方案成立。
 
-## 8. 后记（同日下午）：这条路已经不走了
+## 8. 同日下午的最终决定：不改网关，改用搜索工具
 
 用户补充了关键信息并做了决定：
 
-- **不稳定的真因是上游账号 401**，不是网络/并发。站B 部署在自建的上游服务上，
-  号被封/掉线时模型请求能路由到其它号，**但 `/alpha/search` 的 401 是直接透传回来的**，
-  得手动切号重认证。→ 换搜索后端（含 DeepSeek 转换）解决不了这一类问题，
-  DeepSeek key 一样会 401 / 余额耗尽。**转换方案的成本收益比因此进一步下降，已搁置。**
-- **改走 Tavily MCP**：免费档 1000 credits/月，够用；网关侧零成本、零改动。
+- 用户补充：主要遇到的是上游账号 401；普通模型请求能换账号，但该上游的独立搜索路径直接返回 401，需要手动切号或重新认证。
+  这是用户补充的具体情况，不足以排除所有网络或等待问题。更换搜索后端可能绕过当时的账号问题，但也要付出兼容和维护成本，因此当时决定搁置转换。
+- **改用 Tavily MCP**：原记录称当时免费档为 1000 credits/月，用户判断够用；网关无需因此改代码。额度和计费没有在本次整理中复核。
   Tavily MCP 其实早就配好了 —— dsh 在 `~/.dsh/cordis.patch.yml:92`，Codex 在
   `~/.codex/config.toml` 的 `[mcp_servers.tavily]`。
 - **已关闭 Codex 的 standalone search**：`~/.codex/config.toml` 的
   `[model_providers.custom] supports_standalone_web_search` 由 `true` 改为 `false`。
-  这是 Codex 侧对「这个 provider 支持 /alpha/search」的能力声明（对应 README 第 224 行
-  那句「是上游侧的能力声明，不是本地网关开关」）。改完 Codex 不再打 `/alpha/search`，
-  需要重启 Codex 生效。
+  这是客户端对 provider 能力的声明，不是网关开关，见[搜索与压缩说明](maintenance.md#搜索与压缩)。
+  当时预期重启客户端后不再发送独立搜索请求；本记录没有补充重启后的完整复测。
 
-**网关侧：本轮零改动。** 129 passed 的基线也确认过了。
+**网关侧：当次调查没有改代码或配置。** 原记录另报告过 129 passed；这是当时的测试数字。
 
-预期后续现象（下次用 Codex 时可对照）：`/alpha/search` 请求归零；Codex 可能改为把
-`web_search` 塞进 `/v1/responses` 的 tools —— 那条路仍然是被上游忽略的（见第 6 节第 2 点），
-所以表现为「Codex 不会自动联网，但可以让它用 Tavily MCP 搜」。
+当时的使用建议是：需要联网时明确让客户端使用 Tavily MCP，并确认它真的返回了搜索结果。
+后续是否还发送其他形式的搜索请求，要看实际客户端记录，不能只凭这一项配置推断。
 
-## 附：本次探测的用法（可复现）
+## 附：以后要复测时
 
-```bash
-# 从库里取 key（只读）
-python -c "import sqlite3;c=sqlite3.connect('file:data/gateway.db?mode=ro',uri=True);\
-print(c.execute('select api_key from upstream_groups where id=18').fetchone()[0])"
+先确认确有需要、允许向外部服务发送什么内容，以及愿意承担的调用费用。不要为了检查文档顺便复测。
 
-curl -X POST https://api.deepseek.com/anthropic/v1/messages \
-  -H "x-api-key: $KEY" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
-  --data-binary @req.json     # 中文必须用文件传，Windows 下 -d 内联会破坏 UTF-8
-```
+- 模型列表使用 `GET /v1/models`；当时搜索测试使用 `POST /anthropic/v1/messages`。
+- 请求参数见第 1 节，测试文本使用不含秘密的固定内容，并限制输出和调用次数。
+- API Key 只用于鉴权，不要像旧示例那样从数据库读出后直接打印到终端，也不要照抄历史组号。
+- PowerShell 下含中文的 JSON 可先保存成 UTF-8 文件再发送，避免多层命令行转义。不要把真实请求正文或密钥写回这份文档。
