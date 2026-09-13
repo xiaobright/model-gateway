@@ -804,8 +804,9 @@ function logRow(r) {
   const remote = r.remote_model ? ` <span class="dim">→ ${esc(r.remote_model)}</span>` : '';
   const modelTip = r.remote_model ? `${r.model} → ${r.remote_model}` : r.model;
   const proto = r.protocol || '';
+  const protoLabel = PROTO_LABEL[proto] || proto;
   const protoCell = proto
-    ? `<span class="tag${proto === 'anthropic' ? ' tag-accent' : ''}">${esc(PROTO_LABEL[proto] || proto)}</span>`
+    ? `<span class="tag${proto === 'anthropic' ? ' tag-accent' : ''}" title="${esc(protoLabel)}">${esc(PROTO_SHORT[proto] || protoLabel)}</span>`
     : '<span class="dim">—</span>';
   // 分组名只在不是「默认」时才写出来，不然每一行都拖一条没信息量的尾巴
   const grp = r.group_name && r.group_name !== '默认'

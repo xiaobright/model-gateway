@@ -941,6 +941,71 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .tbl-upstreams td:last-child { white-space: nowrap; }
 .tbl-upstreams td.num { white-space: nowrap; }
 
+/* 转发记录同理：9 列不横滑。固定布局让列宽真正生效，长模型名/长错误在格子里省略
+   （鼠标悬停有 title 看全文），模型列吃掉剩下的宽度。窄窗口（笔记本高缩放/半屏）
+   压列宽并允许折行，信息一个不少、就是行高会涨一点。 */
+.tbl-log {
+  table-layout: fixed;
+  min-width: 0;
+}
+.tbl-log th:nth-child(1) { width: 112px; } /* 时间 */
+.tbl-log th:nth-child(2) { width: 104px; } /* 客户端 */
+.tbl-log th:nth-child(3) { width: 108px; } /* 协议 */
+/* 第 4 列（模型）不设宽：吃剩余空间 */
+.tbl-log th:nth-child(5) { width: 104px; } /* 上游 */
+.tbl-log th:nth-child(6) { width: 72px; }  /* 状态 */
+.tbl-log th:nth-child(7) { width: 194px; } /* Token */
+.tbl-log th:nth-child(8) { width: 66px; }  /* 耗时 */
+.tbl-log th:nth-child(9) { width: 92px; }  /* 备注 */
+.tbl-log > thead > tr > th,
+.tbl-log > tbody > tr > td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 上游格允许折行：名字 + 分组 +「第 N 次」挤不下时掉到第二行，别把标签挤没 */
+.tbl-log > tbody > tr > td:nth-child(5) { white-space: normal; }
+.tbl-log td.truncate { max-width: none; }
+/* 徽标也要能省略：inline-flex 里的文字没法打省略号，换成 inline-block。
+   dot 单独补回来，不然会退化成不可见的内联元素。 */
+.tbl-log .tag {
+  display: inline-block; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+}
+.tbl-log .tag .dot { display: inline-block; vertical-align: middle; margin-right: 3px; }
+
+/* 断点按卡片实际可用宽度定：1420 视口里主列 ≈1130，再减去卡片内边距 ≈1050，
+   基准列宽 812 到 1280 视口就只剩不到 140 给模型列了 —— 以下一律切换成紧凑模式。 */
+@media (max-width: 1280px) {
+  .tbl-log th:nth-child(1) { width: 80px; }
+  .tbl-log th:nth-child(2) { width: 84px; }
+  .tbl-log th:nth-child(3) { width: 104px; }
+  .tbl-log th:nth-child(5) { width: 88px; }
+  .tbl-log th:nth-child(6) { width: 66px; }
+  .tbl-log th:nth-child(7) { width: 136px; }
+  .tbl-log th:nth-child(8) { width: 48px; }
+  .tbl-log th:nth-child(9) { width: 84px; }
+  .tbl-log > thead > tr > th,
+  .tbl-log > tbody > tr > td {
+    white-space: normal;
+  }
+  /* 徽标内也允许折行：窄列里宁可两行也别把「OpenAI Chat」截成「OpenAI Ch…」 */
+  .tbl-log .tag { white-space: normal; }
+}
+
+/* 961~1150 这段最挤：侧栏还占着 232px，卡片比 880 的手机版还窄。再收一档，
+   先保住模型列，其余的靠换行和省略号。 */
+@media (min-width: 961px) and (max-width: 1150px) {
+  .tbl-log th:nth-child(1) { width: 76px; }
+  .tbl-log th:nth-child(2) { width: 68px; }
+  .tbl-log th:nth-child(3) { width: 84px; }
+  .tbl-log th:nth-child(5) { width: 76px; }
+  .tbl-log th:nth-child(6) { width: 64px; }
+  .tbl-log th:nth-child(7) { width: 116px; }
+  .tbl-log th:nth-child(8) { width: 44px; }
+  .tbl-log th:nth-child(9) { width: 74px; }
+}
+
 /* 分组子行：往里缩一格 + 底色压暗，和供应商行分开 */
 .grp-row > td { background: var(--glass-sunken); }
 .grp-row .grp-name { padding-left: 24px; font-size: 12.5px; color: var(--ink-2); white-space: nowrap; }

@@ -657,7 +657,8 @@ async def forward(
     # 最后一次真正发出去的候选（不是「下一个要试的」）：502 文案只能怪它
     last_route: db.Route | None = None
     # 这个请求里站级失败过的分组。整个跳掉（含它下面同模型的其它候选）：同一个站
-    # 绝不在一次请求里立刻重试。模型级的 404 不进这里 —— 那是名字的问题不是站的问题
+    # 绝不在一次请求里立刻重试。候选级的失败（404 / 400 / 422）不进这里 ——
+    # 那是「这个候选不认这条请求」，站本身不一定有毛病
     dead_groups: set[int] = set()
     # 「实时」那一页的数据来源。record=False 的元数据请求（count_tokens）照样登记 ——
     # 它也会走降级、也会踩断路器，「这个站为什么在被打」的答案有时就是它 —— 但打个
@@ -669,9 +670,11 @@ async def forward(
     )
 
     def advance() -> int:
-        """还该不该再打一个？返回下一个候选的下标，-1 = 到此为止。"""
-        if attempt >= failover.MAX_ATTEMPTS:
-            return -1
+        """还该不该再打一个？返回下一个候选的下标，-1 = 到此为止。
+
+        候选顺序就是用户排的，配了几个就试几个 —— 不设尝试次数上限。总时长由
+        START_DEADLINE 和每次尝试前的客户端断开检查兜底。
+        """
         return failover.next_index(candidates, index + 1, dead_groups)
 
     async def same_retry_pause(delay_s: float) -> bool:
@@ -843,7 +846,7 @@ async def forward(
         )
 
         site_bad = resp.status_code in failover.RETRY_STATUS
-        model_bad = resp.status_code in failover.MODEL_STATUS
+        candidate_bad = resp.status_code in failover.CANDIDATE_STATUS
         # 同站重试优先于换站降级：命中该供应商的规则就原站再发，耗尽了才走下面的
         # note_fail / advance。错误状态说明上游还没吐正文，重发对 store 类请求通常也安全
         delay = failover.same_retry_delay(
@@ -897,14 +900,15 @@ async def forward(
                 resp = None
                 index = nxt
                 continue
-        if not site_bad and not model_bad:
+        if not site_bad and not candidate_bad:
             failover.note_ok(route.group_id)
             break
         if site_bad:
             failover.note_fail(route.group_id, resp.status_code, label)
             dead_groups.add(route.group_id)
-        # 模型级的 404 既不算失败也不算成功：站是通的、key 是好的，只是这个名字没了。
-        # 所以不碰断路器，让同一个分组里的下一条真名还有机会
+        # 候选级的失败（404 名字没了；400/422 这站不认请求里的某个参数）既不算失败也
+        # 不算成功：站是通的、key 是好的。所以不碰断路器，让同组的其它真名和后面的
+        # 候选都还有机会
         nxt = advance()
         if nxt < 0:
             # 没有退路了就把上游的响应原样透传下去，和没有降级时的行为一字不差

@@ -79,22 +79,32 @@ def test_failover_is_off_on_openai(gateway):
         assert again.status_code == 200 and again.json()["upstream"] == "siteB"
 
 
-def test_failover_skips_a_bad_request(gateway):
-    """400 换个站也是同样的答案，重试只是白花一次调用。"""
+def test_failover_moves_past_a_bad_request(gateway):
+    """400 不一定是请求本身的问题：这个站不认某个参数、或模型映射不对，换一个站往往能跑。
+
+    候选级的失败只换下一个候选，不冷却这个站 —— 真库里的 hyper 就长期对
+    deepseek-v4-flash 回 400，而别的站同样的请求能过。
+    """
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         two_anthropic_sites(gateway, a, b)
         a.fail_with(400)
 
         resp = gateway.post("/v1/messages", json=msg("opus"))
-        assert resp.status_code == 400
-        rows = wait_rows(gateway, 1)
-        assert len(rows) == 1 and rows[0]["upstream"] == "siteA"
+        assert resp.status_code == 200 and resp.json()["upstream"] == "siteB"
+        rows = wait_rows(gateway, 2)
+        assert [(r["upstream"], r["status"], r["note"]) for r in rows] == [
+            ("siteA", 400, "failed_over"),
+            ("siteB", 200, "ok"),
+        ]
+        assert gateway.get("/admin/api/failover").json()["breakers"] == [], \
+            "400 是候选不认这条请求，不该让整个分组进冷却"
 
 
-def test_failover_gives_up_after_three_attempts(gateway):
-    """全都坏的时候要有个头：打三个就把最后那个的响应还给客户端，别把 40 万 token 重发五遍。"""
-    from gateway import failover
+def test_failover_tries_every_candidate(gateway):
+    """全都坏的时候就按顺序试完用户配的每个候选，别试到一半就停。
 
+    候选顺序是用户排的，配了几个就试几个；最后那次原样透传，不合成错误。
+    """
     with MockUpstream("s1") as s1, MockUpstream("s2") as s2, \
             MockUpstream("s3") as s3, MockUpstream("s4") as s4:
         for i, site in enumerate((s1, s2, s3, s4), start=1):
@@ -104,9 +114,9 @@ def test_failover_gives_up_after_three_attempts(gateway):
 
         resp = gateway.post("/v1/messages", json=msg("opus"))
         assert resp.status_code == 503
-        rows = wait_rows(gateway, failover.MAX_ATTEMPTS)
-        assert [r["upstream"] for r in rows] == ["s1", "s2", "s3"]
-        assert [r["attempt"] for r in rows] == [1, 2, 3]
+        rows = wait_rows(gateway, 4)
+        assert [r["upstream"] for r in rows] == ["s1", "s2", "s3", "s4"]
+        assert [r["attempt"] for r in rows] == [1, 2, 3, 4]
         # 最后那次是原样透传下去的，不算「被降级接住」
         assert rows[-1]["note"] != "failed_over"
 
