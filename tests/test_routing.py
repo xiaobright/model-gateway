@@ -1,6 +1,8 @@
-"""端到端测试 · 路由：候选的增删、停用之后的兜底、模型名绑定在一种接口上。"""
+"""端到端测试 · 路由：候选增删、停用、同名多接口的独立候选链。"""
 
 from __future__ import annotations
+
+import pytest
 
 from helpers import (
     MockUpstream, add_upstream, add_group, provider_id, add_route, cands, route_id, msg,
@@ -19,7 +21,7 @@ def test_delete_active_candidate_reattaches_remaining(gateway):
         assert shared["active_route_id"] == rids[g_a]
 
         assert gateway.delete(
-            "/admin/api/models", params={"model_name": "shared", "group_id": g_a}
+            "/admin/api/models", params={"route_id": rids[g_a]}
         ).status_code == 200
         routes = gateway.get("/admin/api/models").json()
         shared = next(g for g in routes if g["model_name"] == "shared")
@@ -33,7 +35,7 @@ def test_disabled_upstream_is_not_routed(gateway):
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
         uid = provider_id(gateway, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
 
         detail = gateway.get("/admin/api/upstreams").json()[0]
         gateway.put(
@@ -87,6 +89,35 @@ def test_disabled_group_is_not_routed(gateway):
         assert "gpt-test" in {m["id"] for m in gateway.get("/v1/models").json()["data"]}
 
 
+@pytest.mark.parametrize("disable", ["group", "upstream"])
+def test_disabled_explicit_model_does_not_borrow_another_tier_chain(gateway, disable):
+    """显式停用的链不能被同档位名字接管；真正未配置的名字仍保留档位兼容。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        name = "claude-opus-special"
+        r_a = add_route(gateway, name, g_a, "special-remote")
+        add_route(gateway, "opus", g_b, "fallback-remote")
+        if disable == "group":
+            result = gateway.put(
+                f"/admin/api/groups/{g_a}",
+                json={"name": "默认", "protocol": "anthropic", "api_key": "key-siteA", "enabled": False},
+            )
+        else:
+            result = gateway.put(
+                f"/admin/api/upstreams/{provider_id(gateway, 'siteA')}",
+                json={"name": "siteA", "base_url": a.base_url, "enabled": False},
+            )
+        assert result.status_code == 200, result.text
+        row = next(r for r in gateway.get("/admin/api/models").json() if r["model_name"] == name)
+        assert [c["route_id"] for c in row["candidates"]] == [r_a]
+        assert row["active_route_id"] is None
+        assert gateway.post("/v1/messages", json=msg(name)).status_code == 404
+        fallback = gateway.post("/v1/messages", json=msg("claude-opus-unconfigured"))
+        assert fallback.status_code == 200, fallback.text
+        assert fallback.json()["model"] == "fallback-remote"
+
+
 def test_model_name_with_slash_can_be_deleted(gateway):
     """公益站上很多模型名带 '/'，放在 URL 路径里会被当成多段，所以删除走 query 参数。"""
     with MockUpstream("siteA") as a:
@@ -95,7 +126,7 @@ def test_model_name_with_slash_can_be_deleted(gateway):
         add_route(gateway, name, g_a, name)
         assert name in {m["id"] for m in gateway.get("/v1/models").json()["data"]}
 
-        resp = gateway.delete("/admin/api/models", params={"model_name": name, "group_id": g_a})
+        resp = gateway.delete("/admin/api/models", params={"model_name": name, "protocol": "openai"})
         assert resp.status_code == 200, resp.text
         assert name not in {m["id"] for m in gateway.get("/v1/models").json()["data"]}
 
@@ -113,7 +144,7 @@ def test_delete_whole_model_removes_every_candidate(gateway):
         assert gateway.delete("/admin/api/models", params={"model_name": "shared"}).status_code == 404
 
 
-def test_model_is_bound_to_one_interface(gateway):
+def test_model_chains_are_isolated_by_interface(gateway):
     """模型的接口 = 它候选所在分组的接口。跨接口调是 404 —— 拿 Anthropic 的请求体去打人家的
     /v1/responses 只会得到垃圾。同名模型可以在两种接口下各挂一条链，但两条链互不可见：
     转发只在自己接口的候选里挑、降级，谁也串不到谁那边去。"""
@@ -245,18 +276,18 @@ def test_chat_completions_stream_uses_done_marker_and_usage(gateway):
         assert row["stream"] == 1
 
 
-def test_unchecking_a_model_removes_every_mapping_in_that_group(gateway):
-    """分组弹窗里的勾选框答的是「这个模型在这个分组里有没有」，所以取消勾选
-    （group_id 那种删法）要把同分组的几条映射一起去掉。"""
+def test_unchecking_a_catalog_model_removes_all_of_its_mappings(gateway):
+    """分组弹窗管理上游目录；移除一个上游真名会下线指向它的所有下游候选。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA", "anthropic")
         g_b = add_upstream(gateway, b, "siteB", "anthropic")
-        add_route(gateway, "opus", g_a, "opus-a1")
-        add_route(gateway, "opus", g_a, "opus-a2")
+        add_route(gateway, "opus", g_a, "opus-a")
+        add_route(gateway, "opus-alias", g_a, "opus-a")
         r_b = add_route(gateway, "opus", g_b, "opus-b")
 
-        resp = gateway.delete("/admin/api/models", params={"model_name": "opus", "group_id": g_a})
-        assert resp.json() == {"ok": True, "removed": 2}
+        resp = gateway.delete(f"/admin/api/groups/{g_a}/models", params={"remote_model": "opus-a"})
+        assert resp.status_code == 200, resp.text
+        assert cands(gateway, "opus-alias") == []
         assert [c["route_id"] for c in cands(gateway, "opus")] == [r_b]
         # 活跃的那条被删了，流量自动落到剩下的候选上
         assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"

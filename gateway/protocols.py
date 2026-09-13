@@ -375,8 +375,12 @@ class SSEObserver:
     直到下一次 feed 补齐；观察失败最多少一条统计，不应影响 relay 原样转发。
     """
 
-    def __init__(self, proto: Protocol) -> None:
+    def __init__(
+        self, proto: Protocol, *, collect_types: bool = False, collect_compaction: bool = False
+    ) -> None:
         self.proto = proto
+        self._collect_types = collect_types or collect_compaction
+        self._collect_compaction = collect_compaction
         self._buffer = bytearray()
         self.ended = False
         self.text_bytes = 0
@@ -432,7 +436,7 @@ class SSEObserver:
 
         if not data and not event:
             return
-        if event:
+        if event and self._collect_types:
             self.event_types[event] = self.event_types.get(event, 0) + 1
         data_bytes = b"\n".join(data)
         try:
@@ -449,15 +453,16 @@ class SSEObserver:
 
         data_text = data_bytes.decode("utf-8", "ignore").strip()
         payload: object = None
-        if data_text:
+        if data_text and (self._collect_types or not event):
             try:
                 payload = json.loads(data_text)
             except (TypeError, ValueError):
                 pass
-        if isinstance(payload, dict) and isinstance(payload.get("type"), str):
+        if self._collect_types and isinstance(payload, dict) and isinstance(payload.get("type"), str):
             payload_type = payload["type"]
             self.payload_types[payload_type] = self.payload_types.get(payload_type, 0) + 1
-        self.compaction_items.extend(compaction_observations(payload, event=event))
+        if self._collect_compaction:
+            self.compaction_items.extend(compaction_observations(payload, event=event))
 
         if event in self.proto.end_event_types:
             self.ended = True

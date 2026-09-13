@@ -25,9 +25,32 @@ def test_duplicate_base_url_is_rejected_with_a_hint_about_groups(gateway):
         assert "分组" in dup.json()["detail"] and "siteA" in dup.json()["detail"]
 
 
-def test_bulk_add_to_missing_group_is_404(gateway):
-    resp = gateway.post("/admin/api/models/bulk-add", json={"group_id": 9999, "model_names": ["x"]})
+def test_add_route_to_missing_group_is_404(gateway):
+    resp = gateway.post("/admin/api/models", json={"group_id": 9999, "model_name": "x"})
     assert resp.status_code == 404
+
+
+def test_retired_orchestration_and_split_stats_endpoints_are_absent(gateway):
+    for method, path in (
+        ("POST", "/models/transfer"),
+        ("POST", "/models/bulk-add"),
+        ("GET", "/stats/series"),
+        ("GET", "/stats/upstreams"),
+        ("GET", "/stats/models"),
+    ):
+        assert gateway.request(method, f"/admin/api{path}").status_code == 404
+
+
+@pytest.mark.parametrize("extra", [{"group_id": 1}, {"group_id": 9999}, {"group": 1}])
+def test_retired_delete_parameters_cannot_widen_the_deletion(gateway, extra):
+    with MockUpstream("siteA") as a:
+        gid = add_upstream(gateway, a, "siteA")
+        rid = add_route(gateway, "m", gid)
+        before = gateway.get("/admin/api/models").json()
+        for target in ({"model_name": "m"}, {"route_id": rid}):
+            result = gateway.delete("/admin/api/models", params={**target, **extra})
+            assert result.status_code == 400, result.text
+            assert gateway.get("/admin/api/models").json() == before
 
 
 def test_remote_model_pull_and_manual_add_default_remote_name(gateway):
@@ -82,7 +105,7 @@ def test_catalog_delete_of_unknown_model_is_404(gateway):
 def test_request_log_can_be_cleared(gateway):
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
         gateway.post("/v1/responses", json={"model": "gpt-test"})
         assert gateway.get("/admin/api/requests").json()
 
@@ -344,8 +367,8 @@ def test_base_url_is_stored_as_a_root_and_v1_is_added_per_protocol(gateway):
         assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteA"
 
 
-def test_bulk_add_allows_same_name_on_another_interface(gateway):
-    """拉一个站的模型列表动辄几十上百个。同名模型在别的接口下已有链不算冲突 ——
+def test_add_routes_allows_same_name_on_another_interface(gateway):
+    """同名模型在别的接口下已有链不算冲突 ——
     一个站同时暴露 Responses 和 Chat Completions 很常见，两边各挂各的链。"""
     with MockUpstream("siteA") as a:
         g_an = add_upstream(gateway, a, "siteA", "anthropic")
@@ -353,12 +376,8 @@ def test_bulk_add_allows_same_name_on_another_interface(gateway):
         add_route(gateway, "claude-test", g_an, "claude-test")
 
         # claude-test 已经在 anthropic 下了，挂到 openai 分组照样成功
-        resp = gateway.post(
-            "/admin/api/models/bulk-add",
-            json={"group_id": g_oa, "model_names": ["gpt-test", "claude-test"]},
-        )
-        assert resp.status_code == 200, resp.text
-        assert resp.json() == {"added": 2, "skipped": []}
+        for model in ("gpt-test", "claude-test"):
+            add_route(gateway, model, g_oa)
 
         rows = sorted(
             (g["model_name"], g["protocol"]) for g in gateway.get("/admin/api/models").json()
@@ -627,7 +646,7 @@ def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatc
     完整基线是当前 SCHEMA_VERSION —— 旧版即使 cache_creation 列齐全，也要补后续迁移。"""
     import sqlite3
 
-    from gateway import config, db
+    from gateway import config, db, stats
 
     db_path = tmp_path / "gateway.db"
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
@@ -706,7 +725,7 @@ def test_migration_from_pre_group_schema(tmp_path, monkeypatch):
     """老库（api_key 挂在上游行上）原地升级成供应商 / 分组结构，候选和历史记录一条不少。"""
     import sqlite3
 
-    from gateway import config, db
+    from gateway import config, db, stats
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -746,7 +765,7 @@ def test_migration_from_pre_group_schema(tmp_path, monkeypatch):
     assert route.upstream.base_url == "https://a.example"
     assert db.resolve_route("m1", "anthropic") is None, "接口参与匹配"
 
-    assert db.request_stats()["requests"] == 1, "历史转发记录不能丢"
+    assert stats.request_stats()["requests"] == 1, "历史转发记录不能丢"
     assert db.recent_requests(1)[0]["protocol"] == "openai", "老记录的协议列要回填"
 
     db.init_db()   # 再跑一遍不能出事，也不能又建一遍分组
@@ -797,7 +816,7 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
     迁移要把接口搬到分组上、把 base_url 收成站根，候选和历史记录一条不少。"""
     import sqlite3
 
-    from gateway import config, db
+    from gateway import config, db, stats
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -843,7 +862,7 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
     }
     route = db.resolve_route("m1", "openai")
     assert (route.upstream.name, route.group_name, route.upstream.api_key) == ("gpt-site", "默认", "sk-aaa")
-    assert db.request_stats()["requests"] == 1
+    assert stats.request_stats()["requests"] == 1
     assert db.recent_requests(1)[0]["protocol"] == "openai", "老记录的协议列要回填"
 
     # 老库的候选是复合主键，顺带升级成自增 id：一个分组下才塞得下第二条映射

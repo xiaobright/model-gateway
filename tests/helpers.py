@@ -569,7 +569,7 @@ def cands(client: httpx.Client, model_name: str) -> list[dict]:
 
 
 def route_id(client: httpx.Client, model_name: str, group_id: int) -> int:
-    """这个模型在某个分组下的候选 id（bulk-add 建出来的拿不到返回值，从列表里找）。"""
+    """这个模型在某个分组下的唯一候选 id（不知道 id 时从列表里找）。"""
     hit = [c for c in cands(client, model_name) if c["group_id"] == group_id]
     assert len(hit) == 1, f"{model_name} 在 g{group_id} 下有 {len(hit)} 条候选"
     return int(hit[0]["route_id"])

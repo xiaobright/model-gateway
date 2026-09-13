@@ -21,7 +21,7 @@ from .upstream import normalize_base
 #
 # 接口（protocol）挂在**分组**上而不是供应商上：现实里同一个站的 Claude key 和 GPT key
 # 是两把不同的 key，额度和能拉到的模型都不一样。「模型属于哪个接口」不再单独存一份，
-# 它等于自己候选所在分组的接口 —— 代价是同一个模型名的所有候选必须同接口，见 add_model_route。
+# 它等于自己候选所在分组的接口。同名模型按「模型名 + 接口」形成独立候选链。
 
 # 候选的列定义单独拎出来：建库和迁移里重建这张表都用它。以前两处各写一份，
 # 迁移那份漏了 priority，启动之后到处报 no such column。
@@ -130,10 +130,6 @@ class DuplicateBaseUrl(Exception):
 
 class DuplicateRemote(Exception):
     """同一个分组下已经有一条映射到这个上游真名的候选了。args = (上游真名,)。"""
-
-
-class RouteTransferConflict(Exception):
-    """拖拽开始后来源候选发生变化，不能继续按旧快照移动。"""
 
 
 class ProtocolLocked(Exception):
@@ -947,77 +943,6 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
     return int(cur.lastrowid)
 
 
-def transfer_model_routes(
-    source_model_name: str, target_model_name: str, route_ids: Iterable[int], mode: str = "copy"
-) -> dict:
-    """复制、移动或合并候选；目标写入和来源移除在同一个事务中完成。
-
-    分组、上游真名及 1M 后缀原样保留。已有目标的首选与顺序不变，重复映射合并；
-    新模型继承所选候选中的首选。来源名称也参与校验，拒绝迟到的拖拽快照。
-    """
-    ids = tuple(dict.fromkeys(route_ids))
-    source = source_model_name.strip()
-    target = target_model_name.strip()
-    if not source or not target or source == target or not ids or mode not in ("copy", "move"):
-        raise ValueError("请选择不同的来源和目标模型，并提供有效候选")
-    placeholders = ",".join("?" for _ in ids)
-    with _conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
-            f"SELECT * FROM model_routes WHERE id IN ({placeholders}) ORDER BY priority, id", ids
-        ).fetchall()
-        if len(rows) != len(ids) or any(row["model_name"] != source for row in rows):
-            raise RouteTransferConflict("来源候选已经变化，请刷新后重试")
-        protocol = _group_protocol(conn, rows[0]["group_id"])
-        if any(_group_protocol(conn, row["group_id"]) != protocol for row in rows):
-            raise RouteTransferConflict("来源候选的协议不一致")
-        # 目标模型可以在别的接口下已有自己的链（同名多协议是合法的），所以只看
-        # 「目标在**这种接口**下是否已有链」来决定新插候选要不要当首选
-        has_chain = conn.execute(
-            "SELECT 1 FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
-            " WHERE m.model_name=? AND g.protocol=? LIMIT 1",
-            (target, protocol),
-        ).fetchone() is not None
-        preferred = next((row["id"] for row in rows if row["is_active"]), rows[0]["id"])
-        next_priority = conn.execute(
-            "SELECT COALESCE(MAX(m.priority), -1) + 1 AS p FROM model_routes m"
-            " JOIN upstream_groups g ON g.id = m.group_id"
-            " WHERE m.model_name=? AND g.protocol=?",
-            (target, protocol),
-        ).fetchone()["p"]
-        result_ids = []
-        added = 0
-        for row in rows:
-            existing = conn.execute(
-                "SELECT id FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
-                (target, row["group_id"], row["remote_model"]),
-            ).fetchone()
-            if existing:
-                result_ids.append(existing["id"])
-                continue
-            cur = conn.execute(
-                "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
-                " VALUES(?,?,?,?,?)",
-                (target, row["group_id"], row["remote_model"],
-                 int(not has_chain and row["id"] == preferred), next_priority),
-            )
-            result_ids.append(int(cur.lastrowid))
-            next_priority += 1
-            added += 1
-        if mode == "move":
-            conn.execute(f"DELETE FROM model_routes WHERE id IN ({placeholders})", ids)
-            _reattach_active(conn, source)
-        _reattach_active(conn, target)
-        source_empty = conn.execute(
-            "SELECT 1 FROM model_routes WHERE model_name=? LIMIT 1", (source,)
-        ).fetchone() is None
-        return {
-            "model_name": target, "protocol": protocol, "route_ids": result_ids,
-            "added": added, "merged": len(rows) - added,
-            "moved": len(rows) if mode == "move" else 0, "source_empty": source_empty,
-        }
-
-
 def update_model_route(route_id: int, remote_model: str) -> bool:
     """只改「上游那边的真实模型名」。1M 开关也是它 —— 存成 `名字[1m]` 后缀。"""
     with _conn() as conn:
@@ -1038,22 +963,6 @@ def update_model_route(route_id: int, remote_model: str) -> bool:
         return cur.rowcount > 0
 
 
-def add_routes_for_group(group_id: int, model_names: Iterable[str]) -> tuple[int, tuple[str, ...]]:
-    """批量加候选，返回 (加上了几个, 跳过了哪些)。
-
-    跳过的一直是空的（历史上是「跨接口撞名」的兜底，同名多协议放开后不再有这种情况）；
-    重复的真名不算跳过 —— 已经有了本来就是想要的结果。保留返回形状以兼容管理 API。"""
-    added = 0
-    skipped: list[str] = []
-    for raw in model_names:
-        name = raw.strip()
-        if not name:
-            continue
-        if add_model_route(name, group_id, name):
-            added += 1
-    return added, tuple(skipped)
-
-
 def delete_model_route(route_id: int) -> str:
     """删掉一条候选，返回它的模型名（找不到返回空串）。"""
     with _conn() as conn:
@@ -1063,20 +972,6 @@ def delete_model_route(route_id: int) -> str:
         conn.execute("DELETE FROM model_routes WHERE id=?", (route_id,))
         _reattach_active(conn, row["model_name"])
         return row["model_name"]
-
-
-def delete_routes_in_group(model_name: str, group_id: int) -> int:
-    """把这个模型在某个分组下的候选全删掉，返回删除条数。
-
-    分组弹窗里那个勾选框就是这个语义：它答的是「这个模型在这个分组里有没有」，
-    同分组挂了好几个真名时，取消勾选自然是一起去掉。"""
-    with _conn() as conn:
-        removed = conn.execute(
-            "DELETE FROM model_routes WHERE model_name=? AND group_id=?", (model_name, group_id)
-        ).rowcount
-        if removed:
-            _reattach_active(conn, model_name)
-        return removed
 
 
 def delete_model(model_name: str, protocol: str = "") -> int:
@@ -1262,7 +1157,10 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
     with _conn() as conn:
         matched = model_name
         rows = conn.execute(_CHAIN_QUERY, (model_name, protocol)).fetchall()
-        if not rows:
+        # 只有从未配置的名字才做档位兼容。显式配置但全部停用的链必须保持不可用，
+        # 不能悄悄借用另一个同档位模型，更不能给管理页返回不属于本链的 active_route_id。
+        configured = protocol in _model_protocols(conn, model_name) if not rows else True
+        if not rows and not configured:
             matched = _tier_match(conn, model_name, protocol)
             rows = conn.execute(_CHAIN_QUERY, (matched, protocol)).fetchall() if matched else []
     return tuple(
@@ -1454,10 +1352,3 @@ def set_protocol_enabled(protocol: str, enabled: bool) -> None:
 def clear_request_log() -> int:
     with _conn() as conn:
         return conn.execute("DELETE FROM request_log").rowcount
-
-
-def request_stats() -> dict:
-    """兼容旧调用点；统计口径统一由 stats 模块按协议描述符计算。"""
-    from . import stats as stats_mod
-
-    return stats_mod.request_stats()

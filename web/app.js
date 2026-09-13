@@ -146,7 +146,7 @@ function refreshConfig(options) {
 }
 
 const statsRefresh = createRefreshQueue(
-  () => api('GET', '/admin/api/stats'),
+  () => api('GET', '/admin/api/stats?live_only=true'),
   (data, args) => {
     if (args.seq < liveAppliedSeq) return;
     liveAppliedSeq = args.seq;
@@ -163,7 +163,7 @@ function refreshStats(options) {
 /* skipSeries：切时间窗时由 animateWindowChange 负责在淡出淡入之间换图，
    这里就别先原地渲染一次，否则新数据会先闪一下再被淡出 */
 const overviewRefresh = createRefreshQueue(
-  ({ window }) => api('GET', `/admin/api/overview?window=${window}&top=8`),
+  ({ window }) => api('GET', `/admin/api/overview?window=${window}`),
   (data, args) => {
     if (args.window !== state.window || args.seq < (state.overviewSeq || 0)) return;
     state.overviewSeq = args.seq;
@@ -470,6 +470,7 @@ const EGRESS_TIP = {
 };
 
 let vpsPresetRaw = '';   // 完整预设 URL，只在需要保存/填充时取回一次
+let upstreamEditSeq = 0; // 相同 id（尤其新建的 null）重开也是新会话
 
 async function ensureVpsPreset() {
   if (vpsPresetRaw) return vpsPresetRaw;
@@ -496,7 +497,7 @@ function egressHint() {
 
 /* kind 由后端算（system / direct / vps / proxy），raw 只在编辑代理时按需取回 */
 function fillEgress(kind, raw = '') {
-  $('up-egress-kind').value = kind;
+  $('up-egress-kind').value = kind === 'system' ? '' : kind;
   $('up-egress-url').value = kind === 'proxy' ? raw : '';
   egressHint();
 }
@@ -511,10 +512,12 @@ function syncEgressPreset() {
    各自被不同的站拉黑 —— 这个问题只能实测，猜不出来。 */
 async function probeUpstream() {
   if (state.editing === null) return toast('先保存这个供应商，再测出口', 'err');
+  const seq = upstreamEditSeq;
   const host = $('up-egress-hint');
   host.textContent = '正在从每扇门各打一次…';
   try {
     const data = await api('POST', `/admin/api/upstreams/${state.editing}/probe`);
+    if (seq !== upstreamEditSeq || !$('up-dialog').open) return;
     if (!Array.isArray(data.results)) throw new Error('响应里没有 results');
     host.innerHTML = data.results.map((r) => {
       const dot = r.ok ? (r.status < 400 ? 'good' : 'warn') : 'crit';
@@ -522,11 +525,12 @@ async function probeUpstream() {
       return `<span class="dot dot-${dot}"></span>${esc(r.label)} ${what} <span class="dim">${r.ms}ms</span>`;
     }).join(' &nbsp; ') + '<br><span class="dim">拿到状态码就算这扇门能到站（401 也算 —— 问的是网络，不是 key）</span>';
   } catch (e) {
-    host.textContent = `测出口失败：${e.message}`;
+    if (seq === upstreamEditSeq && $('up-dialog').open) host.textContent = `测出口失败：${e.message}`;
   }
 }
 
 async function openUpstream(id) {
+  const seq = ++upstreamEditSeq;
   state.editing = id;
   const u = id === null ? null : state.upstreams.find((x) => x.id === id);
   // 自填代理的完整地址（可能含账密）不在列表里，编辑这一个站时单独取回；
@@ -536,9 +540,10 @@ async function openUpstream(id) {
     try {
       egressRaw = (await api('GET', `/admin/api/upstreams/${u.id}/egress`)).egress || '';
     } catch (e) {
-      return toast(`读取出口配置失败：${e.message}`, 'err');
+      if (seq === upstreamEditSeq) toast(`读取出口配置失败：${e.message}`, 'err');
+      return;
     }
-    if (state.editing !== id) return;   // 等响应期间用户已经点到别处了
+    if (seq !== upstreamEditSeq) return;
   }
   $('up-title').textContent = u ? `编辑供应商：${u.name}` : '添加供应商';
   $('up-name').value = u ? u.name : '';
@@ -554,6 +559,7 @@ async function openUpstream(id) {
   const hint = $('up-groups-hint');
   hint.hidden = Boolean(u);
   if (!u) hint.innerHTML = '保存后就能在这里加第一个分组：选接口（Anthropic Messages / OpenAI Responses / Chat Completions）＋ 填那把 key。';
+  $('up-dialog').dataset.upstreamSession = String(seq);
   $('up-dialog').showModal();
   views.renderUpGroups();      // 已有的供应商在这儿直接管分组，不用回列表里展开
   $('up-name').focus();
@@ -608,17 +614,23 @@ function upstreamPayload() {
 }
 
 async function saveUpstream() {
-  if (egressKind() === 'vps') {
+  const seq = upstreamEditSeq;
+  const editingAt = state.editing;
+  const groupIds = (state.upstreams.find((u) => u.id === editingAt)?.groups || []).map((g) => g.id);
+  const kind = egressKind();
+  const payload = upstreamPayload(); // 所有表单值和目标在第一个 await 前固定
+  if (kind === 'vps') {
     try {
-      await ensureVpsPreset();      // 保存前取回预设原文；列表接口只给脱敏形状
+      payload.egress = await ensureVpsPreset();
     } catch (e) {
-      return toast(`读取 VPS 出口失败：${e.message}`, 'err');
+      if (seq === upstreamEditSeq && $('up-dialog').open) toast(`读取 VPS 出口失败：${e.message}`, 'err');
+      return;
     }
-    if (!vpsPresetRaw) return toast('设置表里没有 egress_vps，先在设置里配好这扇门', 'err');
+    if (seq !== upstreamEditSeq || !$('up-dialog').open) return;
+    if (!payload.egress) return toast('设置表里没有 egress_vps，先在设置里配好这扇门', 'err');
   }
-  const payload = upstreamPayload();
   if (!payload.name || !payload.base_url) return toast('名称和 Base URL 都要填', 'err');
-  if (egressKind() === 'proxy' && !payload.egress) {
+  if (kind === 'proxy' && !payload.egress) {
     return toast('「走指定代理」得填代理地址；想跟随系统代理就选那一项', 'err');
   }
   if (payload.header_override) {
@@ -637,28 +649,25 @@ async function saveUpstream() {
       return toast('同站重试不是合法 JSON：' + e.message, 'err');
     }
   }
-  if (state.editing === null) {
+  if (editingAt === null) {
     const created = await api('POST', '/admin/api/upstreams', payload);
     // 供应商弹窗不关：分组就在它下半部分管。新建的供应商还没有分组、用不了，
     // 所以直接把分组弹窗叠上去；关掉那层就回到这儿，新分组已经列在下面了。
     // 请求在途时弹窗被关掉的话，就别为一个放弃的流程再叠分组弹窗。
-    const stillEditing = $('up-dialog').open && state.editing === null;
     await refreshConfig();
-    if (!stillEditing) {
-      toast('已保存', 'ok');
-      return;
-    }
+    if (seq !== upstreamEditSeq || !$('up-dialog').open) return;
     state.editing = created.id;
     $('up-title').textContent = `编辑供应商：${created.name}`;
     $('up-groups-hint').hidden = true;
+    views.renderUpGroups();
     toast('已保存，接着建第一个分组', 'ok');
     openGroup(created.id, null);
     return;
   }
-  const editingAt = state.editing;
   await api('PUT', `/admin/api/upstreams/${editingAt}`, payload);
+  groupIds.forEach(invalidateRemoteModels); // 站根、出口或请求头变化后，旧列表不能继续当真
   await refreshConfig();
-  if (state.editing !== editingAt) return;  // 迟到响应：别去动另一个供应商的表单
+  if (seq !== upstreamEditSeq || !$('up-dialog').open) return;
   toast('已保存', 'ok');
   markOverride();
 }
@@ -684,7 +693,6 @@ async function openGroup(upstreamId, gid) {
   if (!up) return toast('供应商不存在了，刷新一下', 'err');
   const g = gid === null ? null : (up.groups || []).find((x) => x.id === gid);
   const token = beginGroupEdit(up.id, g ? g.id : null);
-  $('group-dialog').dataset.groupSession = String(token.seq);
 
   // 列表接口只回脱敏 key；编辑时按需取回原文，取失败就别开弹窗 ——
   // 否则表单里是掩码，一保存就把真 key 冲掉了
@@ -693,8 +701,8 @@ async function openGroup(upstreamId, gid) {
     try {
       key = (await api('GET', `/admin/api/groups/${g.id}/key`)).api_key || '';
     } catch (e) {
-      closeGroupEdit(token.seq);
-      return toast(`读取分组 Key 失败：${e.message}`, 'err');
+      if (closeGroupEdit(token.seq)) toast(`读取分组 Key 失败：${e.message}`, 'err');
+      return;
     }
     if (!isCurrentGroupEdit(token)) return;   // 等响应期间弹窗已被关掉/切走
   }
@@ -731,11 +739,13 @@ async function openGroup(upstreamId, gid) {
   $('grp-manual').value = '';
   $('grp-import').hidden = !g;
   renderPicker();
+  $('group-dialog').dataset.groupSession = String(token.seq);
   $('group-dialog').showModal();
   if (g) {
     // 编辑已有分组：核心操作是勾选上游模型，而字段区较高、列表在下方，
     // 打开就把列表带进视野，别让用户以为「拉到的模型显示不出来」。
     requestAnimationFrame(() => {
+      if (!isCurrentGroupEdit(token) || !$('group-dialog').open) return;
       const body = document.querySelector('#group-dialog .dlg-body');
       const pick = $('grp-picker');
       if (body && pick) {
@@ -774,9 +784,13 @@ async function saveGroup() {
     }
     await api('PUT', `/admin/api/groups/${targetGroup}`, payload);
   }
+  const modelsChanged = original && (keyBefore !== payload.api_key
+    || original.protocol !== payload.protocol || original.upstream_id !== movedTo);
+  // 写已成功，即使用户切走也必须废弃旧 key/出口对应的缓存。
+  if (modelsChanged) invalidateRemoteModels(targetGroup);
   await refreshConfig();
-  editingKey = payload.api_key;
   if (!isCurrentGroupEdit(token)) return null;
+  editingKey = payload.api_key;
   if (created) {
     updateGroupEdit(token, targetUpstream, created.id);
     const owner = state.upstreams.find((x) => x.id === targetUpstream);
@@ -788,9 +802,9 @@ async function saveGroup() {
     updateGroupEdit(token, movedTo, targetGroup);
     toast(payload.upstream_id ? '已保存并搬到新供应商下' : '已保存', 'ok');
   }
-  if (original && (keyBefore !== payload.api_key
-    || original.protocol !== payload.protocol || original.upstream_id !== movedTo)) {
-    invalidateRemoteModels(targetGroup);
+  if (modelsChanged) {
+    pulled = [];
+    $('grp-pull-status').textContent = '';
   }
   renderPicker();
   return currentGroupEdit()?.groupId ?? null;
@@ -1005,7 +1019,8 @@ function fillRemoteList(gid) {
     : '拉不动这个分组的模型列表，手动填';
   else hint.textContent = '';
 
-  if (!pulledNames && !remoteBusy.has(gid) && !remoteDead.has(gid)) pullRemoteList(gid);
+  // busy 只作展示；旧会话还在拉不能挡住新会话。同会话的请求由 requestKey 去重。
+  if (!pulledNames && !remoteDead.has(gid)) pullRemoteList(gid);
 }
 
 /** 这个模型在这个分组下已经占用的上游真名（同名多协议时必须按接口定位链） */
@@ -1183,7 +1198,7 @@ async function saveRewrite() {
     if (!Array.isArray(rules)) return toast('要是一个数组：[{"from":"x","to":"y"}]', 'err');
   }
   const saved = await api('PUT', '/admin/api/rewrite-rules', { rules });
-  rewriteDirty = false;
+  rewriteDirty = (box.value || '').trim() !== text;
   renderRewriteRules(saved);
   toast(rules.length ? `已保存 ${rules.length} 条规则` : '已清空规则', 'ok');
 }
@@ -1386,10 +1401,8 @@ const ACTIONS = {
     } finally {
       endModelWrites(token, [name]);
       label.classList.remove('busy');
-      if (isCurrentGroupEdit(token)) {
-        await refreshConfig();      // 末尾的 syncPickerChecks 负责把勾选拉回真相
-        renderPicker();             // 勾掉的项要落到「没登记」那节（或消失），不能留在已登记里
-      }
+      await refreshConfig();
+      if (isCurrentGroupEdit(token)) renderPicker();
     }
   },
 
@@ -1401,10 +1414,8 @@ const ACTIONS = {
     if (!beginModelWrites(token, names)) return toast('有模型正在保存，请稍后再试', 'err');
     try {
       await addModels(names, token);
-      if (isCurrentGroupEdit(token)) {
-        await refreshConfig();
-        renderPicker();
-      }
+      await refreshConfig();
+      if (isCurrentGroupEdit(token)) renderPicker();
     } finally {
       endModelWrites(token, names);
     }
@@ -1444,12 +1455,10 @@ const ACTIONS = {
     } finally {
       // 中途失败也要把界面拉回真实状态：前面几条已经删掉了，不能只等重开弹窗
       endModelWrites(token, names);
-      if (isCurrentGroupEdit(token)) {
-        await refreshConfig();
-        renderPicker();
-      }
+      await refreshConfig();
+      if (isCurrentGroupEdit(token)) renderPicker();
     }
-    toast(`去掉了 ${names.length} 个`, 'ok');
+    if (isCurrentGroupEdit(token)) toast(`去掉了 ${names.length} 个`, 'ok');
   },
 
   /* 上游不肯列全的时候（不少站的 /v1/models 就是残的）自己填一个 */
@@ -1465,11 +1474,11 @@ const ACTIONS = {
     } finally {
       endModelWrites(token, [name]);
     }
-    $('grp-manual').value = '';
-    if (isCurrentGroupEdit(token)) {
-      await refreshConfig();
-      renderPicker();
+    if (isCurrentGroupEdit(token) && $('grp-manual').value.trim() === name) {
+      $('grp-manual').value = '';
     }
+    await refreshConfig();
+    if (isCurrentGroupEdit(token)) renderPicker();
   },
 
   'open-search': openSearch,
@@ -1745,14 +1754,21 @@ $('grp-picker-filter').addEventListener('keydown', (ev) => {
 /* 弹窗关掉后刷一次列表（Esc 关闭也走这里，所以挂在 close 上而不是关闭按钮上）。
    编辑目标不再靠清空全局字段来表示失效，而由 group-editor 的会话序号管理。若旧
    close 事件晚于紧接着打开的新弹窗，dialog.open 已经为真，不能把新会话一起作废。 */
-$('up-dialog').addEventListener('close', () => run(null, refreshConfig));
+$('up-dialog').addEventListener('close', (ev) => {
+  if (!ev.target.open && Number(ev.target.dataset.upstreamSession) === upstreamEditSeq) {
+    upstreamEditSeq += 1;
+  }
+  run(null, refreshConfig);
+});
 $('group-dialog').addEventListener('close', (ev) => {
   if (!ev.target.open) closeGroupEdit(ev.target.dataset.groupSession);
   run(null, refreshConfig);
 });
 
 // route-dialog 的 editingCand 同理：也只由 openRoute 负责重设，close 时不动
-$('route-dialog').addEventListener('close', () => { routeRemoteSeq += 1; });
+$('route-dialog').addEventListener('close', (ev) => {
+  if (!ev.target.open) routeRemoteSeq += 1;
+});
 
 $('route-filter').addEventListener('input', (ev) => {
   state.filter = ev.target.value;
@@ -1776,7 +1792,7 @@ const ticking = () => document.visibilityState === 'visible' && !document.queryS
 
 // 快轮只取活跃流：3 秒一次，让"进行中的请求"真的是实时的
 setInterval(() => {
-  if (ticking()) run(null, () => refreshStats({ allowIntermediate: true }));
+  if (ticking() && state.view !== 'live') run(null, () => refreshStats({ allowIntermediate: true }));
 }, 3000);
 
 /* 「实时」页只在自己显示时轮询，1 秒一次 —— 那个接口是纯内存的，不碰数据库。

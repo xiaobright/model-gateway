@@ -112,7 +112,7 @@ def test_compaction_probe_recognizes_nested_summary_and_cmp_encrypted_items():
 def test_sse_observer_records_event_and_payload_type_inventory():
     from gateway.protocols import OPENAI, SSEObserver
 
-    observer = SSEObserver(OPENAI)
+    observer = SSEObserver(OPENAI, collect_compaction=True)
     observer.feed(
         b'event: response.output_item.done\ndata: {"type":"response.output_item.done",'
         b'"item":{"type":"compaction","id":"cmp_1","encrypted_content":"x"}}\n\n'
@@ -120,6 +120,23 @@ def test_sse_observer_records_event_and_payload_type_inventory():
     assert observer.event_types == {"response.output_item.done": 1}
     assert observer.payload_types == {"response.output_item.done": 1}
     assert observer.compaction_items[0]["item_id"] == "cmp_1"
+
+
+@pytest.mark.parametrize("collect_types", [False, True])
+def test_sse_observer_does_not_scan_compaction_unless_requested(monkeypatch, collect_types):
+    from gateway import protocols
+
+    def unexpected_scan(*args, **kwargs):
+        pytest.fail("普通流和原始抓包都不应递归扫描 compaction")
+
+    monkeypatch.setattr(protocols, "compaction_observations", unexpected_scan)
+    observer = protocols.SSEObserver(protocols.OPENAI, collect_types=collect_types)
+    observer.feed(b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n')
+    observer.feed(b'data: {"type":"response.completed"}\n\n')
+    assert observer.ended and observer.text_bytes == 2
+    assert observer.compaction_items == []
+    assert observer.event_types == ({"response.output_text.delta": 1} if collect_types else {})
+    assert bool(observer.payload_types) == collect_types
 
 
 def test_openai_json_content_accepts_codex_alpha_search_string_output():
@@ -232,18 +249,18 @@ def test_wait_for_upstream_maps_timeout_to_stall():
 
 def test_system_proxy_change_rebuilds_the_cached_client(monkeypatch):
     """系统代理开关改变后，跟随系统的出口不能继续沿用旧直连 client。"""
-    from gateway import proxy
+    from gateway import upstream
 
     current = {}
     monkeypatch.setattr(urllib.request, "getproxies", lambda: dict(current))
 
     async def run():
-        await proxy.aclose_client()
-        direct = await proxy.get_client()
+        await upstream.aclose_client()
+        direct = await upstream.get_client()
         current.update({"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"})
-        proxied = await proxy.get_client()
+        proxied = await upstream.get_client()
         assert proxied is not direct
-        await proxy.aclose_client()
+        await upstream.aclose_client()
 
     asyncio.run(run())
 
@@ -255,11 +272,11 @@ def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
     自签的 https 代理（VPS 上 gost 那扇门）系统根证书验不了：钉了签发的那张就能过，
     而且系统根证书原样保留，不影响别的站。
     """
-    from gateway import proxy as proxy_mod
+    from gateway import upstream as upstream_mod
 
     with MockProxy(certfile=PROXY_CERT, keyfile=PROXY_KEY) as px, MockUpstream("siteA") as a:
         egress = f"https://me:pw@127.0.0.1:{px.port}#ca={PROXY_CERT}"
-        args = proxy_mod.client_args(egress)
+        args = upstream_mod.client_args(egress)
         # 片段是给网关看的，httpx 不认识，传之前剥掉；钉的证书挂在 Proxy 对象上
         # （httpx 连代理那一跳认的是它自己的 ssl_context，不是 client 的 verify）
         assert isinstance(args["proxy"], httpx.Proxy)
@@ -275,7 +292,7 @@ def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
         assert px.seen, "字节没从 TLS 门过"
 
         # 同一扇门，不钉证书：TLS 握手就过不去（自签的不在系统信任列表里）
-        bare = proxy_mod.client_args(f"https://me:pw@127.0.0.1:{px.port}")
+        bare = upstream_mod.client_args(f"https://me:pw@127.0.0.1:{px.port}")
         with pytest.raises(httpx.HTTPError) as ei:
             asyncio.run(through(bare))
         assert "certificate" in str(ei.value).lower()
@@ -287,7 +304,7 @@ def test_client_args_verifies_upstream_tls_against_the_system_trust_store():
     httpx 自带的 CA 捆绑包不认杀软装进系统库的根证书，curl/浏览器能通、网关 502。
     truststore 装了就带上 verify，没装则不加、行为原样（可选依赖）。
     """
-    from gateway import proxy as proxy_mod
+    from gateway import upstream as upstream_mod
 
     try:
         import truststore  # noqa: F401
@@ -295,7 +312,7 @@ def test_client_args_verifies_upstream_tls_against_the_system_trust_store():
     except ImportError:
         installed = False
 
-    args = proxy_mod.client_args("")
+    args = upstream_mod.client_args("")
     if installed:
         import ssl as _ssl
         assert isinstance(args.get("verify"), _ssl.SSLContext)
@@ -310,7 +327,7 @@ def test_input_item_census_records_the_role_alongside_the_type():
     `role: "developer"` 的 message item。只数 type 会看到「一堆普通 message」，
     什么都看不出来；把 role 记下来，下次抓包一眼就知道该映射哪一个。
     """
-    from gateway.proxy import _input_item_census
+    from gateway.capture import _input_item_census
 
     types, roles = _input_item_census({
         "input": [
@@ -327,7 +344,7 @@ def test_input_item_census_records_the_role_alongside_the_type():
 
 
 def test_input_item_census_handles_a_scalar_input():
-    from gateway.proxy import _input_item_census
+    from gateway.capture import _input_item_census
 
     types, roles = _input_item_census({"input": "hello"})
     assert types == {"str": 1} and roles == {}
@@ -744,7 +761,7 @@ def test_header_capture_uses_the_same_secret_list_as_stream_capture(tmp_path, mo
     from starlette.requests import Request
 
     from gateway import config
-    from gateway import proxy as proxy_mod
+    from gateway import capture
 
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     (tmp_path / "capture.flag").write_text("", encoding="utf-8")
@@ -764,7 +781,7 @@ def test_header_capture_uses_the_same_secret_list_as_stream_capture(tmp_path, mo
         }
     )
 
-    proxy_mod._maybe_capture_headers(request, {}, 0)
+    capture.maybe_capture_headers(request, {}, 0)
 
     dump = json.loads((tmp_path / "captured_headers.json").read_text("utf-8"))
     assert dump["authorization"] == "<redacted>"
@@ -922,7 +939,7 @@ def test_autostart_powershell_quoting_escapes_apostrophes():
     """安装路径里有撇号（用户名 O'Brien 那种）不能破坏脚本，更不能注入。"""
     from gateway.autostart import _ps_quote
 
-    assert _ps_quote("C:\O'Brien\main.py") == "'C:\O''Brien\main.py'"
+    assert _ps_quote(r"C:\O'Brien\main.py") == r"'C:\O''Brien\main.py'"
 
 
 def _scope(**headers: str) -> dict:

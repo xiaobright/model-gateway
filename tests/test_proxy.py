@@ -94,10 +94,8 @@ def test_import_models_and_switch_without_interrupting_stream(gateway):
         pulled = gateway.get(f"/admin/api/groups/{g_a}/remote-models").json()["models"]
         assert set(pulled) == {"gpt-test", "claude-test"}
 
-        added = gateway.post(
-            "/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": pulled}
-        ).json()
-        assert added == {"added": 2, "skipped": []}
+        added = [add_route(gateway, model, g_a) for model in pulled]
+        assert len(set(added)) == 2
 
         r_b = add_route(gateway, "gpt-test", g_b, "gpt-test")
 
@@ -127,7 +125,7 @@ def test_import_models_and_switch_without_interrupting_stream(gateway):
 def test_upstream_error_is_passed_through(gateway):
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
 
         resp = gateway.post("/v1/responses", json={"model": "gpt-test", "fail": True})
         assert resp.status_code == 429
@@ -137,7 +135,7 @@ def test_upstream_error_is_passed_through(gateway):
 def test_responses_tools_and_context_management_are_transparent(gateway):
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
 
         body = {
             "model": "gpt-test",
@@ -319,7 +317,7 @@ def test_header_override_applied_per_upstream(gateway):
         assert r.status_code == 200, r.text
         assert r.json()["header_override"] == override
 
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
         resp = gateway.post(
             "/v1/responses",
             json={"model": "gpt-test"},
@@ -337,7 +335,7 @@ def test_connect_failure_is_logged_as_502(gateway):
         "/admin/api/upstreams", json={"name": "dead", "base_url": "http://127.0.0.1:1"}
     ).json()
     gid = add_group(gateway, int(created["id"]), "openai")
-    gateway.post("/admin/api/models/bulk-add", json={"group_id": gid, "model_names": ["ghost"]})
+    add_route(gateway, "ghost", gid)
 
     assert gateway.post("/v1/responses", json={"model": "ghost"}).status_code == 502
     row = gateway.get("/admin/api/requests").json()[0]
@@ -349,7 +347,7 @@ def test_client_disconnect_mid_stream_is_recorded_and_gateway_survives(gateway):
     """客户端中途断开不能让转发协程炸掉，也不能漏掉这条记录。"""
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
 
         with gateway.stream("POST", "/v1/responses", json={"model": "gpt-test", "stream": True}) as stream:
             assert stream.status_code == 200
@@ -367,7 +365,7 @@ def test_client_leaving_after_completion_event_is_not_flagged(gateway):
     """上游发完完成事件却不收连接、客户端拿到就走 —— 这是正常收尾，不能记成客户端断开。"""
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
 
         with gateway.stream(
             "POST", "/v1/responses", json={"model": "gpt-test", "stream": True, "mode": "lingering"}
@@ -385,7 +383,7 @@ def test_completion_marker_split_across_chunks_is_detected(gateway):
     """完成标记被切在两个 chunk 之间时也要认出来，否则会误报截断。"""
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
 
         resp = gateway.post("/v1/responses", json={"model": "gpt-test", "stream": True, "mode": "split_marker"})
         assert resp.status_code == 200

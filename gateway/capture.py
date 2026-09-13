@@ -35,9 +35,15 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from gateway import config
+from fastapi import Request
+
+from . import config
+from .reqlog import log
+
+if TYPE_CHECKING:
+    from . import db
 
 FLAG_NAME = "capture-stream.flag"
 OUT_DIRNAME = "captured_stream"
@@ -59,10 +65,6 @@ def flag_path() -> Path:
 def out_root() -> Path:
     """抓包产物根目录（管理接口列目录时用）。"""
     return config.DATA_DIR / OUT_DIRNAME
-
-
-# 内部都走 out_root()，别再单独拼路径。
-_out_root = out_root
 
 
 def _read_spec() -> dict[str, Any]:
@@ -129,7 +131,7 @@ def status() -> dict[str, Any]:
         "enabled": spec is not None,
         "remaining": remaining,
         "max": (spec or {}).get("max", DEFAULT_MAX_REQUESTS),
-        "out_dir": str(_out_root()),
+        "out_dir": str(out_root()),
     }
 
 
@@ -160,7 +162,7 @@ class StreamCapture:
         # 这类在 Windows 上是路径分隔/保留字符，原样拼进去能逃出 captured_stream。
         model = re.sub(r"[^A-Za-z0-9._-]+", "_", str(meta.get("model") or "unknown"))[:40]
         model = model.strip("._") or "unknown"
-        root = _out_root().resolve()
+        root = out_root().resolve()
         target = (root / f"{stamp}-{next(_seq):03d}-{model}").resolve()
         if target.parent != root:
             raise ValueError(f"抓包目录名不合法：{meta.get('model')!r}")
@@ -257,3 +259,221 @@ def finish(cap: StreamCapture | None, **extra: Any) -> None:
                 flag_path().unlink()
             except FileNotFoundError:
                 pass
+
+
+# ---------------------------------------------------------------- 请求形状 / 压缩诊断
+
+
+def capability_summary(payload: dict) -> str:
+    """为排查工具/压缩兼容性记录脱敏摘要，不落请求参数或输入内容。"""
+    parts: list[str] = []
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        names = []
+        for item in tools[:16]:
+            if isinstance(item, dict):
+                names.append(str(item.get("type") or item.get("name") or "?"))
+            else:
+                names.append("?")
+        suffix = ",".join(names)
+        if len(tools) > 16:
+            suffix += ",..."
+        parts.append(f"tools={len(tools)}[{suffix}]")
+    if "context_management" in payload:
+        parts.append("context_management=present")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _input_item_census(payload: dict) -> tuple[dict[str, int], dict[str, int]]:
+    """数一遍 input 里各 item 的 type 和「type:role」。
+
+    为什么连 role 一起数：Codex Desktop 的 "responses lite" 线格式不发顶层 `instructions`，
+    系统提示词是 `role: "developer"` 的 message item —— 只看 type 会以为「全是普通 message」，
+    而 role 一旦原样透传就会被上游 422。抓形状时就该看见它。
+    """
+    input_value = payload.get("input")
+    input_items = input_value if isinstance(input_value, list) else [input_value]
+    types: dict[str, int] = {}
+    roles: dict[str, int] = {}
+    for item in input_items:
+        if isinstance(item, dict):
+            item_type = str(item.get("type", "?"))
+            role = item.get("role")
+            if isinstance(role, str) and role:
+                key = f"{item_type}:{role}"
+                roles[key] = roles.get(key, 0) + 1
+        else:
+            item_type = type(item).__name__
+        types[item_type] = types.get(item_type, 0) + 1
+    return types, roles
+
+
+def _tool_brief(value: object, depth: int = 0) -> object:
+    """工具形状摘要：递归保留结构，长字符串截断 —— 抓包是为了看形状，不是存内容。"""
+    if isinstance(value, Mapping):
+        if depth > 4:
+            return "..."
+        return {
+            str(key): _tool_brief(item, depth + 1)
+            for key, item in value.items()
+            if key not in ("parameters",) or depth < 2
+        }
+    if isinstance(value, list):
+        return [_tool_brief(item, depth + 1) for item in value[:8]] + (
+            ["..."] if len(value) > 8 else []
+        )
+    if isinstance(value, str):
+        return value[:160] + f"...({len(value)}B)" if len(value) > 160 else value
+    return value
+
+
+def maybe_capture_headers(request: Request, payload: dict, body_len: int) -> None:
+    """调试用：放一个 data/capture.flag，下一请求的头和形状会被脱敏记录。"""
+    flag = config.DATA_DIR / "capture.flag"
+    if not flag.exists():
+        return
+    dump = {
+        k: ("<redacted>" if is_secret_header(k) else v)
+        for k, v in request.headers.items()
+    }
+    input_types, input_roles = _input_item_census(payload)
+    # 工具连容器一起记：`namespace` 这个坑就是抓包只记个数才漏掉的
+    tool_briefs = _tool_brief(payload.get("tools") or [])
+    extra_tools = [
+        item.get("tools")
+        for item in (payload.get("input") if isinstance(payload.get("input"), list) else [])
+        if isinstance(item, Mapping) and item.get("type") == "additional_tools"
+    ]
+    shape = {
+        "path": request.url.path,
+        "body_bytes": body_len,
+        "top_level_keys": sorted(str(key) for key in payload),
+        "input_item_types": input_types,
+        # 连 role 一起记：`developer` 是从这里看出来的
+        "input_item_roles": input_roles,
+        "tools_count": len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
+        "tools_shape": tool_briefs,
+        "additional_tools_shape": [_tool_brief(tools) for tools in extra_tools if tools is not None],
+        "has_context_management": "context_management" in payload,
+        "content_encoding": request.headers.get("content-encoding", ""),
+        "codex_beta_features": request.headers.get("x-codex-beta-features", ""),
+    }
+    try:
+        (config.DATA_DIR / "captured_headers.json").write_text(
+            json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (config.DATA_DIR / "captured_request_shape.json").write_text(
+            json.dumps(shape, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        flag.unlink()
+        log("captured real client headers and request shape to data/captured_*.json")
+    except OSError:
+        pass
+
+
+def compaction_requested(path: str) -> bool:
+    """Whether the one-shot compaction observation flag is armed."""
+    return (path.endswith("/responses") or path.endswith("/responses/compact")) and (
+        config.DATA_DIR / "compaction_capture.flag"
+    ).exists()
+
+
+def _has_compaction_trigger(payload: dict) -> bool:
+    input_items = payload.get("input")
+    if not isinstance(input_items, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "compaction_trigger"
+        for item in input_items
+    )
+
+
+def _probe_request_shape(payload: dict) -> dict[str, object]:
+    """Return only the request shape needed to diagnose client-side compaction."""
+    input_types, _ = _input_item_census(payload)
+    return {
+        "top_level_keys": sorted(str(key) for key in payload),
+        "input_item_types": input_types,
+        "tools_count": len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
+        "has_context_management": "context_management" in payload,
+        "has_compaction_trigger": _has_compaction_trigger(payload),
+    }
+
+
+def response_types(value: object, counts: dict[str, int] | None = None) -> dict[str, int]:
+    """Count JSON ``type`` fields without retaining response content."""
+    result = counts if counts is not None else {}
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if isinstance(kind, str):
+            result[kind] = result.get(kind, 0) + 1
+        for child in value.values():
+            response_types(child, result)
+    elif isinstance(value, list):
+        for child in value:
+            response_types(child, result)
+    return result
+
+
+def write_compaction_capture(
+    *,
+    request: Request,
+    payload: dict,
+    route: db.Route,
+    remote_model: str,
+    status: int,
+    stream: bool,
+    req_bytes: int,
+    resp_bytes: int,
+    elapsed: float,
+    observations: list[dict[str, object]],
+    response_event_types: dict[str, int] | None = None,
+    response_payload_types: dict[str, int] | None = None,
+) -> None:
+    """Write a count-only probe record, including negative evidence.
+
+    Keep the flag armed after an ordinary response so a later automatic
+    compaction can still be captured. A positive record is never overwritten by
+    subsequent ordinary turns.
+    """
+    flag = config.DATA_DIR / "compaction_capture.flag"
+    if not flag.exists():
+        return
+    capture_path = config.DATA_DIR / "compaction_capture.json"
+    if not observations and capture_path.exists():
+        try:
+            old = json.loads(capture_path.read_text(encoding="utf-8"))
+            if isinstance(old, dict) and old.get("found") is True:
+                return
+        except (OSError, ValueError, TypeError):
+            pass
+    capture = {
+        "captured_at_unix": time.time(),
+        "path": request.url.path,
+        "model": str(payload.get("model") or ""),
+        "remote_model": remote_model,
+        "upstream": route.upstream.name,
+        "group": route.group_name,
+        "status": status,
+        "stream": stream,
+        "request_bytes": req_bytes,
+        "response_bytes": resp_bytes,
+        "duration_ms": int(elapsed * 1000),
+        "found": bool(observations),
+        "x_codex_beta_features": request.headers.get("x-codex-beta-features", ""),
+        "request_shape": _probe_request_shape(payload),
+        "response_event_types": response_event_types or {},
+        "response_payload_types": response_payload_types or {},
+        "observations": observations,
+    }
+    try:
+        capture_path.write_text(
+            json.dumps(capture, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        if observations:
+            flag.unlink(missing_ok=True)
+            log(f"  compaction capture: {len(observations)} item event(s), encrypted lengths only; saved data/compaction_capture.json")
+        else:
+            log("  compaction probe: no compaction item in this response; flag remains armed")
+    except OSError as exc:
+        log(f"  compaction capture write failed: {exc.__class__.__name__}: {exc}")

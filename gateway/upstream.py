@@ -1,12 +1,30 @@
+"""上游连接：地址、鉴权、出口/TLS、共享连接池和模型列表读取。"""
+
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import ssl
+import urllib.request
 from pathlib import Path
 
 import httpx
 
 from . import config, protocols
+
+# connect 只给 8 秒：真库里 104 个 502 全是连不上，平均白等 16.6 秒（旧值是 15 秒的
+# connect 超时在磨）。握手 8 秒都完不成的站，也扛不住几十万 token 的请求体。
+PROXY_TIMEOUT = httpx.Timeout(connect=8.0, read=600.0, write=60.0, pool=600.0)
+PROXY_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
+
+# httpx 在 Windows 上会读注册表里的系统代理（Clash 之类），而注册表的 bypass 列表通常是空的，
+# 于是连本机上游都会绕一趟代理。回环地址一律直连。
+LOOPBACK = ("127.0.0.1", "localhost", "[::1]")
+
+# 「出口」的两个特殊值，其余一律当代理 URL（http:// 或 socks5://）
+EGRESS_SYSTEM = ""        # 跟随系统代理：httpx 自己去读环境变量和注册表
+EGRESS_DIRECT = "direct"  # 直连：把系统代理也关掉
 
 MODELS_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
@@ -124,15 +142,113 @@ def system_ssl_context() -> ssl.SSLContext | None:
         return None
 
 
+def loopback_mounts() -> dict[str, httpx.AsyncHTTPTransport]:
+    # 每个 client 要有自己的 transport（transport 自带连接池，会随 client 一起关闭）
+    return {f"all://{host}": httpx.AsyncHTTPTransport() for host in LOOPBACK}
+
+
+def client_args(egress: str) -> dict:
+    """按「出口」拼出建 client 要的那几个参数。
+
+    这是整件事唯一的开关：网关自己就是发请求的那个客户端，socket 是它自己开的，
+    所以按站换出口不需要任何代理内核 —— 内核的存在意义是替「不知道有代理」的进程
+    做拦截。
+
+    注意 `trust_env=False` 才是真的「直连」：httpx 不只看环境变量，在 Windows 上
+    还会读注册表里的系统代理。
+
+    回环 mounts 只在没指定代理时挂：它是用来抵消**隐式**的系统代理的（否则连本机
+    上游都要绕一趟 Clash）。明确给某个站指了代理，就按说的走 —— 真实场景里没人会给
+    127.0.0.1 的站配代理，而测试要的正是「字节真的从那扇门出去了」。
+
+    代理 URL 允许带 `#ca=<pem 路径>` 的尾巴（自签证书的 https 代理，VPS 上 gost 那扇门）。
+    怎么拆、怎么校验都在 upstream 里（split_ca / ca_context）—— 保存出口时和真正建 client
+    时走的是同一段代码，别在两处各写一份规则。
+    """
+    egress = (egress or "").strip()
+    proxy = None if egress in (EGRESS_SYSTEM, EGRESS_DIRECT) else egress
+    args: dict = {
+        "mounts": {} if proxy else loopback_mounts(),
+        "trust_env": egress == EGRESS_SYSTEM,
+        "proxy": proxy,
+    }
+    # 用 Windows 系统证书库验证上游 TLS。httpx 默认用自带的 CA 捆绑包，认不得
+    # 卡巴斯基这类「加密连接扫描」的 MITM 根证书 —— 明明 curl 能通、浏览器能通，
+    # 网关却 502 "self-signed certificate in certificate chain"（2026-09-11 实锤）。
+    # truststore 把系统库注入 ssl：杀软的根是用户自己机器上受信的，跟着走。
+    # 没装 truststore 就退回 httpx 默认行为。
+    ctx = system_ssl_context()
+    if ctx is not None:
+        args["verify"] = ctx
+    if proxy:
+        base, frag = split_ca(proxy)
+        if frag:
+            # httpx 连代理这一跳用的是 Proxy 对象上单独的 ssl_context，client 的
+            # verify 管不到它 —— 钉证书必须钉在这里
+            args["proxy"] = httpx.Proxy(httpx.URL(base), ssl_context=ca_context(frag))
+    return args
+
+
+_clients: dict[object, httpx.AsyncClient] = {}
+_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _system_proxy_signature() -> tuple[tuple[str, str], ...]:
+    """快照 httpx 会读取的系统代理配置，避免开关切换后继续复用旧 client。"""
+    return tuple(sorted(
+        (str(key).lower(), str(value))
+        for key, value in urllib.request.getproxies().items()
+    ))
+
+
+async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
+    """按「出口」复用 client，省掉每个请求一次 TLS 握手（对远端公益站是几百 ms 的差别）。
+
+    同一个出口和同一份系统代理配置复用一个 client。代理是建 client 时定的，没法按请求
+    换；系统代理开关变化后用新的配置签名建新 client。出口最多也就三五种，池子小得可以忽略。
+    """
+    global _client_loop
+    loop = asyncio.get_running_loop()
+    if _client_loop is not loop:
+        # 换 loop 了（托盘模式下服务跑在另一个线程里）。旧 client 的连接池绑着上一个
+        # loop，留着就是泄漏一批连接和 fd —— 而且它们已经没人能用了。
+        # 先占坑再清理：否则两个并发请求同时进这段，后完成者会把先完成者刚建的
+        # client 一起清掉（那段连接池就没人关了）
+        _client_loop = loop
+        await aclose_client()
+    cache_key: object = (
+        (EGRESS_SYSTEM, _system_proxy_signature())
+        if egress == EGRESS_SYSTEM else egress
+    )
+    client = _clients.get(cache_key)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS, **client_args(egress)
+        )
+        _clients[cache_key] = client
+    return client
+
+
+async def aclose_client() -> None:
+    # 先摘快照再关：并发 get_client 在等待期间新建的 client 不能被后到的清理扫掉。
+    # 不在这里改 _client_loop —— 谁切换 loop 谁负责记，清理只负责关连接。
+    snapshot = list(_clients.items())
+    for key, client in snapshot:
+        if _clients.get(key) is client:
+            del _clients[key]
+    for _, client in snapshot:
+        if not client.is_closed:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+
 async def fetch_remote_models(
     base_url: str, api_key: str, header_override: str = "", protocol: str = "openai",
     egress: str = "",
 ) -> tuple[str, ...]:
-    # 出口和转发共用一套规则（回环直连、'direct' 连系统代理也关掉），理由见 proxy.py。
+    # 出口和转发共用一套规则（回环直连、'direct' 连系统代理也关掉），规则见本模块的 client_args()。
     # 这里必须也按出口走：不然「只能走代理才通」的站转发是好的、拉列表却失败，
     # 最容易被误判成 key 填错了
-    from .proxy import client_args
-
     url = models_url(base_url)
     async with httpx.AsyncClient(timeout=MODELS_TIMEOUT, **client_args(egress)) as client:
         resp = await client.get(url, headers=build_headers(api_key, header_override, protocol))

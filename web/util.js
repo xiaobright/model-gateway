@@ -9,7 +9,7 @@ export const $ = (id) => document.getElementById(id);
 export const state = {
   upstreams: [],     // 每个供应商带着自己的 groups
   routes: [],
-  stats: null,      // /admin/api/stats：累计值 + 活跃流
+  stats: null,      // /admin/api/stats?live_only=true：只轮询内存中的活跃数
   overview: null,   // /admin/api/overview：时间线 + 健康 + 热度
   // /admin/api/failover：{enabled:{anthropic,openai}, breakers:[{group_id,cooling_ms,...}]}
   // 开关按接口分开：Claude 侧全是坏得勤的中转站，GPT 侧要花钱的站得手动确认

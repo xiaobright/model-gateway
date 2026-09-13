@@ -2,7 +2,7 @@
 
 这里放修改代码、接入客户端和排查故障时才需要的细节。日常使用请先看[首页](../README.md)。
 
-本文按 2026-09-12 的代码整理，不代表重新运行过全部测试，也不保证某个外部站点当前可用。
+本文随当前代码维护；测试结果应以本次实际运行的输出为准，不保证某个外部站点当前可用。
 
 ## 目录
 
@@ -25,14 +25,15 @@
 | --- | --- |
 | `main.py`、`gateway/server.py` | 启动、端口和退出。 |
 | `gateway/tray.py`、`gateway/autostart.py` | Windows 托盘、单实例检查和开机自启。 |
-| `gateway/proxy.py` | 接收请求，选择连接，转发响应，处理重试、中断和收尾。 |
+| `gateway/proxy.py` | 接收请求，选择候选，转发响应，处理重试、中断和收尾。 |
 | `gateway/protocols.py` | 各接口的名称、鉴权方式、结束事件、用量读取和页面展示信息。 |
 | `gateway/db.py` | 配置和记录的读写、数据库升级、模型候选查询。 |
 | `gateway/failover.py` | 重试规则、候选顺序和分组冷却。 |
-| `gateway/upstream.py` | 站点地址、请求头、证书和上游模型列表。 |
+| `gateway/upstream.py` | 站点地址、鉴权头、出口/TLS、共享连接池和上游模型列表。 |
 | `gateway/inflight.py` | 正在运行的请求、阶段、进度和单条中断。 |
 | `gateway/stats.py`、`gateway/reqlog.py` | 用量与健康统计、文本日志。 |
-| `gateway/capture.py`、`gateway/rewrite.py` | 临时保存请求/响应；按规则替换请求文本。 |
+| `gateway/capture.py` | 请求头/形状诊断、临时请求/响应抓包和压缩观察结果落盘。 |
+| `gateway/rewrite.py` | 按规则替换请求文本。 |
 | `gateway/admin.py`、`gateway/app.py` | 管理接口、本机访问限制和静态页面。 |
 | `web/app.js`、`web/views.js` | 页面入口、操作分发和显示内容。 |
 | `web/group-editor.js`、`web/async-state.js` | 分组编辑状态、迟到请求的处理和刷新合并。 |
@@ -69,15 +70,18 @@
 - 数据库里的接口标识是 `openai`（Responses）、`openai-chat`（Chat Completions）、`anthropic`（Messages）。不要把 `openai` 当成前两种格式的总称。
 - 一个供应商对应一个地址；同地址的多把 Key 放在不同分组，不重复建供应商。
 - 一个分组保存一把 Key 和一种接口。同一供应商内，分组按「接口 + 组名」区分。
-- 同一个客户端模型名只能属于一种接口，跨接口添加候选会返回 409。客户端从不匹配的接口调用会返回 404。
+- 同一个客户端模型名可以在多种接口下各有独立候选链；首选、顺序、转发和用量统计都按「模型名 + 接口」区分。
 - 同一模型可以在同一个分组里配置多个真实模型名；「模型 + 分组 + 真实模型名」完全相同才算重复。
 - 有候选的分组不能直接改接口。复制 Key 到另一种接口时，不要把它理解为候选和模型也已自动配好。
 - 上游模型目录只回答「这个分组有哪些模型」。候选被删除不会自动忘记目录；从目录移除模型则会连带删除指向它的候选，需要先确认。
 - 供应商/分组停用不删除客户端模型名；接口全局停用还会隐藏该接口的模型和相关历史，但数据保留。
+- 已配置但全部停用的链返回 404，不会落到另一个同档位模型；只有该接口下未配置的名字才尝试档位兼容。
 - `/v1/models` 通过 `anthropic-version` 请求头识别 Anthropic 客户端，只返回该接口的模型；其他情况返回未被全局关闭的接口下的模型。
 
-管理接口 `POST /admin/api/models/transfer` 支持复制、移动、合并模型候选：一次数据库操作中完成，保留分组与真实模型名，已有目标的首选和顺序不变。
-不同接口或已经过期的来源数据会被拒绝，不在这里做格式转换。
+旧编排的候选复制/移动接口和旧批量暴露接口已移除，历史实现见[旧编排查阅指引](orchestration-history.md)。
+当前新增候选用 `POST /admin/api/models`，上游目录登记用 `POST /admin/api/groups/{id}/models`，两种含义不要混用。
+`DELETE /admin/api/models` 用 `route_id` 删除单条，或用 `model_name` 与 `protocol` 删除一条链。
+旧 `group_id` 删除参数和其他未知参数会返回 400，避免把局部删除误当成整模型删除。
 
 ### “不转换格式”不等于所有字节都不改
 
@@ -158,6 +162,7 @@ $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = 'my-haiku'
 `status` 是触发状态码，`times` 是最多额外重发次数（上限 10），`delay_ms` 是重试前等待毫秒数。
 连接失败按 502 检查规则；未配规则就不做同站重试。规则用完才考虑换候选。
 400/422 由普通自动降级换下一个候选（见下表），也可以由明确配置的同站规则先重试。
+间隔期间仍响应客户端断开和实时页的手动中断；手动停止记 `manual_abort`，不再重试或换站。
 
 ### 自动换候选和冷却
 
@@ -181,7 +186,7 @@ $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = 'my-haiku'
 
 ### 等待时间
 
-`proxy.py` 的 httpx 超时设置是：连接 8 秒、读取 600 秒、写入 60 秒、等待连接池 600 秒。
+`upstream.py` 的 httpx 超时设置是：连接 8 秒、读取 600 秒、写入 60 秒、等待连接池 600 秒。
 连接超时不等于“8 秒内必须收到模型回复”。
 
 另外有默认 20 秒的「发呆超时」：流式要开始出正文、推理或工具参数之后才计时，非流式从第一块正文起算，
@@ -195,6 +200,11 @@ $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = 'my-haiku'
 异常残留的活跃项超过 12 分钟会在读取状态时清理，并写日志。
 
 `count_tokens` 请求也会显示和参与转发处理，但不计入正常请求的“进行中”数量、转发记录和用量累计。
+
+概览、健康和路由行次数共用所选时间窗，模型按「模型名 + 接口」聚合。热榜只展示前 8 名，
+`GET /admin/api/overview` 仍返回全部模型链的统计，其他路由不会因此丢失次数徽标。
+单独的 `/stats/series`、`/stats/upstreams`、`/stats/models` 接口已退役，避免重复维护同一份聚合入口。
+`GET /admin/api/stats` 保留累计统计；页面快轮用 `?live_only=true`，只读内存活跃数、不扫请求记录。
 
 ### token 数怎么理解
 
@@ -305,6 +315,11 @@ Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:8317/admin/api/capture-stre
 管理接口 `GET /admin/api/capture-stream` 看开关状态，`GET /admin/api/capture-stream/list` 列出抓包目录。
 另有 `data/capture.flag` 的一次性请求头诊断，会写 `data/captured_headers.json` 等诊断信息；同样不应未经检查就公开。
 
+压缩诊断单独由 `data/compaction_capture.flag` 开启，结果写入 `data/compaction_capture.json`：
+只记请求形状、事件类型和不透明内容的长度，不保存该内容原文；没有发现时继续等待，发现后收旗。
+普通转发不递归扫描压缩条目；流式抓包只额外计数事件类型，压缩扫描仅在自己的开关开启时运行。
+这只能证明观察到相应条目，不能单凭它宣称客户端后续复用成功。
+
 ## 请求文本替换
 
 管理页「上游站点 → 敏感词绕行」用于处理**已确认的固定文本误报**：
@@ -399,19 +414,19 @@ Get-ChildItem -LiteralPath '.\web' -Filter '*.js' -File | ForEach-Object {
     node --check $_.FullName
     if ($LASTEXITCODE -ne 0) { throw "JavaScript 语法检查失败：$($_.Name)" }
 }
-node tests/web_protocols.test.mjs
+npm --prefix web test
 git diff --check
 ```
 
 | 测试文件 | 主要检查 |
 | --- | --- |
 | `test_proxy`、`test_lifecycle` | 转发、模型与请求头、分块、结束判定、中断收尾。 |
-| `test_routing`、`test_route_transfer` | 候选选择、复制/移动、同接口限制和配置冲突。 |
+| `test_routing` | 候选选择、停用、同名多接口隔离和配置冲突。 |
 | `test_admin` | 管理接口、保存校验、模型目录、数据库升级。 |
 | `test_failover`、`test_same_retry` | 换候选、冷却、同站重试及限制。 |
 | `test_stats`、`test_inflight` | 用量、成功/失败统计、实时状态和取消。 |
 | `test_egress`、`test_units` | 代理、证书、工具函数与内容观察。 |
-| `web_protocols.test.mjs` | 协议选项、编辑状态和刷新等前端行为。 |
+| `web_protocols.test.mjs`、`web_app.test.mjs` | 协议选项、刷新队列、弹窗会话、模型列表重开与统计展示。 |
 
 测试使用临时数据库和模拟上游，不拿真实 `data/` 做演练。为了提速不能删必要断言、隐藏失败用例，或修改正式运行的超时/重试参数。
 语法检查不等于浏览器验证，模拟转发通过也不等于真实站点具备某项能力；报告时分开写。
@@ -419,11 +434,12 @@ git diff --check
 ## 修改前端时注意什么
 
 - 浏览器直接加载 ES 模块。`/static` 使用 `cache-control: no-store`，避免新旧模块混用。
-- 分组编辑每次打开都视为一次独立操作。A 分组迟到的结果、错误和收尾不能改到 B，也不能改到重新打开的 A。
+- 供应商、分组和候选弹窗每次打开都是新会话。迟到的结果、错误、刷新和 close 事件不能改新会话，即使两次打开的 id 相同或都是新建。
+- 保存目标与表单值在第一次等待前固定；写成功后先失效正确的缓存，恢复修改当前弹窗前再核对会话。模型列表的 busy 只用于提示，同会话由请求键去重，不能挡住关闭重开后的新请求。
 - 保存完成后的刷新，必须读取保存后的数据，不能拿保存前已发出的旧请求充数。
 - 同一类刷新不要重复堆积；不同入口更新同一份状态时也要防止旧结果覆盖新结果。
 - 保留未保存的表单输入。模型勾选立即生效，组名/接口/Key 需要保存，这两种操作不要混淆。
-- 后台大致每 3 秒更新进行中计数、15 秒更新配置/统计/记录，实时页另有 1 秒刷新；隐藏标签页或打开弹窗时暂停后台轮询。卡片计时在本地更新。
+- 非实时页每 3 秒只取内存活跃数；实时页用 1 秒 `/inflight` 刷新，不再叠加 3 秒轮询。每 15 秒更新配置/概览/记录；隐藏标签页或打开弹窗时暂停后台轮询。卡片计时在本地更新。
 - 确认框使用独立 `<dialog>`，提示条使用 `popover`，都需要显示在当前弹窗上方，不能只靠普通 `z-index`。
 
 改完按实际影响验证，不为了文件数量或抽象层数重写整个前端。

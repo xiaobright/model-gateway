@@ -8,7 +8,7 @@ import json
 import httpx
 import pytest
 
-from gateway import config, db, failover, inflight, proxy, stats
+from gateway import config, db, failover, inflight, proxy, stats, upstream as upstream_mod
 from gateway.app import create_app
 
 
@@ -49,7 +49,7 @@ def use_upstream(monkeypatch, client):
     async def get_client(egress=""):
         return client
 
-    monkeypatch.setattr(proxy, "get_client", get_client)
+    monkeypatch.setattr(upstream_mod, "get_client", get_client)
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
@@ -187,3 +187,118 @@ def test_manual_cancel_stops_only_the_selected_request(app, monkeypatch, phase):
                     await asyncio.gather(victim, other, return_exceptions=True)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["connect", "status"])
+@pytest.mark.parametrize("cancel_kind", ["manual", "task"])
+def test_retry_delay_is_cancellable_without_another_attempt(app, monkeypatch, failure, cancel_kind):
+    """30 秒重试间隔不实际等待：确认到达间隔后取消，两条错误分支都必须立即收尾。"""
+    for name in ("primary", "backup"):
+        provider = db.create_upstream(
+            name, f"https://{name}.example", egress="direct",
+            retry_rules='[{"status":400,"times":1,"delay_ms":30000},'
+                        '{"status":502,"times":1,"delay_ms":30000}]',
+        )
+        group = db.create_group(provider.id, "default", "anthropic")
+        db.add_model_route("m", group.id, "m")
+
+    async def run():
+        paused = asyncio.Event()
+        calls = []
+        original_wait = inflight.wait_for_upstream
+
+        async def wait(call, operation, timeout=None):
+            if call.trail and call.trail[-1]["note"] == "same_retry":
+                paused.set()
+            return await original_wait(call, operation, timeout)
+
+        monkeypatch.setattr(inflight, "wait_for_upstream", wait)
+
+        async def handle(request):
+            calls.append(request.url.host)
+            if failure == "connect":
+                raise httpx.ConnectError("test connection failure", request=request)
+            return httpx.Response(400, json={"error": "retry me"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle), trust_env=False) as upstream:
+            use_upstream(monkeypatch, upstream)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1") as client:
+                task = asyncio.create_task(client.post("/v1/messages", json={"model": "m"}))
+                try:
+                    await asyncio.wait_for(paused.wait(), 2)
+                    target = inflight.snapshot()["calls"][0]
+                    if cancel_kind == "manual":
+                        result = await client.post(f'/admin/api/inflight/{target["id"]}/cancel')
+                        assert result.json()["cancelled"] is True
+                        response = await asyncio.wait_for(task, 2)
+                        assert response.status_code == 499
+                    else:
+                        task.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await task
+                    note = "manual_abort" if cancel_kind == "manual" else "client_abort"
+                    assert calls == ["primary.example"], "取消间隔不能再同站重试或换站"
+                    assert failover.snapshot() == [], "取消不是站级故障"
+                    assert inflight.counts()["requests"] == 0
+                    assert inflight.snapshot()["recent"][0]["note"] == note
+                    assert [(r["status"], r["note"]) for r in reversed(db.recent_requests())] == [
+                        (502 if failure == "connect" else 400, "same_retry"),
+                    ], "间隔中取消没有新发送，不能虚增一条转发记录"
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["off", "stream", "compaction"])
+def test_forward_diagnostics_are_opt_in_and_include_the_final_frame(app, monkeypatch, mode):
+    from gateway import capture, protocols
+
+    configure_routes("openai")
+    if mode == "stream":
+        capture.enable(1)
+    elif mode == "compaction":
+        (config.DATA_DIR / "compaction_capture.flag").touch()
+    scans = []
+    observe = protocols.compaction_observations
+
+    def tracked(payload, **kwargs):
+        scans.append(payload)
+        return observe(payload, **kwargs)
+
+    monkeypatch.setattr(protocols, "compaction_observations", tracked)
+    raw = (
+        b'event: response.output_item.done\ndata: {"type":"response.output_item.done",'
+        b'"item":{"type":"compaction","id":"cmp_1","encrypted_content":"opaque-test"}}\n\n'
+        b'data: {"type":"response.completed"}'  # EOF 没有空行，必须 flush 后再写诊断
+    )
+
+    async def chunks():
+        yield raw
+
+    async def run():
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=Body(chunks()),
+        ))
+        async with httpx.AsyncClient(transport=transport, trust_env=False) as upstream:
+            use_upstream(monkeypatch, upstream)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1") as client:
+                response = await client.post("/v1/responses", json={"model": "m", "stream": True})
+                assert response.content == raw
+
+    asyncio.run(run())
+    assert db.recent_requests(1)[0]["note"] == "ok"
+    assert len(scans) == (2 if mode == "compaction" else 0)
+    if mode == "compaction":
+        result = json.loads((config.DATA_DIR / "compaction_capture.json").read_text("utf-8"))
+        assert result["found"]
+        assert result["response_payload_types"]["response.completed"] == 1
+        assert result["observations"][0]["encrypted_content_bytes"] == len("opaque-test")
+        assert "opaque-test" not in json.dumps(result)
+        assert not (config.DATA_DIR / "compaction_capture.flag").exists()
+    elif mode == "stream":
+        result = json.loads(next(capture.out_root().glob("*/meta.json")).read_text("utf-8"))
+        assert result["event_types"] == {"response.output_item.done": 1}
+        assert result["observer_ended"] is True

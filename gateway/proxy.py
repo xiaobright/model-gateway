@@ -4,8 +4,6 @@ import asyncio
 import contextlib
 import json
 import time
-import urllib.request
-from collections.abc import Mapping
 from typing import Any, AsyncIterator
 
 import httpx
@@ -15,7 +13,6 @@ from starlette.requests import ClientDisconnect
 
 from . import (
     capture,
-    config,
     db,
     failover,
     inflight,
@@ -27,20 +24,7 @@ from . import (
 from .reqlog import log
 from .upstream import endpoint as upstream_endpoint
 
-# connect 只给 8 秒：真库里 104 个 502 全是连不上，平均白等 16.6 秒（旧值是 15 秒的
-# connect 超时在磨）。握手 8 秒都完不成的站，也扛不住几十万 token 的请求体。
-PROXY_TIMEOUT = httpx.Timeout(connect=8.0, read=600.0, write=60.0, pool=600.0)
-PROXY_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
-
-# httpx 在 Windows 上会读注册表里的系统代理（Clash 之类），而注册表的 bypass 列表通常是空的，
-# 于是连本机上游都会绕一趟代理。回环地址一律直连。
-LOOPBACK = ("127.0.0.1", "localhost", "[::1]")
-
-# 「出口」的两个特殊值，其余一律当代理 URL（http:// 或 socks5://）
-EGRESS_SYSTEM = ""        # 跟随系统代理：httpx 自己去读环境变量和注册表
-EGRESS_DIRECT = "direct"  # 直连：把系统代理也关掉
-
-# 上游发呆超时：这么久没有任何新字节（含等响应头）就按「卡住」打断这条请求，
+# 上游发呆超时：开始输出内容后这么久没有新内容，就按「卡住」打断这条请求，
 # 让下游的客户端自己重发。不触发自动降级 —— 真库里的偶发卡住常常只影响一条连接
 # （并发其它请求都正常），换站会让同一条请求被处理两遍。0 = 关闭。
 STALL_TIMEOUT_KEY = "stall_timeout_s"
@@ -65,53 +49,6 @@ def set_stall_timeout(seconds: float) -> float:
     value = min(MAX_STALL_TIMEOUT_S, max(0.0, float(seconds)))
     db.set_setting(STALL_TIMEOUT_KEY, f"{value:g}")
     return value
-
-
-def loopback_mounts() -> dict[str, httpx.AsyncHTTPTransport]:
-    # 每个 client 要有自己的 transport（transport 自带连接池，会随 client 一起关闭）
-    return {f"all://{host}": httpx.AsyncHTTPTransport() for host in LOOPBACK}
-
-
-def client_args(egress: str) -> dict:
-    """按「出口」拼出建 client 要的那几个参数。
-
-    这是整件事唯一的开关：网关自己就是发请求的那个客户端，socket 是它自己开的，
-    所以按站换出口不需要任何代理内核 —— 内核的存在意义是替「不知道有代理」的进程
-    做拦截。
-
-    注意 `trust_env=False` 才是真的「直连」：httpx 不只看环境变量，在 Windows 上
-    还会读注册表里的系统代理。
-
-    回环 mounts 只在没指定代理时挂：它是用来抵消**隐式**的系统代理的（否则连本机
-    上游都要绕一趟 Clash）。明确给某个站指了代理，就按说的走 —— 真实场景里没人会给
-    127.0.0.1 的站配代理，而测试要的正是「字节真的从那扇门出去了」。
-
-    代理 URL 允许带 `#ca=<pem 路径>` 的尾巴（自签证书的 https 代理，VPS 上 gost 那扇门）。
-    怎么拆、怎么校验都在 upstream 里（split_ca / ca_context）—— 保存出口时和真正建 client
-    时走的是同一段代码，别在两处各写一份规则。
-    """
-    egress = (egress or "").strip()
-    proxy = None if egress in (EGRESS_SYSTEM, EGRESS_DIRECT) else egress
-    args: dict = {
-        "mounts": {} if proxy else loopback_mounts(),
-        "trust_env": egress == EGRESS_SYSTEM,
-        "proxy": proxy,
-    }
-    # 用 Windows 系统证书库验证上游 TLS。httpx 默认用自带的 CA 捆绑包，认不得
-    # 卡巴斯基这类「加密连接扫描」的 MITM 根证书 —— 明明 curl 能通、浏览器能通，
-    # 网关却 502 "self-signed certificate in certificate chain"（2026-09-11 实锤）。
-    # truststore 把系统库注入 ssl：杀软的根是用户自己机器上受信的，跟着走。
-    # 没装 truststore 就退回 httpx 默认行为。
-    ctx = upstream_mod.system_ssl_context()
-    if ctx is not None:
-        args["verify"] = ctx
-    if proxy:
-        base, frag = upstream_mod.split_ca(proxy)
-        if frag:
-            # httpx 连代理这一跳用的是 Proxy 对象上单独的 ssl_context，client 的
-            # verify 管不到它 —— 钉证书必须钉在这里
-            args["proxy"] = httpx.Proxy(httpx.URL(base), ssl_context=upstream_mod.ca_context(frag))
-    return args
 
 
 # 逐跳头（RFC 7230 8.1.2.2）：只属于当前这一跳，代理必须剥掉；Connection 头里
@@ -190,59 +127,6 @@ MODEL_CREATED_AT = "2025-01-01T00:00:00Z"
 
 router = APIRouter()
 
-_clients: dict[object, httpx.AsyncClient] = {}
-_client_loop: asyncio.AbstractEventLoop | None = None
-
-
-def _system_proxy_signature() -> tuple[tuple[str, str], ...]:
-    """快照 httpx 会读取的系统代理配置，避免开关切换后继续复用旧 client。"""
-    return tuple(sorted(
-        (str(key).lower(), str(value))
-        for key, value in urllib.request.getproxies().items()
-    ))
-
-
-async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
-    """按「出口」复用 client，省掉每个请求一次 TLS 握手（对远端公益站是几百 ms 的差别）。
-
-    同一个出口和同一份系统代理配置复用一个 client。代理是建 client 时定的，没法按请求
-    换；系统代理开关变化后用新的配置签名建新 client。出口最多也就三五种，池子小得可以忽略。
-    """
-    global _client_loop
-    loop = asyncio.get_running_loop()
-    if _client_loop is not loop:
-        # 换 loop 了（托盘模式下服务跑在另一个线程里）。旧 client 的连接池绑着上一个
-        # loop，留着就是泄漏一批连接和 fd —— 而且它们已经没人能用了。
-        # 先占坑再清理：否则两个并发请求同时进这段，后完成者会把先完成者刚建的
-        # client 一起清掉（那段连接池就没人关了）
-        _client_loop = loop
-        await aclose_client()
-    cache_key: object = (
-        (EGRESS_SYSTEM, _system_proxy_signature())
-        if egress == EGRESS_SYSTEM else egress
-    )
-    client = _clients.get(cache_key)
-    if client is None or client.is_closed:
-        client = httpx.AsyncClient(
-            timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS, **client_args(egress)
-        )
-        _clients[cache_key] = client
-    return client
-
-
-async def aclose_client() -> None:
-    # 先摘快照再关：并发 get_client 在等待期间新建的 client 不能被后到的清理扫掉。
-    # 不在这里改 _client_loop —— 谁切换 loop 谁负责记，清理只负责关连接。
-    snapshot = list(_clients.items())
-    for key, client in snapshot:
-        if _clients.get(key) is client:
-            del _clients[key]
-    for _, client in snapshot:
-        if not client.is_closed:
-            with contextlib.suppress(Exception):
-                await client.aclose()
-
-
 class ClientDisconnected(Exception):
     """下游在等待上游响应头时已经断开。"""
 
@@ -300,225 +184,6 @@ def _client_label(ua: str) -> str:
     if ua.startswith("claude-cli"):
         return "Claude Code"
     return ua.split("/")[0].strip()[:24] or "unknown"
-
-
-def _capability_summary(payload: dict) -> str:
-    """为排查工具/压缩兼容性记录脱敏摘要，不落请求参数或输入内容。"""
-    parts: list[str] = []
-    tools = payload.get("tools")
-    if isinstance(tools, list):
-        names = []
-        for item in tools[:16]:
-            if isinstance(item, dict):
-                names.append(str(item.get("type") or item.get("name") or "?"))
-            else:
-                names.append("?")
-        suffix = ",".join(names)
-        if len(tools) > 16:
-            suffix += ",..."
-        parts.append(f"tools={len(tools)}[{suffix}]")
-    if "context_management" in payload:
-        parts.append("context_management=present")
-    return (" " + " ".join(parts)) if parts else ""
-
-
-def _input_item_census(payload: dict) -> tuple[dict[str, int], dict[str, int]]:
-    """数一遍 input 里各 item 的 type 和「type:role」。
-
-    为什么连 role 一起数：Codex Desktop 的 "responses lite" 线格式不发顶层 `instructions`，
-    系统提示词是 `role: "developer"` 的 message item —— 只看 type 会以为「全是普通 message」，
-    而 role 一旦原样透传就会被上游 422。抓形状时就该看见它。
-    """
-    input_value = payload.get("input")
-    input_items = input_value if isinstance(input_value, list) else [input_value]
-    types: dict[str, int] = {}
-    roles: dict[str, int] = {}
-    for item in input_items:
-        if isinstance(item, dict):
-            item_type = str(item.get("type", "?"))
-            role = item.get("role")
-            if isinstance(role, str) and role:
-                key = f"{item_type}:{role}"
-                roles[key] = roles.get(key, 0) + 1
-        else:
-            item_type = type(item).__name__
-        types[item_type] = types.get(item_type, 0) + 1
-    return types, roles
-
-
-def _tool_brief(value: object, depth: int = 0) -> object:
-    """工具形状摘要：递归保留结构，长字符串截断 —— 抓包是为了看形状，不是存内容。"""
-    if isinstance(value, Mapping):
-        if depth > 4:
-            return "..."
-        return {
-            str(key): _tool_brief(item, depth + 1)
-            for key, item in value.items()
-            if key not in ("parameters",) or depth < 2
-        }
-    if isinstance(value, list):
-        return [_tool_brief(item, depth + 1) for item in value[:8]] + (
-            ["..."] if len(value) > 8 else []
-        )
-    if isinstance(value, str):
-        return value[:160] + f"...({len(value)}B)" if len(value) > 160 else value
-    return value
-
-
-def _maybe_capture_headers(request: Request, payload: dict, body_len: int) -> None:
-    """调试用：放一个 data/capture.flag，下一请求的头和形状会被脱敏记录。"""
-    flag = config.DATA_DIR / "capture.flag"
-    if not flag.exists():
-        return
-    dump = {
-        k: ("<redacted>" if capture.is_secret_header(k) else v)
-        for k, v in request.headers.items()
-    }
-    input_types, input_roles = _input_item_census(payload)
-    # 工具连容器一起记：`namespace` 这个坑就是抓包只记个数才漏掉的
-    tool_briefs = _tool_brief(payload.get("tools") or [])
-    extra_tools = [
-        item.get("tools")
-        for item in (payload.get("input") if isinstance(payload.get("input"), list) else [])
-        if isinstance(item, Mapping) and item.get("type") == "additional_tools"
-    ]
-    shape = {
-        "path": request.url.path,
-        "body_bytes": body_len,
-        "top_level_keys": sorted(str(key) for key in payload),
-        "input_item_types": input_types,
-        # 连 role 一起记：`developer` 是从这里看出来的
-        "input_item_roles": input_roles,
-        "tools_count": len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
-        "tools_shape": tool_briefs,
-        "additional_tools_shape": [_tool_brief(tools) for tools in extra_tools if tools is not None],
-        "has_context_management": "context_management" in payload,
-        "content_encoding": request.headers.get("content-encoding", ""),
-        "codex_beta_features": request.headers.get("x-codex-beta-features", ""),
-    }
-    try:
-        (config.DATA_DIR / "captured_headers.json").write_text(
-            json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        (config.DATA_DIR / "captured_request_shape.json").write_text(
-            json.dumps(shape, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        flag.unlink()
-        log("captured real client headers and request shape to data/captured_*.json")
-    except OSError:
-        pass
-
-
-def _compaction_capture_requested(path: str) -> bool:
-    """Whether the one-shot compaction observation flag is armed."""
-    return path.endswith("/responses") or path.endswith("/responses/compact")
-
-
-def _has_compaction_trigger(payload: dict) -> bool:
-    input_items = payload.get("input")
-    if not isinstance(input_items, list):
-        return False
-    return any(
-        isinstance(item, dict) and item.get("type") == "compaction_trigger"
-        for item in input_items
-    )
-
-
-def _probe_request_shape(payload: dict) -> dict[str, object]:
-    """Return only the request shape needed to diagnose client-side compaction."""
-    input_value = payload.get("input")
-    input_items = input_value if isinstance(input_value, list) else [input_value]
-    input_types: dict[str, int] = {}
-    for item in input_items:
-        item_type = item.get("type", "?") if isinstance(item, dict) else type(item).__name__
-        key = str(item_type)
-        input_types[key] = input_types.get(key, 0) + 1
-    return {
-        "top_level_keys": sorted(str(key) for key in payload),
-        "input_item_types": input_types,
-        "tools_count": len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
-        "has_context_management": "context_management" in payload,
-        "has_compaction_trigger": _has_compaction_trigger(payload),
-    }
-
-
-def _probe_response_types(value: object, counts: dict[str, int] | None = None) -> dict[str, int]:
-    """Count JSON ``type`` fields without retaining response content."""
-    result = counts if counts is not None else {}
-    if isinstance(value, dict):
-        kind = value.get("type")
-        if isinstance(kind, str):
-            result[kind] = result.get(kind, 0) + 1
-        for child in value.values():
-            _probe_response_types(child, result)
-    elif isinstance(value, list):
-        for child in value:
-            _probe_response_types(child, result)
-    return result
-
-
-def _write_compaction_capture(
-    *,
-    request: Request,
-    payload: dict,
-    route: db.Route,
-    remote_model: str,
-    status: int,
-    stream: bool,
-    req_bytes: int,
-    resp_bytes: int,
-    elapsed: float,
-    observations: list[dict[str, object]],
-    response_event_types: dict[str, int] | None = None,
-    response_payload_types: dict[str, int] | None = None,
-) -> None:
-    """Write a count-only probe record, including negative evidence.
-
-    Keep the flag armed after an ordinary response so a later automatic
-    compaction can still be captured. A positive record is never overwritten by
-    subsequent ordinary turns.
-    """
-    flag = config.DATA_DIR / "compaction_capture.flag"
-    if not flag.exists():
-        return
-    capture_path = config.DATA_DIR / "compaction_capture.json"
-    if not observations and capture_path.exists():
-        try:
-            old = json.loads(capture_path.read_text(encoding="utf-8"))
-            if isinstance(old, dict) and old.get("found") is True:
-                return
-        except (OSError, ValueError, TypeError):
-            pass
-    capture = {
-        "captured_at_unix": time.time(),
-        "path": request.url.path,
-        "model": str(payload.get("model") or ""),
-        "remote_model": remote_model,
-        "upstream": route.upstream.name,
-        "group": route.group_name,
-        "status": status,
-        "stream": stream,
-        "request_bytes": req_bytes,
-        "response_bytes": resp_bytes,
-        "duration_ms": int(elapsed * 1000),
-        "found": bool(observations),
-        "x_codex_beta_features": request.headers.get("x-codex-beta-features", ""),
-        "request_shape": _probe_request_shape(payload),
-        "response_event_types": response_event_types or {},
-        "response_payload_types": response_payload_types or {},
-        "observations": observations,
-    }
-    try:
-        capture_path.write_text(
-            json.dumps(capture, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        if observations:
-            flag.unlink(missing_ok=True)
-            log(f"  compaction capture: {len(observations)} item event(s), encrypted lengths only; saved data/compaction_capture.json")
-        else:
-            log("  compaction probe: no compaction item in this response; flag remains armed")
-    except OSError as exc:
-        log(f"  compaction capture write failed: {exc.__class__.__name__}: {exc}")
 
 
 def _build_headers(
@@ -601,10 +266,7 @@ async def forward(
         payload = scrubbed
         log(f"POST {endpoint} 敏感词绕行：命中 {rewrite_hits} 处")
 
-    compaction_capture = (
-        _compaction_capture_requested(endpoint)
-        and (config.DATA_DIR / "compaction_capture.flag").exists()
-    )
+    compaction_capture = capture.compaction_requested(endpoint)
     requested = str(payload.get("model", ""))
     asked, flag = naming.split_model(requested)
     normal_chain = db.resolve_chain(asked, proto.name)
@@ -692,15 +354,36 @@ async def forward(
         """
         return failover.next_index(candidates, index + 1, dead_groups)
 
+    def abort_request(note: str, *, record_attempt: bool = True) -> JSONResponse:
+        """首字前中断：发送等待、重试间隔共用收尾，不把手动取消记成上游故障。"""
+        inflight.finish(call, status=499, note=note)
+        if record and record_attempt:
+            _record(
+                request=request, route=last_route or route, proto=proto, model=asked,
+                remote_model=remote, status=499, stream_flag=stream_flag,
+                req_bytes=len(sent_body), resp_bytes=0, elapsed=time.monotonic() - began,
+                usage=NO_USAGE, note=note, attempt=attempt,
+            )
+        return _error(proto, 499, "请求已手动中断" if note == "manual_abort" else "客户端已断开")
+
     async def same_retry_pause(delay_s: float) -> bool:
-        """同站重试前的间隔；客户端已经走了就返回 False。"""
-        if delay_s > 0:
+        """重试间隔也登记为可取消的等待；False 表示手动中断或客户端已离开。"""
+        async def pause() -> bool:
             end = time.monotonic() + delay_s
             while time.monotonic() < end:
                 if await request.is_disconnected():
                     return False
-                await asyncio.sleep(min(0.05, max(0.0, end - time.monotonic())))
-        return True
+                await asyncio.sleep(min(RESPONSE_POLL, max(0.0, end - time.monotonic())))
+            return True
+
+        try:
+            return await inflight.wait_for_upstream(call, pause())
+        except inflight.ManualAbort:
+            return False
+        except asyncio.CancelledError:
+            # 前一次失败已落库，间隔中取消没有发出新请求，不虚增转发次数。
+            abort_request("client_abort", record_attempt=False)
+            raise
 
     # 每个上游在本次请求里已经同站重试过几次（键是 upstream.id）
     same_counts: dict[int, int] = {}
@@ -742,7 +425,7 @@ async def forward(
                 {**payload, "model": remote}, ensure_ascii=False, separators=(",", ":")
             ).encode()
 
-        _maybe_capture_headers(request, payload, len(body))
+        capture.maybe_capture_headers(request, payload, len(body))
         # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
@@ -756,7 +439,7 @@ async def forward(
             # 出口是**供应商**的属性，而每个候选可能属于不同的供应商，所以 client 在循环里取。
             # 放在 try 里：出口配坏了（比如 #ca 指的证书被删了）是「这扇门不通」，
             # 按连不上处理、降级换下一扇，而不是整个请求 500
-            client = await get_client(route.upstream.egress)
+            client = await upstream_mod.get_client(route.upstream.egress)
             resp = await inflight.wait_for_upstream(
                 call,
                 _send_until_headers(
@@ -768,40 +451,16 @@ async def forward(
         except inflight.ManualAbort:
             elapsed = time.monotonic() - began
             log(f"POST {endpoint} model={requested!r} -> 499 (手动中断) after {elapsed:.1f}s")
-            inflight.finish(call, status=499, note="manual_abort")
-            if record:
-                _record(
-                    request=request, route=route, proto=proto, model=asked,
-                    remote_model=remote, status=499, stream_flag=stream_flag,
-                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
-                    usage=NO_USAGE, note="manual_abort", attempt=attempt,
-                )
-            return _error(proto, 499, "请求已手动中断")
+            return abort_request("manual_abort")
         except ClientDisconnected:
             elapsed = time.monotonic() - began
             log(
                 f"POST {endpoint} model={requested!r} upstream={route.upstream.name} -> 499 "
                 f"(客户端在等待响应头时断开) after {elapsed:.1f}s req={len(sent_body)}B"
             )
-            inflight.finish(call, status=499, note="client_abort")
-            if record:
-                _record(
-                    request=request, route=route, proto=proto, model=asked,
-                    remote_model=remote, status=499, stream_flag=stream_flag,
-                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
-                    usage=NO_USAGE, note="client_abort", attempt=attempt,
-                )
-            return _error(proto, 499, "客户端已断开")
+            return abort_request("client_abort")
         except asyncio.CancelledError:
-            elapsed = time.monotonic() - began
-            inflight.finish(call, status=499, note="client_abort")
-            if record:
-                _record(
-                    request=request, route=route, proto=proto, model=asked,
-                    remote_model=remote, status=499, stream_flag=stream_flag,
-                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
-                    usage=NO_USAGE, note="client_abort", attempt=attempt,
-                )
+            abort_request("client_abort")
             raise
         except (httpx.HTTPError, httpx.InvalidURL, ImportError, ValueError) as exc:
             fail, resp = exc, None
@@ -830,8 +489,7 @@ async def forward(
                         usage=NO_USAGE, note="same_retry", attempt=attempt,
                     )
                 if not await same_retry_pause(delay):
-                    client_left = True
-                    log("  客户端已断开，不再同站重试")
+                    client_left = not call.cancel_requested
                     break
                 fail = None
                 same_mode = True
@@ -860,7 +518,7 @@ async def forward(
             f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
             f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
             f"req={len(sent_body)}B ua={request.headers.get('user-agent', '')[:48]!r}"
-            f"{_capability_summary(payload)}"
+            f"{capture.capability_summary(payload)}"
             f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
         )
 
@@ -891,8 +549,7 @@ async def forward(
                 )
             resp = None
             if not await same_retry_pause(delay):
-                client_left = True
-                log("  客户端已断开，不再同站重试")
+                client_left = not call.cancel_requested
                 break
             same_mode = True
             continue
@@ -951,14 +608,10 @@ async def forward(
         index = nxt
 
     if resp is None:
-        if client_left:
-            # 客户端在重试间隙走了：这不是上游的锅，记 499 让排障一眼看清
-            inflight.finish(call, status=499, note="client_abort")
-            return _error(proto, 499, "客户端已断开")
         if call.cancel_requested:
-            # 中断恰好落在「没有候选可试」的那一瞬：也按手动中断记账
-            inflight.finish(call, status=499, note="manual_abort")
-            return _error(proto, 499, "请求已手动中断")
+            return abort_request("manual_abort", record_attempt=False)
+        if client_left:
+            return abort_request("client_abort", record_attempt=False)
         blamed = last_route or route
         if fail is not None:
             why = f"上游 {blamed.upstream.name} 请求失败: {fail}"
@@ -1003,7 +656,9 @@ async def forward(
         response_event_types: dict[str, int] = {}
         response_payload_types: dict[str, int] = {}
         content_type = upstream_resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        observer = protocols.SSEObserver(proto) if content_type == "text/event-stream" else None
+        observer = protocols.SSEObserver(
+            proto, collect_types=cap is not None, collect_compaction=compaction_capture,
+        ) if content_type == "text/event-stream" else None
         json_body = bytearray()
         json_capped = False
         head = bytearray()
@@ -1045,10 +700,6 @@ async def forward(
                         if stall_s > 0 and observer.content_events > seen_content_events:
                             seen_content_events = observer.content_events
                             content_deadline = time.monotonic() + stall_s
-                        if compaction_capture:
-                            compaction_observations = list(observer.compaction_items)
-                            response_event_types = dict(observer.event_types)
-                            response_payload_types = dict(observer.payload_types)
                     except Exception as exc:
                         log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
                 else:
@@ -1099,6 +750,14 @@ async def forward(
             else:
                 log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
+            if observer is not None:
+                # flush 可能刚补完最后一帧；收尾时取一次，不在每个 chunk 复制诊断清单。
+                text_bytes, thinking = observer.text_bytes, observer.thinking
+                inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
+                if compaction_capture:
+                    compaction_observations = observer.compaction_items
+                    response_event_types = observer.event_types
+                    response_payload_types = observer.payload_types
             if cap is not None:
                 capture.finish(
                     cap,
@@ -1118,12 +777,12 @@ async def forward(
                         text_bytes, thinking = proto.count_json_content(json_payload)
                         if compaction_capture:
                             compaction_observations = protocols.compaction_observations(json_payload)
-                            response_payload_types = _probe_response_types(json_payload)
+                            response_payload_types = capture.response_types(json_payload)
                 except Exception as exc:
                     log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
             if compaction_capture:
-                _write_compaction_capture(
+                capture.write_compaction_capture(
                     request=request,
                     payload=payload,
                     route=won,

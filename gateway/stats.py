@@ -209,18 +209,20 @@ def upstream_health(rows: Iterable[dict] | None = None) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------- 模型热度
 
 
-def model_top(limit: int = 8, rows: Iterable[dict] | None = None) -> list[dict[str, Any]]:
-    grouped: dict[str, list[dict]] = defaultdict(list)
+def model_usage(rows: Iterable[dict] | None = None) -> list[dict[str, Any]]:
+    """所有模型链的用量；热榜只在展示时取前几名，不能裁掉路由行的使用徽标。"""
+    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for row in _all_rows() if rows is None else rows:
-        grouped[row["model"]].append(row)
+        grouped[(row["model"], row["protocol"])].append(row)
 
     out = []
-    for model, group in grouped.items():
+    for (model, protocol), group in grouped.items():
         durations = [r["duration_ms"] for r in group]
         bad = sum(1 for r in group if _failed(r))
         out.append(
             {
                 "model": model,
+                "protocol": protocol,
                 "n": len(group),
                 "bad": bad,
                 "avg": round(sum(durations) / len(durations)) if durations else 0,
@@ -230,7 +232,7 @@ def model_top(limit: int = 8, rows: Iterable[dict] | None = None) -> list[dict[s
             }
         )
     out.sort(key=lambda r: -r["n"])
-    return out[: max(1, limit)]
+    return out
 
 
 # ---------------------------------------------------------------- 概览合批
@@ -246,7 +248,7 @@ def _rows_in_window(window: str, rows: Iterable[dict]) -> tuple[dict, ...]:
     )
 
 
-def overview(window: str = DEFAULT_WINDOW, top: int = 8) -> dict[str, Any]:
+def overview(window: str = DEFAULT_WINDOW) -> dict[str, Any]:
     """概览视图一次拿全，省掉前端三次往返。所有聚合都只看当前时间窗。"""
     all_rows = _all_rows()
     rows = _rows_in_window(window, all_rows)
@@ -254,7 +256,7 @@ def overview(window: str = DEFAULT_WINDOW, top: int = 8) -> dict[str, Any]:
     return {
         "series": series(window, all_rows),
         "upstreams": upstream_health(rows),
-        "models": model_top(top, rows),
+        "models": model_usage(rows),
         "live": live(),
         "totals": {
             **stats,
@@ -273,17 +275,9 @@ def p95_overall(rows: Iterable[dict]) -> int:
 # 「实时」页上那个 `≈ N tok` 的标尺。转发记录里每一行都现成地放着字节数和上游报的
 # token 数，所以这个比值是真的从过往经验里量出来的，不是拍的常数。
 #
-# 两个方向量的**不是同一件事**，这一点必须写清楚：
-#
-# - 上行量的是「计费口径」，而且它是准的：请求体每个字符都算进输入，字节数和 token 数
-#   一一对应，所以上行的 `≈` 可以当计费量看
-# - 下行量的是「**收到手的内容**」。计费口径这边估不出来 —— 思维链发下来的是总结过的，
-#   而计费按完整的算，思维链越多差得越远。所以下行的标尺只认没有思维链的那些记录
-#   （正文是完整的，那种记录里收到的和计费的对得上），而计费的输出量只从流末尾
-#   上游自己报的那个数读，不猜
-#
-# 另外下行只数**内容**字节，不数整条响应：SSE 帧和 JSON 结构占了大头，
-# 拿整条响应的字节数去折 token 差十倍（见 protocols.count_content）。
+# 两个方向都是估值，不是账单：请求体含 JSON / 工具结构，字节与计费 token
+# 并不一一对应；回复可能只带推理摘要，缺少上游计费的完整内容。
+# 输出标尺只认不带推理的内容字节，排除 SSE / JSON 框架；用量仍以上游报告为准。
 
 RATIO_MIN_ROWS = 20        # 样本少于这个数就用兜底常数，别拿三条记录去定标尺
 RATIO_MAX_SPREAD = 6.0     # p90/p10 超过这个就是「字节数压根预测不了 token」，不给估值

@@ -5,10 +5,10 @@ import json
 import time
 import urllib.parse
 from collections import defaultdict
-from typing import Annotated, Any, Iterable, Literal
+from typing import Annotated, Any, Iterable
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from . import capture, db, failover, inflight, protocols, proxy as proxy_mod, rewrite
@@ -76,18 +76,6 @@ class ModelRouteIn(BaseModel):
 class RouteEditIn(BaseModel):
     route_id: int
     remote_model: str = ""
-
-
-class RouteTransferIn(BaseModel):
-    source_model_name: _NonBlank
-    target_model_name: _NonBlank
-    route_ids: tuple[int, ...] = Field(min_length=1)
-    mode: Literal["copy", "move"] = "copy"
-
-
-class BulkAddIn(BaseModel):
-    group_id: int
-    model_names: tuple[str, ...] = Field(min_length=1)
 
 
 class GroupModelsIn(BaseModel):
@@ -215,7 +203,7 @@ def _validate_egress(raw: str) -> str:
     别攒到第一个请求失败才发现。
     """
     egress = (raw or "").strip()
-    if egress in (proxy_mod.EGRESS_SYSTEM, proxy_mod.EGRESS_DIRECT):
+    if egress in (upstream_mod.EGRESS_SYSTEM, upstream_mod.EGRESS_DIRECT):
         return egress
     scheme = egress.split("://", 1)[0].lower() if "://" in egress else ""
     if scheme not in ("http", "https", "socks5", "socks5h"):
@@ -273,9 +261,9 @@ def _egress_kind(value: str) -> str:
     """前端编辑弹窗靠它决定「跟随系统 / 直连 / VPS 预设 / 自填代理」。
     别让前端拿 raw 值去比对预设 —— 那等于把代理凭据又发下去了。"""
     raw = (value or "").strip()
-    if not raw or raw == proxy_mod.EGRESS_SYSTEM:
+    if not raw or raw == upstream_mod.EGRESS_SYSTEM:
         return "system"
-    if raw == proxy_mod.EGRESS_DIRECT:
+    if raw == upstream_mod.EGRESS_DIRECT:
         return "direct"
     if raw and raw == _vps_preset_raw():
         return "vps"
@@ -468,7 +456,7 @@ async def _probe_one(base_url: str, egress: str, label: str, headers: dict[str, 
     began = time.monotonic()
     try:
         async with httpx.AsyncClient(
-            timeout=PROBE_TIMEOUT, **proxy_mod.client_args(egress)
+            timeout=PROBE_TIMEOUT, **upstream_mod.client_args(egress)
         ) as client:
             resp = await client.get(url, headers=headers)
     except Exception as exc:  # 探测什么都不该抛：代理地址填错是 ValueError，缺 socksio 是 ImportError
@@ -495,8 +483,8 @@ async def probe_upstream(upstream_id: int) -> dict[str, Any]:
         up.header_override,
         group.protocol if group else "openai",
     )
-    doors = [(proxy_mod.EGRESS_SYSTEM, "跟随系统"), (proxy_mod.EGRESS_DIRECT, "直连")]
-    if up.egress not in (proxy_mod.EGRESS_SYSTEM, proxy_mod.EGRESS_DIRECT):
+    doors = [(upstream_mod.EGRESS_SYSTEM, "跟随系统"), (upstream_mod.EGRESS_DIRECT, "直连")]
+    if up.egress not in (upstream_mod.EGRESS_SYSTEM, upstream_mod.EGRESS_DIRECT):
         doors.append((up.egress, "这个代理"))
     # 并发打：一扇被挡住的门要磨满 connect 超时，串行的话三扇门要等三倍
     results = await asyncio.gather(
@@ -786,23 +774,6 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
     }
 
 
-@router.post("/models/transfer")
-def transfer_model_routes(payload: RouteTransferIn) -> dict[str, Any]:
-    try:
-        result = db.transfer_model_routes(
-            payload.source_model_name, payload.target_model_name, payload.route_ids, payload.mode
-        )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except db.RouteTransferConflict as exc:
-        raise HTTPException(409, str(exc)) from exc
-    log(
-        f"TRANSFER mode={payload.mode} from={payload.source_model_name!r}"
-        f" to={result['model_name']!r} added={result['added']} merged={result['merged']}"
-    )
-    return result
-
-
 @router.put("/models")
 def put_model_route(payload: RouteEditIn) -> dict[str, Any]:
     """改一个已有候选的「上游那边的真实模型名」。1M 开关也走这里（存成 `名字[1m]`）。"""
@@ -825,14 +796,6 @@ def put_model_route(payload: RouteEditIn) -> dict[str, Any]:
         "group_id": route["group_id"],
         "remote_model": remote_model,
     }
-
-
-@router.post("/models/bulk-add")
-def post_bulk_add(payload: BulkAddIn) -> dict[str, Any]:
-    """批量导入。撞上「已经在另一种接口下暴露」的名字只跳过它，别把整批退回去。"""
-    _require_group(payload.group_id)
-    added, skipped = db.add_routes_for_group(payload.group_id, payload.model_names)
-    return {"added": added, "skipped": list(skipped)}
 
 
 @router.post("/models/switch")
@@ -983,12 +946,16 @@ def put_stall_timeout(payload: StallTimeoutIn) -> dict[str, float]:
 
 @router.delete("/models")
 def remove_model_route(
+    request: Request,
     model_name: str = Query(default="", description="模型名"),
-    group_id: int | None = Query(default=None, description="只删这个模型在该分组下的候选（可能有多条）"),
-    route_id: int | None = Query(default=None, description="只删这一条候选；给了它就不看前两个参数"),
+    route_id: int | None = Query(default=None, description="只删这一条候选；给了它就不看模型名和接口"),
     protocol: str = Query(default="", description="只删这个接口下的链；同名模型在其它接口下的候选保留"),
 ) -> dict[str, Any]:
     # 走 query 而不是路径参数：模型名常带 '/'（如 deepseek-ai/DeepSeek-V3），放路径里会被当成多段
+    # FastAPI 默认忽略未知参数。必须先拒绝旧 group_id，不能把旧的局部删除升级为整链删除。
+    unknown = set(request.query_params) - {"model_name", "route_id", "protocol"}
+    if unknown:
+        raise HTTPException(400, f"不支持的删除参数：{', '.join(sorted(unknown))}；请使用 route_id 或模型名与接口")
     if route_id is not None:
         name = db.delete_model_route(route_id)
         if not name:
@@ -996,16 +963,9 @@ def remove_model_route(
         return {"ok": True, "removed": 1, "model_name": name}
     if not model_name:
         raise HTTPException(400, "要么给 route_id，要么给 model_name")
-    if group_id is None:
-        removed = db.delete_model(model_name, protocol)
-        if removed == 0:
-            raise HTTPException(404, f"模型「{model_name}」不存在")
-        return {"ok": True, "removed": removed}
-    # 分组级：同一个分组下可能挂了这个模型的好几条真名，一起去掉 ——
-    # 分组弹窗里那个勾选框答的就是「这个模型在这个分组里有没有」
-    removed = db.delete_routes_in_group(model_name, group_id)
+    removed = db.delete_model(model_name, protocol)
     if removed == 0:
-        raise HTTPException(404, "该候选不存在")
+        raise HTTPException(404, f"模型「{model_name}」不存在")
     return {"ok": True, "removed": removed}
 
 
@@ -1026,7 +986,9 @@ def clear_requests() -> dict[str, Any]:
 
 
 @router.get("/stats")
-def get_stats() -> dict[str, Any]:
+def get_stats(live_only: bool = False) -> dict[str, Any]:
+    if live_only:
+        return {"live": stats_mod.live()}
     stats = stats_mod.request_stats()
     return {
         **stats,
@@ -1036,24 +998,9 @@ def get_stats() -> dict[str, Any]:
 
 
 @router.get("/overview")
-def get_overview(window: str = "1h", top: int = 8) -> dict[str, Any]:
+def get_overview(window: str = "1h") -> dict[str, Any]:
     """概览视图一次拿全：时间线 + 上游健康 + 模型热度 + 活跃流 + 累计值。"""
-    return stats_mod.overview(window, max(1, min(top, 20)))
-
-
-@router.get("/stats/series")
-def get_series(window: str = "1h") -> dict[str, Any]:
-    return stats_mod.series(window)
-
-
-@router.get("/stats/upstreams")
-def get_upstream_health() -> list[dict[str, Any]]:
-    return stats_mod.upstream_health()
-
-
-@router.get("/stats/models")
-def get_model_top(limit: int = 8) -> list[dict[str, Any]]:
-    return stats_mod.model_top(max(1, min(limit, 20)))
+    return stats_mod.overview(window)
 
 
 @router.post("/shutdown")

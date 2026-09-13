@@ -75,11 +75,11 @@ def test_direct_really_turns_the_system_proxy_off():
     （Clash 那种），而注册表的 bypass 列表通常是空的。只把 proxy 设成 None 的话，
     「让这个站绕过代理」这件事根本没做到 —— 而这正是被机房 IP 拉黑的站唯一的出路。
     """
-    from gateway import proxy as proxy_mod
+    from gateway import upstream as upstream_mod
 
-    follow = proxy_mod.client_args("")
-    direct = proxy_mod.client_args("direct")
-    via = proxy_mod.client_args("http://127.0.0.1:7890")
+    follow = upstream_mod.client_args("")
+    direct = upstream_mod.client_args("direct")
+    via = upstream_mod.client_args("http://127.0.0.1:7890")
 
     assert follow["trust_env"] is True and follow["proxy"] is None
     assert direct["trust_env"] is False and direct["proxy"] is None

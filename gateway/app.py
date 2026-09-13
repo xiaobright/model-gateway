@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, proxy
+from . import config, db, upstream
 from .admin import router as admin_router
 from .proxy import router as proxy_router
 
@@ -106,7 +106,7 @@ class NoCacheStatic(StaticFiles):
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
-    await proxy.aclose_client()
+    await upstream.aclose_client()
 
 
 def create_app() -> FastAPI:

@@ -16,7 +16,7 @@ import helpers
 @pytest.fixture()
 def gateway(tmp_path, monkeypatch, request):
     from gateway import config, failover, inflight
-    from gateway import proxy as proxy_mod
+    from gateway import upstream as upstream_mod
     from gateway import stats as stats_mod
     from gateway.app import create_app
     from gateway.server import start_server_thread
@@ -35,24 +35,22 @@ def gateway(tmp_path, monkeypatch, request):
 
     if not use_network:
         async def get_client(egress=""):
-            client = proxy_mod._clients.get(egress)
+            client = upstream_mod._clients.get(egress)
             if client is None or client.is_closed:
                 client = httpx.AsyncClient(
                     transport=httpx.MockTransport(helpers.fake_upstream_request),
-                    timeout=proxy_mod.PROXY_TIMEOUT,
+                    timeout=upstream_mod.PROXY_TIMEOUT,
                     trust_env=False,
                 )
-                proxy_mod._clients[egress] = client
+                upstream_mod._clients[egress] = client
             return client
 
-        monkeypatch.setattr(proxy_mod, "get_client", get_client)
+        monkeypatch.setattr(upstream_mod, "get_client", get_client)
 
         async def fetch_remote_models(base_url, api_key, header_override="", protocol="openai", egress=""):
             # The production helper creates its own socket client.  Reuse the
             # same in-process transport as forwarding while keeping its URL,
             # headers, status, and JSON validation behavior intact.
-            from gateway import upstream as upstream_mod
-
             client = await get_client(egress)
             url = upstream_mod.models_url(base_url)
             resp = await client.get(

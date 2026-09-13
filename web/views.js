@@ -16,6 +16,7 @@ let chart = null;
 const odometers = {};
 
 const EMPTY = '<div class="empty">暂无数据</div>';
+const modelKey = (name, protocol) => JSON.stringify([name, protocol]);
 
 /* ================================================================ KPI */
 
@@ -61,7 +62,7 @@ function kpiSkeleton() {
 
 export function renderKpis() {
   kpiSkeleton();
-  // 累计值和 P95 只从 overview 来（/stats 不带分位数），live 两个接口都有
+  // 统计值只从 overview 来；live 由轻量轮询更新。
   const t = (state.overview && state.overview.totals) || state.stats || {};
   const live = (state.stats && state.stats.live)
     || (state.overview && state.overview.live) || { requests: 0, streams: 0 };
@@ -176,7 +177,7 @@ export function renderHealth() {
 
 export function renderHot() {
   const host = $('hot-list');
-  const rows = (state.overview && state.overview.models) || [];
+  const rows = ((state.overview && state.overview.models) || []).slice(0, 8);
   $('hot-count').textContent = rows.length ? `Top ${rows.length}` : '';
   if (!rows.length) { host.innerHTML = EMPTY; return; }
 
@@ -197,14 +198,14 @@ export function renderHot() {
   const frag = document.createDocumentFragment();
   for (const m of rows) {
     const row = barRow({
-      label: m.model,
+      label: `${m.model} · ${PROTO_SHORT[m.protocol] || m.protocol}`,
       value: m.n,
       max,
       badge: fmtInt(m.n),
       tone: m.bad / Math.max(1, m.n) > 0.2 ? 'crit' : 'accent',
       note: fmtSec(m.p95),
     });
-    row.dataset.key = m.model;
+    row.dataset.key = modelKey(m.model, m.protocol);
     frag.append(row);
   }
   host.innerHTML = '';
@@ -310,10 +311,10 @@ function failoverBox() {
 
 const EMPTY_BY_IFACE = {
   anthropic: 'Anthropic 接口下还没有模型。先在「上游站点」给某个站加一个 Anthropic 分组'
-    + '（填 Claude Code 那把 key），拉取模型列表导入，或者点右上角「新增模型」自己起名字。',
-  openai: 'OpenAI 接口下还没有模型。去「上游站点」展开某个分组，用「拉取模型列表」导入。',
+    + '（填 Claude Code 那把 key），再点右上角「新增模型」配置下游路由。',
+  openai: 'Responses 接口下还没有模型。先配置上游分组，再点右上角「新增模型」；只登记上游目录不会对外暴露。',
   'openai-chat': 'Chat Completions 接口下还没有模型。去「上游站点」展开某个分组，'
-    + '用「拉取模型列表」导入，或者点右上角「新增模型」自己起名字。',
+    + '登记模型后，再点右上角「新增模型」配置下游路由。',
 };
 
 export function renderRoutes() {
@@ -324,13 +325,13 @@ export function renderRoutes() {
   const list = kw ? byIface.filter((r) => r.model_name.toLowerCase().includes(kw)) : byIface;
   const total = state.routes.length;
   $('route-count').textContent = (kw || iface)
-    ? `${list.length} / ${total} 个模型`
-    : `${total} 个模型`;
+    ? `${list.length} / ${total} 条模型路由`
+    : `${total} 条模型路由`;
 
   if (!total) {
     $('route-list').innerHTML =
       '<div class="empty">还没有模型。先在「上游站点」加一个供应商，给它建一个分组（选接口 + 填 key），'
-      + '再用「拉取模型列表」导入，或点右上角「新增模型」。</div>';
+      + '再点右上角「新增模型」配置下游路由。只登记上游目录不会出现在这里。</div>';
     return;
   }
   if (!list.length) {
@@ -341,7 +342,8 @@ export function renderRoutes() {
   }
 
   // 请求次数来自概览统计，用来回答"这个模型到底有没有在用"
-  const hot = new Map(((state.overview && state.overview.models) || []).map((m) => [m.model, m]));
+  const hot = new Map(((state.overview && state.overview.models) || [])
+    .map((m) => [modelKey(m.model, m.protocol), m]));
   const multi = multiGroupIds();
 
   const host = $('route-list');
@@ -354,9 +356,9 @@ export function renderRoutes() {
     const ifaceTag = !iface && g.protocol
       ? ` <span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
         + ` title="在 ${esc(PROTO_PATH[g.protocol] || '')} 下暴露">${esc(PROTO_LABEL[g.protocol] || '')}</span>` : '';
-    const stat = hot.get(g.model_name);
+    const stat = hot.get(modelKey(g.model_name, g.protocol));
     const usage = stat
-      ? `<span class="route-usage" title="最近 2000 条里的请求数 · P95 ${fmtSec(stat.p95)}">${fmtInt(stat.n)} 次</span>`
+      ? `<span class="route-usage" title="所选时间窗内本接口的请求数（最多保留 2000 条记录）· P95 ${fmtSec(stat.p95)}">${fmtInt(stat.n)} 次</span>`
       : '';
     // 同一个分组下挂了这个模型的好几条候选时，圆片必须把真名写出来才分得清
     const sibs = new Map();
@@ -423,15 +425,12 @@ function trailRow(t) {
     </div>`;
 }
 
-/* 包大小 -> token 数的估值。标尺是后端从转发记录里量出来的（stats.token_ratio）。
-
-   两个方向量的不是同一件事：上行的 `≈` 可以当**计费量**看（请求体每个字符都算进输入）；
-   下行的 `≈` 是**收到手的内容**有多少 token，跟计费量不等 —— 思维链发下来的是总结过的，
-   计费按完整的算。所以计费的输出量只认流末尾上游报的那个数，不拿字节去猜。 */
+/* 包大小 -> token 估值来自历史比例，不是账单。输入含 JSON/工具结构，
+   输出可能缺少完整推理；收到的内容量与上游报告用量不是同一个数。 */
 function estTok(bytes, dir, proto) {
   const ratio = ((state.tokens || {})[proto] || {})[dir] || 0;
   if (!bytes || !ratio) return '';
-  const what = dir === 'up' ? '按过往记录估的计费量' : '按过往记录估的「收到的内容」，不是计费量';
+  const what = dir === 'up' ? '按历史比例估的输入量，不是账单' : '按历史比例估的「收到的内容」，不是计费量';
   return ` <span title="${esc(what)}：${ratio} 字节一个 token">`
     + `≈ ${fmtTokens(Math.round(bytes / ratio))} tok</span>`;
 }

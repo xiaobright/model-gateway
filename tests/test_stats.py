@@ -8,7 +8,7 @@ from helpers import wait_for_row, MockUpstream, add_upstream, add_group, provide
 def test_request_log_records_usage_and_stats(gateway):
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_a, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_a)
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
 
         rows = gateway.get("/admin/api/requests").json()
@@ -54,7 +54,7 @@ def test_stats_normalize_anthropic_cache_and_count_http_errors_as_failures(gatew
     assert stats["context_tokens"] == 1070, "Anthropic 的 cache_read / cache_creation 都要进输入总量"
     assert stats["cache_hit_rate"] == round(900 / 1070, 4)
 
-    health = next(h for h in gateway.get("/admin/api/stats/upstreams").json() if h["name"] == "siteA")
+    health = next(h for h in gateway.get("/admin/api/overview").json()["upstreams"] if h["name"] == "siteA")
     assert health["bad"] == 2 and health["ok_rate"] == 0.3333
     assert stats["saved"] == 0, "截断的第二次尝试不能算救回"
 
@@ -68,7 +68,7 @@ def test_request_log_records_protocol_and_health_splits_by_it(gateway):
         g_an = add_upstream(gateway, a, "siteA", "anthropic")
         g_oa = add_group(gateway, provider_id(gateway, "siteA"), "openai", name="gpt", api_key="key-siteA")
         add_route(gateway, "opus", g_an, "claude-opus-4-1")
-        gateway.post("/admin/api/models/bulk-add", json={"group_id": g_oa, "model_names": ["gpt-test"]})
+        add_route(gateway, "gpt-test", g_oa)
 
         assert gateway.post("/v1/messages", json=msg("opus")).status_code == 200
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
@@ -76,7 +76,7 @@ def test_request_log_records_protocol_and_health_splits_by_it(gateway):
         rows = gateway.get("/admin/api/requests").json()
         assert {r["model"]: r["protocol"] for r in rows} == {"opus": "anthropic", "gpt-test": "openai"}
 
-        health = next(h for h in gateway.get("/admin/api/stats/upstreams").json() if h["name"] == "siteA")
+        health = next(h for h in gateway.get("/admin/api/overview").json()["upstreams"] if h["name"] == "siteA")
         assert health["by_protocol"] == {
             "anthropic": {"n": 1, "bad": 0, "ok_rate": 1.0},
             "openai": {"n": 1, "bad": 0, "ok_rate": 1.0},
@@ -91,7 +91,7 @@ def test_protocol_split_exposes_a_dead_endpoint(gateway):
     add_route(gateway, "opus", add_group(gateway, int(created["id"]), "anthropic"), "claude-opus-4-1")
 
     assert gateway.post("/v1/messages", json=msg("opus")).status_code == 502
-    health = next(h for h in gateway.get("/admin/api/stats/upstreams").json() if h["name"] == "dead")
+    health = next(h for h in gateway.get("/admin/api/overview").json()["upstreams"] if h["name"] == "dead")
     assert health["by_protocol"] == {"anthropic": {"n": 1, "bad": 1, "ok_rate": 0.0}}
 
 
@@ -167,6 +167,47 @@ def test_overview_totals_health_and_models_respect_the_window(gateway):
     assert {m["model"] for m in week["models"]} == {"recent", "today", "week"}
     assert hour["upstreams"][0]["n"] == 1
     assert week["upstreams"][0]["n"] == 3
+
+
+def test_model_usage_is_protocol_scoped_and_not_limited_to_the_hot_list(gateway):
+    from gateway import db
+
+    def log_model(model, protocol):
+        db.insert_request(
+            client="test", model=model, protocol=protocol, upstream="siteA",
+            status=200, stream=False, req_bytes=1, resp_bytes=1, duration_ms=10, note="ok",
+            input_tokens=0, output_tokens=0, cached_tokens=0,
+        )
+
+    for _ in range(3):
+        log_model("shared", "openai")
+    log_model("shared", "openai-chat")
+    for i in range(10):
+        log_model(f"other-{i}", "openai")
+    data = gateway.get("/admin/api/overview?window=1h").json()
+    usage = {(m["model"], m["protocol"]): m["n"] for m in data["models"]}
+    assert usage[("shared", "openai")] == 3
+    assert usage[("shared", "openai-chat")] == 1
+    assert len(usage) == 12, "前 8 名以外的模型也要给路由行显示次数"
+    assert all(usage[(f"other-{i}", "openai")] == 1 for i in range(10))
+    assert sum(usage.values()) == data["totals"]["requests"] == 14
+
+
+def test_live_only_stats_never_reads_request_history(gateway, monkeypatch):
+    from gateway import db, inflight
+
+    def no_history(*args, **kwargs):
+        raise AssertionError("3 秒活跃数轮询不能查请求记录")
+
+    monkeypatch.setattr(db, "recent_requests", no_history)
+    call = inflight.begin(client="test", model="m", protocol="openai", stream=True, req_bytes=1)
+    try:
+        assert gateway.get("/admin/api/stats?live_only=true").json() == {
+            "live": {"requests": 1, "streams": 1},
+        }
+    finally:
+        inflight.finish(call, status=200)
+    assert gateway.get("/admin/api/stats?live_only=true").json()["live"]["requests"] == 0
 
 
 def test_thinking_is_counted_apart_from_the_text(gateway):
