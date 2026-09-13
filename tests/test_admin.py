@@ -117,6 +117,96 @@ def test_admin_api_rejects_origin_null(gateway):
     assert blocked.status_code == 403
 
 
+def test_admin_api_rejects_another_local_port(gateway):
+    """同 host 异端口是 same-site，Sec-Fetch-Site 不会拦 —— 必须比 Origin 的端口。
+    本机另一个服务（或被入侵的本地应用）提供的页面不能替用户关网关。"""
+    base = gateway.base_url
+    other = f"{base.scheme}://{base.host}:{(base.port or 80) + 1}"
+    blocked = gateway.post(
+        "/admin/api/shutdown", headers={"Origin": other, "Sec-Fetch-Site": "same-site"}
+    )
+    assert blocked.status_code == 403
+    assert "Origin" in blocked.json()["detail"]
+
+
+def test_proxy_endpoints_reject_cross_site_browsers(gateway):
+    """ /v1 没有鉴权：任意网页都能用 no-cors 简单请求借你的 key 烧 token。
+    浏览器跨站特征一律拒绝；curl / Codex 不带这些头，不受影响。"""
+    blocked = gateway.post(
+        "/v1/responses",
+        json={"model": "gpt-test"},
+        headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+    )
+    assert blocked.status_code == 403
+
+    # 同源的浏览器请求（管理页自己发的）照常进转发流程；模型没配 → 404 而不是 403
+    ok = gateway.post(
+        "/v1/responses",
+        json={"model": "nope"},
+        headers={"Origin": str(gateway.base_url), "Sec-Fetch-Site": "same-origin"},
+    )
+    assert ok.status_code == 404
+
+    # 非浏览器客户端（没有 Origin / Sec-Fetch-*）照常
+    plain = gateway.post("/v1/responses", json={"model": "nope"})
+    assert plain.status_code == 404
+
+
+def test_missing_host_is_rejected(gateway):
+    """浏览器永远带 Host；没有 Host 的 HTTP/1.1 请求不接受。"""
+    blocked = gateway.get("/admin/api/upstreams", headers={"Host": ""})
+    assert blocked.status_code == 403
+    assert "Host" in blocked.json()["detail"]
+
+
+def test_group_key_is_masked_in_lists_and_revealed_on_demand(gateway):
+    """列表接口不下发 key 原文（任何 JSON 快照、抓包导出都拿不到），编辑时按需取。"""
+    with MockUpstream("siteA") as a:
+        gid = add_upstream(gateway, a, "siteA")
+        detail = gateway.get("/admin/api/upstreams").json()[0]
+        grp = detail["groups"][0]
+        assert "api_key" not in grp
+        assert grp["has_key"] is True and "key-siteA" not in str(grp["key_masked"])
+        assert "key-siteA" not in gateway.get("/admin/api/upstreams").text
+
+        assert gateway.get(f"/admin/api/groups/{gid}/key").json() == {"api_key": "key-siteA"}
+
+        # PUT 省略 api_key = 保留原值（旧调用方/快捷开关兼容）
+        keep = gateway.put(
+            f"/admin/api/groups/{gid}",
+            json={"name": grp["name"], "protocol": grp["protocol"], "enabled": grp["enabled"]},
+        )
+        assert keep.status_code == 200
+        assert gateway.get(f"/admin/api/groups/{gid}/key").json()["api_key"] == "key-siteA"
+
+
+def test_enabled_toggles_do_not_touch_other_fields(gateway):
+    """列表开关不再整包 PUT：另一标签页刚保存的字段不会被内存快照打回去。"""
+    with MockUpstream("siteA") as a:
+        gid = add_upstream(gateway, a, "siteA")
+        row = gateway.get("/admin/api/upstreams").json()[0]
+        uid, base_url = row["id"], row["base_url"]
+        gateway.put(
+            f"/admin/api/groups/{gid}",
+            json={"name": "改过名", "protocol": "openai", "api_key": "new-key", "enabled": True},
+        )
+        gateway.put(
+            f"/admin/api/upstreams/{uid}",
+            json={"name": "siteA", "base_url": base_url, "enabled": True, "egress": "direct"},
+        )
+
+        assert gateway.post(f"/admin/api/groups/{gid}/enabled", json={"enabled": False}).json() == {"ok": True}
+        assert gateway.post(f"/admin/api/upstreams/{uid}/enabled", json={"enabled": False}).json() == {"ok": True}
+
+        group = gateway.get("/admin/api/upstreams").json()[0]["groups"][0]
+        assert group["name"] == "改过名" and group["enabled"] is False
+        assert gateway.get(f"/admin/api/groups/{gid}/key").json()["api_key"] == "new-key"
+        assert gateway.get(f"/admin/api/upstreams/{uid}/egress").json()["egress"] == "direct"
+
+        missing = gateway.post("/admin/api/groups/9999/enabled", json={"enabled": False})
+        assert missing.status_code == 404
+
+
 def test_stall_timeout_setting_roundtrip_and_range(gateway):
     """发呆超时：默认 20 秒，可改，0 = 关闭，超过上限被拒。"""
     assert gateway.get("/admin/api/stall-timeout").json()["seconds"] == 20
@@ -365,7 +455,10 @@ def test_cloning_a_group_copies_the_key_to_the_other_interface(gateway):
         g_a = add_upstream(gateway, a, "siteA", "openai")
         clone = gateway.post(f"/admin/api/groups/{g_a}/clone", json={"protocol": "anthropic"})
         assert clone.status_code == 200, clone.text
-        assert (clone.json()["protocol"], clone.json()["api_key"]) == ("anthropic", "key-siteA")
+        assert clone.json()["protocol"] == "anthropic"
+        assert clone.json()["has_key"] is True
+        copied_key = gateway.get(f"/admin/api/groups/{clone.json()['id']}/key").json()["api_key"]
+        assert copied_key == "key-siteA"
 
         detail = gateway.get("/admin/api/upstreams").json()[0]
         assert detail["supports"] == ["anthropic", "openai"]
@@ -510,9 +603,11 @@ def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway,
             f"/admin/api/groups/{group_id}/clone", json={"protocol": "test-third"}
         )
         assert copied.status_code == 200
-        assert (copied.json()["protocol"], copied.json()["api_key"]) == (
-            "test-third", "key-siteA"
-        )
+        assert copied.json()["protocol"] == "test-third"
+        copied_key = gateway.get(
+            f"/admin/api/groups/{copied.json()['id']}/key"
+        ).json()["api_key"]
+        assert copied_key == "key-siteA"
 
 
 @pytest.mark.parametrize(

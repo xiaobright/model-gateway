@@ -238,7 +238,7 @@ function multiGroupIds() {
 }
 
 function cloneButtons(group) {
-  if (!group || !group.api_key) return '';
+  if (!group || !group.has_key) return '';
   const targets = PROTOCOLS.filter((p) => p !== group.protocol);
   return targets.map((p) =>
     `<button type="button" class="btn btn-ghost btn-sm" data-act="clone-group"`
@@ -630,7 +630,10 @@ function ifaceTags(u) {
     + `${esc(PROTO_SHORT[p] || PROTO_LABEL[p] || p)}</span>`).join(' ');
 }
 
-const maskKey = (key) => (key ? `${esc(key.slice(0, 6))}… ${key.length}` : '<span class="dim">透传客户端</span>');
+/* key 的脱敏形状由后端算好（列表接口不下发原文）；这里只负责空 key 的说明 */
+const keyCell = (g) => (g.has_key
+  ? esc(g.key_masked)
+  : '<span class="dim">透传客户端</span>');
 
 function modelTags(names) {
   if (!names.length) return '<span class="dim">未录入</span>';
@@ -645,7 +648,7 @@ function groupRow(u, g) {
       + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${esc(PROTO_LABEL[g.protocol] || '?')}</span>`;
   return `<tr class="grp-row">
     <td class="grp-name">${esc(g.name)} ${tag}${g.enabled ? '' : ' <span class="tag">停用</span>'}</td>
-    <td class="mono dim nowrap">${maskKey(g.api_key)}</td>
+    <td class="mono dim nowrap">${keyCell(g)}</td>
     <td>${modelTags(names)}</td>
     <td colspan="2" class="dim nowrap">${names.length} 个模型</td>
     <td><input type="checkbox" class="switch" ${g.enabled ? 'checked' : ''}
@@ -676,7 +679,7 @@ export function renderUpGroups() {
     + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${esc(PROTO_LABEL[g.protocol] || '?')}</span>`;
     return `<div class="ug-row">
       <span class="ug-name">${esc(g.name)}</span>${tag}
-      <span class="ug-key">${maskKey(g.api_key)}</span>
+      <span class="ug-key">${keyCell(g)}</span>
       <span class="grow"></span>
       <span class="dim" style="font-size:12px">${n} 个模型</span>
       <input type="checkbox" class="switch" ${g.enabled ? 'checked' : ''}
@@ -698,16 +701,19 @@ export function renderUpGroups() {
 }
 
 /* 出口不是「跟随系统」时在地址后面标一下：一屏上哪个站走的是另一扇门，
-   得能一眼看出来，不然只有点进编辑才知道。VPS 预设只标「VPS」——
-   完整 URL 里有密码，不放 tooltip。 */
+   得能一眼看出来，不然只有点进编辑才知道。只认后端给的 kind；
+   VPS 预设的完整 URL 里有密码，连后端都只回脱敏形状，前端更别想拿原文。 */
 function egressTag(u) {
-  const raw = (u.egress || '').trim();
-  if (!raw) return '';
-  if (raw === 'direct') return ' <span class="tag" title="不走系统代理，从本机自己的出口出去">直连</span>';
-  if (state.egressVps && raw === state.egressVps) {
+  const kind = u.egress_kind || 'system';
+  if (kind === 'direct') return ' <span class="tag" title="不走系统代理，从本机自己的出口出去">直连</span>';
+  if (kind === 'vps') {
     return ' <span class="tag tag-accent" title="只有这个站走 VPS 上那扇门">VPS</span>';
   }
-  return ` <span class="tag tag-accent" title="只有这个站走 ${esc(raw)}">走代理</span>`;
+  if (kind === 'proxy') {
+    const shown = u.egress_masked || '代理';
+    return ` <span class="tag tag-accent" title="只有这个站走 ${esc(shown)}">走代理</span>`;
+  }
+  return '';
 }
 
 export function renderUpstreams() {

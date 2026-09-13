@@ -22,7 +22,9 @@ def set_egress(client: httpx.Client, name: str, egress: str) -> None:
         json={"name": row["name"], "base_url": row["base_url"], "enabled": True, "egress": egress},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["egress"] == egress
+    # 列表里只回脱敏形状；原文按需取，这是编辑弹窗的路径
+    revealed = client.get(f"/admin/api/upstreams/{row['id']}/egress")
+    assert revealed.json()["egress"] == egress
 
 
 def test_disabling_a_provider_does_not_reset_its_egress(gateway):
@@ -30,13 +32,16 @@ def test_disabling_a_provider_does_not_reset_its_egress(gateway):
         add_upstream(gateway, a, "siteA")
         set_egress(gateway, "siteA", "direct")
         row = next(u for u in gateway.get("/admin/api/upstreams").json() if u["name"] == "siteA")
+        assert row["egress_kind"] == "direct" and row["egress_masked"] == "direct"
 
         # 模拟列表里的快捷开关：即使旧调用方没有带 egress，后端也保留它。
         changed = gateway.put(
             f"/admin/api/upstreams/{row['id']}",
             json={"name": row["name"], "base_url": row["base_url"], "enabled": False},
         )
-        assert changed.status_code == 200 and changed.json()["egress"] == "direct"
+        assert changed.status_code == 200
+        revealed = gateway.get(f"/admin/api/upstreams/{row['id']}/egress").json()["egress"]
+        assert revealed == "direct"
 
 
 @pytest.mark.network
@@ -146,15 +151,24 @@ def test_egress_ca_pin_is_checked_at_save_time(gateway):
         assert put("https://me:pw@h:8443#ca=data/no-such-ca.pem").status_code == 400
 
         ok = put(f"https://me:pw@h:8443#ca={PROXY_CERT}")
-        assert ok.status_code == 200 and ok.json()["egress"].endswith(f"#ca={PROXY_CERT}")
+        assert ok.status_code == 200
+        revealed = gateway.get(f"/admin/api/upstreams/{row['id']}/egress").json()["egress"]
+        assert revealed.endswith(f"#ca={PROXY_CERT}")
+        # 列表里的脱敏形状把密码藏掉、留下主机和用户名，排障照样看得懂
+        listed = next(u for u in gateway.get("/admin/api/upstreams").json() if u["name"] == "siteA")
+        assert "pw" not in listed["egress_masked"]
+        assert "me:***@h:8443" in listed["egress_masked"]
 
 
 def test_egress_vps_preset_comes_from_the_settings_table(gateway):
-    """「走 VPS」这个预设是运维事实不是代码：值在设置表里，没配就没有这个选项。"""
+    """「走 VPS」这个预设是运维事实不是代码：值在设置表里，没配就没有这个选项。
+    列表只给脱敏形状，应用预设时才取原文。"""
     from gateway import db
 
-    assert gateway.get("/admin/api/egress-presets").json() == {"vps": None}
+    assert gateway.get("/admin/api/egress-presets").json() == {"has_vps": False, "vps_masked": ""}
     db.set_setting("egress_vps", "https://u:p@203.0.113.10:8443#ca=data/vps-proxy-ca.pem")
-    assert gateway.get("/admin/api/egress-presets").json()["vps"].endswith(
-        ":8443#ca=data/vps-proxy-ca.pem"
-    )
+    presets = gateway.get("/admin/api/egress-presets").json()
+    assert presets["has_vps"] is True
+    assert "p@" not in presets["vps_masked"] and "u:***@" in presets["vps_masked"]
+    revealed = gateway.get("/admin/api/egress-presets/vps").json()["vps"]
+    assert revealed.endswith(":8443#ca=data/vps-proxy-ca.pem")

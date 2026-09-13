@@ -32,6 +32,7 @@ from __future__ import annotations
 import itertools
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -45,7 +46,9 @@ DEFAULT_MAX_REQUESTS = 1
 
 # 进程内剩余条数。flag 文件是权威来源：外部直接删文件也能立刻生效，
 # 这里的计数只是为了避免同一次运行里反复读盘。begin 时就占名额，抓满不再补发。
+# 转发线程（begin/finish）和管理接口线程池（status/enable/disable）都会碰它，加把锁。
 _state: dict[str, int] = {"remaining": 0, "active": 0}
+_lock = threading.Lock()
 _seq = itertools.count(1)  # 目录序号：同一秒、同一个模型也不会互相覆盖
 
 
@@ -120,9 +123,11 @@ def enabled() -> bool:
 
 def status() -> dict[str, Any]:
     spec = _read_spec() if enabled() else None
+    with _lock:
+        remaining = _state["remaining"]
     return {
         "enabled": spec is not None,
-        "remaining": _state["remaining"],
+        "remaining": remaining,
         "max": (spec or {}).get("max", DEFAULT_MAX_REQUESTS),
         "out_dir": str(_out_root()),
     }
@@ -131,7 +136,8 @@ def status() -> dict[str, Any]:
 def enable(max_requests: int = DEFAULT_MAX_REQUESTS) -> dict[str, Any]:
     max_requests = max(1, int(max_requests or DEFAULT_MAX_REQUESTS))
     flag_path().write_text(json.dumps({"max": max_requests}), encoding="utf-8")
-    _state["remaining"] = max_requests
+    with _lock:
+        _state["remaining"] = max_requests
     return status()
 
 
@@ -140,7 +146,8 @@ def disable() -> dict[str, Any]:
         flag_path().unlink()
     except FileNotFoundError:
         pass
-    _state["remaining"] = 0
+    with _lock:
+        _state["remaining"] = 0
     return status()
 
 
@@ -214,21 +221,25 @@ class StreamCapture:
 def begin(meta: Mapping[str, Any], request_body: bytes | None = None) -> StreamCapture | None:
     """开抓包时返回一个句柄，否则 None（调用点零成本）。"""
     if not enabled():
-        _state["remaining"] = 0
+        with _lock:
+            _state["remaining"] = 0
         return None
     # 名额在 begin 时占住：并发开抓不能各自都看到「还有余额」然后一起超发。
     # active == 0 才补额 —— 否则「全部在飞、还没 finish」会被误当成计数过期。
-    if _state["remaining"] <= 0 and _state["active"] == 0:
-        _state["remaining"] = _read_spec()["max"]
-    if _state["remaining"] <= 0:
-        return None
+    with _lock:
+        if _state["remaining"] <= 0 and _state["active"] == 0:
+            _state["remaining"] = _read_spec()["max"]
+        if _state["remaining"] <= 0:
+            return None
+        _state["remaining"] -= 1
+        _state["active"] += 1
     try:
-        cap = StreamCapture(meta, request_body)
+        return StreamCapture(meta, request_body)
     except Exception:
+        with _lock:  # 建句柄失败（磁盘满之类）把名额还回去
+            _state["active"] = max(0, _state["active"] - 1)
+            _state["remaining"] += 1
         return None
-    _state["remaining"] -= 1
-    _state["active"] += 1
-    return cap
 
 
 def finish(cap: StreamCapture | None, **extra: Any) -> None:
@@ -238,8 +249,10 @@ def finish(cap: StreamCapture | None, **extra: Any) -> None:
     try:
         cap.finish(**extra)
     finally:
-        _state["active"] = max(0, _state["active"] - 1)
-        if _state["remaining"] <= 0:
+        with _lock:
+            _state["active"] = max(0, _state["active"] - 1)
+            full = _state["remaining"] <= 0
+        if full:
             try:
                 flag_path().unlink()
             except FileNotFoundError:

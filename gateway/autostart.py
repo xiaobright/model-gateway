@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 import sys
@@ -8,6 +9,11 @@ from pathlib import Path
 from . import config
 
 SHORTCUT_NAME = "ModelGateway.lnk"
+
+
+def _ps_quote(value: object) -> str:
+    """PowerShell 单引号字符串：把内部的 ' 写成 ''。安装路径里有撇号也不怕。"""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def shortcut_path() -> Path:
@@ -28,16 +34,19 @@ def enable() -> None:
     lnk = str(shortcut_path())
     script = (
         "$ws = New-Object -ComObject WScript.Shell;"
-        f"$s = $ws.CreateShortcut('{lnk}');"
-        f"$s.TargetPath = '{target}';"
-        f"$s.Arguments = '\"{main_py}\" --tray';"
-        f"$s.WorkingDirectory = '{config.PROJECT_ROOT}';"
+        f"$s = $ws.CreateShortcut({_ps_quote(lnk)});"
+        f"$s.TargetPath = {_ps_quote(target)};"
+        f"$s.Arguments = {_ps_quote(f'"{main_py}" --tray')};"
+        f"$s.WorkingDirectory = {_ps_quote(config.PROJECT_ROOT)};"
         "$s.Description = 'Model Gateway';"
         "$s.Save()"
     )
+    # -EncodedCommand（UTF-16LE + base64）：脚本经命令行传递时不再受 cmd/bash 的引号规则
+    # 影响，配合 _ps_quote 把「路径里的撇号」也一起解决了
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     try:
         proc = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script], capture_output=True
+            ["powershell", "-NoProfile", "-EncodedCommand", encoded], capture_output=True
         )
     except OSError as exc:
         raise OSError(f"调用 PowerShell 失败：{exc}") from exc

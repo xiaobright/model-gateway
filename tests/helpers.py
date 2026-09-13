@@ -188,6 +188,14 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                     await asyncio.sleep(20)
 
             return StreamingResponse(gen(), media_type="text/event-stream")
+        if body.get("mode") == "json_stall":
+            # 非流式卡住：头先到、第一块 JSON 字节也到了，然后不再吐 —— 测发呆超时对
+            # 非 SSE 响应同样生效（真实 socket 才模拟得出来，进程内会被整包缓冲掩盖）
+            async def trickle():
+                yield f'{{"upstream": "{name}", "partial": true'.encode()
+                await asyncio.Event().wait()
+
+            return StreamingResponse(trickle(), media_type="application/json")
         if body.get("fail"):
             return JSONResponse({"error": {"message": "quota exhausted"}}, status_code=429)
         response = {

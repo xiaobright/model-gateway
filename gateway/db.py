@@ -97,6 +97,9 @@ CREATE TABLE IF NOT EXISTS settings(
 
 # request_log 只用于人工排查，超出这个条数就从最旧的开始丢，避免 db 无限膨胀
 LOG_KEEP_ROWS = 2000
+# 裁剪不必每条插入都做：攒这么多条再剪一次，期间表最多多留 TRIM_EVERY 行
+TRIM_EVERY = 50
+_since_trim = 0
 
 # 库结构的版本号（存在 sqlite 的 user_version 里）。每次改结构 +1，并在 _upgrade 里
 # 补一条对应 stage 的动作。最新库只额外核对曾被漏迁移的缓存创建列，
@@ -636,6 +639,13 @@ def update_upstream(
         return cur.rowcount > 0
 
 
+def set_upstream_enabled(upstream_id: int, enabled: bool) -> bool:
+    """只翻启用位。列表开关走它，别拿内存快照整包覆盖（另一标签页改过的字段会被打回）。"""
+    with _conn() as conn:
+        cur = conn.execute("UPDATE upstreams SET enabled=? WHERE id=?", (int(enabled), upstream_id))
+        return cur.rowcount > 0
+
+
 def delete_upstream(upstream_id: int) -> bool:
     """分组和候选靠 ON DELETE CASCADE 一起走，这里只要善后「谁没有活跃候选了」。"""
     with _conn() as conn:
@@ -682,6 +692,15 @@ def create_group(
             raise DuplicateName(name) from exc
         row = conn.execute("SELECT * FROM upstream_groups WHERE id=?", (int(cur.lastrowid),)).fetchone()
     return _to_group(row)
+
+
+def set_group_enabled(group_id: int, enabled: bool) -> bool:
+    """只翻启用位，理由同 set_upstream_enabled。"""
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE upstream_groups SET enabled=? WHERE id=?", (int(enabled), group_id)
+        )
+        return cur.rowcount > 0
 
 
 def update_group(
@@ -1348,9 +1367,16 @@ def insert_request(
              req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens,
              cache_creation_tokens, note, attempt, resp_text_bytes, int(thinking)),
         )
-        conn.execute(
-            "DELETE FROM request_log WHERE id <= (SELECT MAX(id) - ? FROM request_log)", (LOG_KEEP_ROWS,)
-        )
+        # 不必每条都跑一次裁剪 DELETE（PK 范围删很便宜，但也是每次请求多一条语句）。
+        # 攒够一批再剪：表最多多留 TRIM_EVERY 行，读取端永远只看最近 2000 行。
+        global _since_trim
+        _since_trim += 1
+        if _since_trim >= TRIM_EVERY:
+            _since_trim = 0
+            conn.execute(
+                "DELETE FROM request_log WHERE id <= (SELECT MAX(id) - ? FROM request_log)",
+                (LOG_KEEP_ROWS,),
+            )
 
 
 def recent_requests(limit: int = 50, exclude_protocols: Iterable[str] = ()) -> tuple[dict, ...]:

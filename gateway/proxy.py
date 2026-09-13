@@ -47,6 +47,10 @@ STALL_TIMEOUT_KEY = "stall_timeout_s"
 DEFAULT_STALL_TIMEOUT_S = 20.0
 MAX_STALL_TIMEOUT_S = 3600.0
 
+# 请求体上限。一次正常 LLM 调用远到不了这个数（1M 上下文纯文本约几 MB，图片再翻几倍），
+# 但客户端写错或恶意灌大时能保住进程 —— Starlette 的 request.body() 会把整包读进内存。
+MAX_REQUEST_BYTES = 64 * 1024 * 1024
+
 
 def stall_timeout() -> float:
     raw = db.get_setting(STALL_TIMEOUT_KEY, "")
@@ -567,8 +571,19 @@ async def forward(
     if not db.protocol_enabled(proto.name):
         log(f"POST {endpoint} -> 404 ({proto.name} 接口已全局停用)")
         return _error(proto, 404, f"{proto.label} 接口已全局停用，请在管理页的接口开关里启用")
+    # content-length 先拦一道（大包不必读进内存）；分块传的边读边数
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+        log(f"POST {endpoint} -> 413 (content-length {declared} 超上限)")
+        return _error(proto, 413, f"请求体超过 {MAX_REQUEST_BYTES // (1024 * 1024)}MB 上限")
     try:
-        body = await request.body()
+        buf = bytearray()
+        async for part in request.stream():
+            buf.extend(part)
+            if len(buf) > MAX_REQUEST_BYTES:
+                log(f"POST {endpoint} -> 413 (请求体超过上限，已读 {len(buf)}B)")
+                return _error(proto, 413, f"请求体超过 {MAX_REQUEST_BYTES // (1024 * 1024)}MB 上限")
+        body = bytes(buf)
     except ClientDisconnect:
         # 大请求体上传到一半客户端走了：连接已经没了，但别在日志里留一坨 ASGI 异常栈
         log(f"POST {endpoint} -> 499 (客户端在请求体上传中途断开)")
@@ -691,6 +706,8 @@ async def forward(
     same_counts: dict[int, int] = {}
     # True = 上一轮决定同站再发，本轮不把 attempt 加一（同站重试优先于换站降级）
     same_mode = False
+    # 客户端在中途走了（重试间隙被检测到）。收尾要记 499/client_abort，不能冤枉成上游连不上
+    client_left = False
 
     # 这里是「自动降级」唯一安全的落点：状态码已经拿到手，但还没往下游发过任何字节，
     # 换个上游重试客户端完全无感。第一个字节一旦发出去就不能再换了。
@@ -703,6 +720,7 @@ async def forward(
             attempt += 1
         if attempt > 1 or same_counts.get(route.upstream.id, 0) > 0:
             if await request.is_disconnected():
+                client_left = True
                 if attempt > 1:
                     attempt -= 1
                 log(f"  客户端已经走了，不再重试（试过 {attempt} 个）")
@@ -785,7 +803,7 @@ async def forward(
                     usage=NO_USAGE, note="client_abort", attempt=attempt,
                 )
             raise
-        except (httpx.HTTPError, ValueError) as exc:
+        except (httpx.HTTPError, httpx.InvalidURL, ImportError, ValueError) as exc:
             fail, resp = exc, None
             elapsed = time.monotonic() - began
             log(
@@ -812,6 +830,7 @@ async def forward(
                         usage=NO_USAGE, note="same_retry", attempt=attempt,
                     )
                 if not await same_retry_pause(delay):
+                    client_left = True
                     log("  客户端已断开，不再同站重试")
                     break
                 fail = None
@@ -872,6 +891,7 @@ async def forward(
                 )
             resp = None
             if not await same_retry_pause(delay):
+                client_left = True
                 log("  客户端已断开，不再同站重试")
                 break
             same_mode = True
@@ -931,6 +951,14 @@ async def forward(
         index = nxt
 
     if resp is None:
+        if client_left:
+            # 客户端在重试间隙走了：这不是上游的锅，记 499 让排障一眼看清
+            inflight.finish(call, status=499, note="client_abort")
+            return _error(proto, 499, "客户端已断开")
+        if call.cancel_requested:
+            # 中断恰好落在「没有候选可试」的那一瞬：也按手动中断记账
+            inflight.finish(call, status=499, note="manual_abort")
+            return _error(proto, 499, "请求已手动中断")
         blamed = last_route or route
         if fail is not None:
             why = f"上游 {blamed.upstream.name} 请求失败: {fail}"
@@ -1024,6 +1052,10 @@ async def forward(
                     except Exception as exc:
                         log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
                 else:
+                    # 非 SSE 响应没有观察器可看：第一块字节就算「开始出正文」，每来一块
+                    # 续一次期 —— 块与块之间同样受发呆超时约束（chunked JSON 卡住也打断）
+                    if stall_s > 0:
+                        content_deadline = time.monotonic() + stall_s
                     # JSON 要收齐后再统计，字符串和 UTF-8 字符也可能被网络切开。
                     room = MAX_JSON_OBSERVE_BYTES - len(json_body)
                     if room > 0:

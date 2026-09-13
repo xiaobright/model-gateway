@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 from . import db
@@ -35,7 +36,9 @@ MAX_RULES = 200
 
 # 规则表每次转发都要读一次；sqlite 已经在每条请求上被查过（resolve_chain），
 # 不差这一下，但没必要每条请求都重新 parse 一遍 JSON，所以按内容缓存解析结果。
+# 读在转发线程、保存在管理接口线程池，加锁免得一边写缓存一边被读到半成品。
 _cache: dict[str, Any] = {"raw": None, "rules": []}
+_lock = threading.Lock()
 
 
 def raw() -> str:
@@ -45,8 +48,9 @@ def raw() -> str:
 def rules() -> list[dict[str, str]]:
     """当前规则表。坏 JSON / 空表都按「没有规则」处理 —— 配错了不能拖垮转发。"""
     text = raw()
-    if _cache["raw"] == text:
-        return _cache["rules"]
+    with _lock:
+        if _cache["raw"] == text:
+            return _cache["rules"]
     parsed: list[dict[str, str]] = []
     if text.strip():
         try:
@@ -62,14 +66,16 @@ def rules() -> list[dict[str, str]]:
                     continue
                 new = item.get("to", "")
                 parsed.append({"from": old, "to": new if isinstance(new, str) else ""})
-    _cache["raw"] = text
-    _cache["rules"] = parsed
+    with _lock:
+        _cache["raw"] = text
+        _cache["rules"] = parsed
     return parsed
 
 
 def save(items: list[dict[str, str]]) -> list[dict[str, str]]:
     db.set_setting(SETTING_KEY, json.dumps(items, ensure_ascii=False, indent=2))
-    _cache["raw"] = None  # 下次 rules() 重新读
+    with _lock:
+        _cache["raw"] = None  # 下次 rules() 重新读
     return rules()
 
 

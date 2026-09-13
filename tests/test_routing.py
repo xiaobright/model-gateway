@@ -61,7 +61,6 @@ def test_route_status_reports_the_available_fallback_when_preferred_is_disabled(
                 "name": detail["name"],
                 "base_url": detail["base_url"],
                 "enabled": False,
-                "egress": detail["egress"],
             },
         )
         assert disabled.status_code == 200, disabled.text

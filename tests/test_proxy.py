@@ -65,6 +65,27 @@ def test_stalled_stream_is_cut_so_downstream_can_retry(gateway):
 
 
 @pytest.mark.network
+def test_non_sse_body_stall_is_cut(gateway):
+    """非流式 JSON 也一样：头到了、第一块字节到了，之后停住就按发呆打断。
+
+    进程内 ASGITransport 会整包缓冲，只有真实 socket 能模拟「吐一半停住」。
+    """
+    from gateway import db
+
+    db.set_setting("stall_timeout_s", "0.4")
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "gpt-test", g_a)
+
+        resp = gateway.post("/v1/responses", json={"model": "gpt-test", "mode": "json_stall"})
+        assert resp.status_code == 200, resp.text
+
+        rows = wait_rows(gateway, 1)
+        assert rows[0]["note"] == "stall_timeout"
+        assert gateway.get("/admin/api/failover").json()["breakers"] == [], "打断不记站故障"
+
+
+@pytest.mark.network
 def test_import_models_and_switch_without_interrupting_stream(gateway):
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA")

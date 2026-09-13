@@ -48,10 +48,17 @@ class UpstreamIn(BaseModel):
 class GroupIn(BaseModel):
     name: _NonBlank
     protocol: str = Field(min_length=1)
-    api_key: str = ""
+    # 省略 / None = 保留库里已有的 key（列表接口只回脱敏形状，编辑弹窗取回原文后照常传）。
+    api_key: str | None = None
     enabled: bool = True
     # PUT 时传了就是把这个分组搬到另一个供应商下（同一个站建成了两个供应商时用来合并）
     upstream_id: int | None = None
+
+
+class EnabledIn(BaseModel):
+    """列表上的快捷开关：只动启用状态，不拿内存里的整份快照覆盖别的字段。"""
+
+    enabled: bool
 
 
 class ModelRouteIn(BaseModel):
@@ -237,13 +244,53 @@ def _validate_egress(raw: str) -> str:
     return egress
 
 
+def _mask_key(key: str) -> str:
+    """列表里只给「前几位 + 长度」：能认出是哪把 key，又不用把凭据发给浏览器。"""
+    key = (key or "").strip()
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return f"… ({len(key)} 位)"
+    return f"{key[:6]}… ({len(key)} 位)"
+
+
+def _mask_userinfo(url: str) -> str:
+    """代理 URL 里的 user:pass 换成 user:***；没凭据的原样返回（主机端口是排障要看的）。"""
+    raw = (url or "").strip()
+    if "://" not in raw or "@" not in raw:
+        return raw
+    scheme, rest = raw.split("://", 1)
+    userinfo, _, host = rest.rpartition("@")
+    user = userinfo.partition(":")[0]
+    return f"{scheme}://{user}:***@{host}"
+
+
+def _vps_preset_raw() -> str:
+    return (db.get_setting("egress_vps", "") or "").strip()
+
+
+def _egress_kind(value: str) -> str:
+    """前端编辑弹窗靠它决定「跟随系统 / 直连 / VPS 预设 / 自填代理」。
+    别让前端拿 raw 值去比对预设 —— 那等于把代理凭据又发下去了。"""
+    raw = (value or "").strip()
+    if not raw or raw == proxy_mod.EGRESS_SYSTEM:
+        return "system"
+    if raw == proxy_mod.EGRESS_DIRECT:
+        return "direct"
+    if raw and raw == _vps_preset_raw():
+        return "vps"
+    return "proxy"
+
+
 def _serialize_group(g: db.Group, models: Iterable[str] = ()) -> dict[str, Any]:
     return {
         "id": g.id,
         "upstream_id": g.upstream_id,
         "name": g.name,
         "protocol": g.protocol,
-        "api_key": g.api_key,
+        # key 不进列表接口：脱敏给一眼能认出的形状，「编辑」时再按需取回
+        "key_masked": _mask_key(g.api_key),
+        "has_key": bool(g.api_key.strip()),
         "enabled": g.enabled,
         # 上游模型目录：这个分组登记过、能调到的上游真名。和「下游暴露」是两回事，
         # 前端用它画「已录入模型」和分组弹窗里的勾选列表。
@@ -263,7 +310,9 @@ def _serialize_upstream(
         "base_url": u.base_url,
         "enabled": u.enabled,
         "header_override": u.header_override,
-        "egress": u.egress,
+        # 出口同样脱敏：kind 给前端选控件，masked 只用于展示，编辑时按需取原文
+        "egress_kind": _egress_kind(u.egress),
+        "egress_masked": _mask_userinfo(u.egress),
         "retry_rules": u.retry_rules,
         "supports": [p for p in protocols.NAMES if any(g.protocol == p for g in groups)],
         "groups": [_serialize_group(g, models_by_group.get(g.id, ())) for g in groups],
@@ -385,6 +434,19 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
     return _one_upstream(upstream_id)
 
 
+@router.get("/upstreams/{upstream_id}/egress")
+def reveal_upstream_egress(upstream_id: int) -> dict[str, str]:
+    """编辑供应商时取回完整出口（含代理凭据）：列表里只回脱敏形状。"""
+    return {"egress": _require_upstream(upstream_id).egress}
+
+
+@router.post("/upstreams/{upstream_id}/enabled")
+def set_upstream_enabled(upstream_id: int, payload: EnabledIn) -> dict[str, bool]:
+    if not db.set_upstream_enabled(upstream_id, payload.enabled):
+        raise HTTPException(404, f"供应商 {upstream_id} 不存在")
+    return {"ok": True}
+
+
 @router.delete("/upstreams/{upstream_id}")
 def remove_upstream(upstream_id: int) -> dict[str, bool]:
     # 分组随供应商级联删除；先把它们的断路器状态清掉，不然管理页会一直挂着幽灵条目
@@ -411,13 +473,13 @@ async def _probe_one(base_url: str, egress: str, label: str, headers: dict[str, 
             resp = await client.get(url, headers=headers)
     except Exception as exc:  # 探测什么都不该抛：代理地址填错是 ValueError，缺 socksio 是 ImportError
         return {
-            "egress": egress, "label": label, "ok": False, "status": 0,
+            "label": label, "ok": False, "status": 0,
             "ms": int((time.monotonic() - began) * 1000),
             "error": str(exc) or exc.__class__.__name__,
         }
     # 拿到任何状态码都算「这扇门能到这个站」。401 也算通 —— 我们问的是网络，不是 key
     return {
-        "egress": egress, "label": label, "ok": True, "status": resp.status_code,
+        "label": label, "ok": True, "status": resp.status_code,
         "ms": int((time.monotonic() - began) * 1000), "error": "",
     }
 
@@ -454,9 +516,19 @@ async def probe_upstream(upstream_id: int) -> dict[str, Any]:
 # 「走 VPS」预设。门是部署在 VPS 上的 gost（systemd: gost-proxy.service），对网关来说
 # 就是一个带自签证书的 https 代理 —— 值存设置表（egress_vps），代码里不落任何密钥：
 # 换端口换密码改一遍设置就行，不用动代码。没配时前端不显示这个选项。
+# 列表只给脱敏形状，前端应用这个预设时才调 /egress-presets/vps 取原文。
 @router.get("/egress-presets")
 def get_egress_presets() -> dict[str, Any]:
-    return {"vps": db.get_setting("egress_vps", "") or None}
+    raw = _vps_preset_raw()
+    return {"has_vps": bool(raw), "vps_masked": _mask_userinfo(raw) if raw else ""}
+
+
+@router.get("/egress-presets/vps")
+def reveal_egress_preset() -> dict[str, str]:
+    raw = _vps_preset_raw()
+    if not raw:
+        raise HTTPException(404, "还没有配置 VPS 出口")
+    return {"vps": raw}
 
 
 @router.get("/standalone-search-target")
@@ -499,7 +571,9 @@ def post_group(upstream_id: int, payload: GroupIn) -> dict[str, Any]:
     name = payload.name.strip()
     protocol = _validate_protocol(payload.protocol)
     try:
-        created = db.create_group(upstream_id, name, protocol, payload.api_key.strip(), payload.enabled)
+        created = db.create_group(
+            upstream_id, name, protocol, (payload.api_key or "").strip(), payload.enabled
+        )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"这个供应商的 {protocol} 接口下已有分组「{name}」") from exc
     return _serialize_group(created)
@@ -507,14 +581,15 @@ def post_group(upstream_id: int, payload: GroupIn) -> dict[str, Any]:
 
 @router.put("/groups/{group_id}")
 def put_group(group_id: int, payload: GroupIn) -> dict[str, Any]:
-    _require_group(group_id)
+    current = _require_group(group_id)
     name = payload.name.strip()
     protocol = _validate_protocol(payload.protocol)
     if payload.upstream_id is not None:
         _require_upstream(payload.upstream_id)
+    api_key = current.api_key if payload.api_key is None else payload.api_key.strip()
     try:
         ok = db.update_group(
-            group_id, name, protocol, payload.api_key.strip(), payload.enabled, payload.upstream_id
+            group_id, name, protocol, api_key, payload.enabled, payload.upstream_id
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"目标供应商的 {protocol} 接口下已有分组「{name}」") from exc
@@ -527,6 +602,19 @@ def put_group(group_id: int, payload: GroupIn) -> dict[str, Any]:
     if not ok:
         raise HTTPException(404, f"分组 {group_id} 不存在")
     return _serialize_group(_require_group(group_id))
+
+
+@router.get("/groups/{group_id}/key")
+def reveal_group_key(group_id: int) -> dict[str, str]:
+    """编辑弹窗按需取回原文 —— 列表接口只回脱敏形状，key 不跟着每次轮询满天飞。"""
+    return {"api_key": _require_group(group_id).api_key}
+
+
+@router.post("/groups/{group_id}/enabled")
+def set_group_enabled(group_id: int, payload: EnabledIn) -> dict[str, bool]:
+    if not db.set_group_enabled(group_id, payload.enabled):
+        raise HTTPException(404, f"分组 {group_id} 不存在")
+    return {"ok": True}
 
 
 @router.post("/groups/{group_id}/clone")

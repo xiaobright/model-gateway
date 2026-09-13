@@ -33,9 +33,11 @@ from .reqlog import log
 KEEP_SECONDS = 90.0
 KEEP_ROWS = 24
 
-# 活跃条目超过这个岁数就当漏了扫掉。正常情况 relay 的 finally 一定会注销，但
-# 「响应刚返回、生成器还没被迭代过就被取消」那一瞬够不到 finally（没启动过的生成器
+# 活跃条目这么久没有**任何进度**就当漏了扫掉。正常情况 relay 的 finally 一定会注销，
+# 但「响应刚返回、生成器还没被迭代过就被取消」那一瞬够不到 finally（没启动过的生成器
 # close() 不执行函数体），漏一条就会在页面上挂个永不消失的幽灵。
+# 判据是「最后进度」不是「开始时间」：一条跑了两小时的流只要一直在出字节就不该被扫 ——
+# 按开始时间一刀切会把长流从实时页抹掉，手动中断也跟着失效。
 # 阈值取读超时（600s）再宽一倍。
 STALE_SECONDS = 720.0
 
@@ -57,6 +59,8 @@ class Call:
     stream: bool
     req_bytes: int
     meta: bool = False              # count_tokens 这类元数据请求，不计入「进行中」
+    # 最后一次有进展的时刻。扫幽灵看它，不看 started —— 长流不该因为跑得久被清掉
+    progress_at: float = 0.0
     # 当前这次尝试打的是谁
     attempt: int = 1
     upstream: str = ""
@@ -99,7 +103,7 @@ class ManualAbort(Exception):
 
 
 class UpstreamStall(Exception):
-    """上游在发呆超时内没有给出响应头或下一个字节。"""
+    """上游开始输出内容后，超过发呆超时没有再吐新内容。"""
 
 
 async def wait_for_upstream(
@@ -155,12 +159,18 @@ def begin(
 ) -> Call:
     with _lock:
         _sweep()
+        now = time.monotonic()
         call = Call(
-            id=next(_ids), started=time.monotonic(), client=client, protocol=protocol,
+            id=next(_ids), started=now, progress_at=now, client=client, protocol=protocol,
             model=model, stream=stream, req_bytes=req_bytes, meta=meta,
         )
         _calls[call.id] = call
     return call
+
+
+def _touch(call: Call) -> None:
+    """有什么动了一下就记下来 —— 阶段、字节、上游报数、换候选都算进展。"""
+    call.progress_at = time.monotonic()
 
 
 def set_route(
@@ -189,6 +199,7 @@ def set_route(
     call.tokens_out = 0
     call.text_bytes = 0
     call.thinking = False
+    _touch(call)
 
 
 def phase(call: Call | None, name: str, *, status: int = 0) -> None:
@@ -197,6 +208,7 @@ def phase(call: Call | None, name: str, *, status: int = 0) -> None:
     call.phase = name
     if status:
         call.status = status
+    _touch(call)
 
 
 def usage(call: Call | None, *, tokens_in: int = 0, tokens_out: int = 0) -> None:
@@ -210,6 +222,7 @@ def usage(call: Call | None, *, tokens_in: int = 0, tokens_out: int = 0) -> None
         return
     call.tokens_in = max(call.tokens_in, tokens_in)
     call.tokens_out = max(call.tokens_out, tokens_out)
+    _touch(call)
 
 
 def progress(call: Call | None, sent: int, *, text_bytes: int = 0, thinking: bool = False) -> None:
@@ -218,12 +231,14 @@ def progress(call: Call | None, sent: int, *, text_bytes: int = 0, thinking: boo
     call.sent = sent
     call.text_bytes = text_bytes
     call.thinking = call.thinking or thinking
+    _touch(call)
 
 
 def failed(call: Call | None, *, status: int, note: str, ms: int) -> None:
     """这次尝试没成，要换下一个候选了。客户端看不见它，但它真花了钱，所以留痕。"""
     if call is None:
         return
+    _touch(call)
     call.trail.append(
         {
             "attempt": call.attempt,
@@ -270,7 +285,10 @@ def _sweep() -> None:
     """漏掉的活跃条目扫走。真漏了得看得见，所以记一行日志而不是默默删。"""
     with _lock:
         now = time.monotonic()
-        stale = [c for c in _calls.values() if not c.done_at and now - c.started > STALE_SECONDS]
+        stale = [
+            c for c in _calls.values()
+            if not c.done_at and now - (c.progress_at or c.started) > STALE_SECONDS
+        ]
         for call in stale:
             _calls.pop(call.id, None)
         for call in stale:

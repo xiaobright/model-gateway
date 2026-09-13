@@ -68,6 +68,27 @@ def test_manual_cancel_closes_a_real_stream_and_gateway_stays_usable(gateway):
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
 
 
+@pytest.mark.network
+def test_manual_cancel_works_for_a_non_stream_request(gateway):
+    """非流式也要能中断：上游头已到、正文磨着不发时，× 得能掐掉这条等待。"""
+    with MockUpstream("siteA") as upstream:
+        group = add_upstream(gateway, upstream, "siteA")
+        add_route(gateway, "gpt-test", group)
+        with gateway.stream(
+            "POST", "/v1/responses", json={"model": "gpt-test", "mode": "json_stall"}
+        ) as stream:
+            chunks = stream.iter_bytes()
+            assert next(chunks)                      # 第一块正文已经过来
+            target = gateway.get("/admin/api/inflight").json()["calls"][0]
+            assert gateway.post(f'/admin/api/inflight/{target["id"]}/cancel').json() == {
+                "ok": True, "cancelled": True,
+            }
+            assert b"".join(chunks) == b"", "取消之后不会再有字节"
+
+        done = wait_inflight(gateway, lambda data: not data["calls"])["recent"][0]
+        assert done["note"] == "manual_abort"
+
+
 def test_inflight_keeps_the_failover_trail(gateway):
     """降级最怕的是把问题藏起来：胜出的那条要带着「前面被谁拒了」。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:

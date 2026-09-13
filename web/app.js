@@ -11,7 +11,7 @@ import {
   catalogOfGroup, catalogOfUpstream, routeCountOfGroup, routeCountOfUpstream,
   groupLabel, upstreamOfGroup, groupOf, protocolOn,
   supportsIface, groupsOfIface, splitOneM, withOneM,
-  PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTOCOLS, setProtocolMetadata,
+  PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
@@ -123,7 +123,7 @@ const configRefresh = createRefreshQueue(
     return { presets, upstreams, routes, failover, searchTarget, rewriteRules, stallTimeout };
   },
   (data, args) => {
-    state.egressVps = data.presets ? data.presets.vps : null;
+    state.egressVps = data.presets && data.presets.has_vps ? (data.presets.vps_masked || 'VPS') : null;
     state.upstreams = data.upstreams;
     state.routes = data.routes;
     state.searchTarget = data.searchTarget;
@@ -459,13 +459,24 @@ function baseHint() {
 }
 
 /* 出口：'' 跟随系统 / 'direct' 直连 / 'vps' 预设门 / 一个代理 URL。界面上拆成
-   「多选一 + URL」两个控件，因为前两个是选择、最后一个才要打字。 */
+   「多选一 + URL」两个控件，因为前两个是选择、最后一个才要打字。
+   代理凭据（自填的 user:pass 和设置表里的 VPS 预设）都不在列表接口里下发：
+   编辑时按需取回，只放在当前表单里。 */
 const EGRESS_TIP = {
   '': '默认。httpx 会读环境变量和 Windows 注册表里的系统代理（Clash 那种），所以这个站跟着你的代理走',
   direct: '不走任何代理，从本机自己的出口出去。被机房 IP 拉黑的站要用这个',
-  vps: '走你在 VPS 上部署的那扇门（地址在设置表 egress_vps 里，保存的是同一个 URL）',
+  vps: '走你在 VPS 上部署的那扇门（地址存在设置表 egress_vps，列表里只显示脱敏形状）',
   proxy: '只有这个站走这个代理。填 http:// 或 socks5://（vless/ss 得先由本机内核落成一个这样的端口）',
 };
+
+let vpsPresetRaw = '';   // 完整预设 URL，只在需要保存/填充时取回一次
+
+async function ensureVpsPreset() {
+  if (vpsPresetRaw) return vpsPresetRaw;
+  const data = await api('GET', '/admin/api/egress-presets/vps');
+  vpsPresetRaw = data.vps || '';
+  return vpsPresetRaw;
+}
 
 function egressKind() {
   return $('up-egress-kind').value;
@@ -473,7 +484,7 @@ function egressKind() {
 
 function egressValue() {
   const kind = egressKind();
-  if (kind === 'vps') return state.egressVps || '';
+  if (kind === 'vps') return vpsPresetRaw;
   return kind === 'proxy' ? $('up-egress-url').value.trim() : kind;
 }
 
@@ -483,10 +494,8 @@ function egressHint() {
   $('up-egress-hint').textContent = EGRESS_TIP[kind] || '';
 }
 
-function fillEgress(value) {
-  const raw = (value || '').trim();
-  const kind = raw === '' || raw === 'direct' ? raw
-    : state.egressVps && raw === state.egressVps ? 'vps' : 'proxy';
+/* kind 由后端算（system / direct / vps / proxy），raw 只在编辑代理时按需取回 */
+function fillEgress(kind, raw = '') {
   $('up-egress-kind').value = kind;
   $('up-egress-url').value = kind === 'proxy' ? raw : '';
   egressHint();
@@ -517,16 +526,27 @@ async function probeUpstream() {
   }
 }
 
-function openUpstream(id) {
+async function openUpstream(id) {
   state.editing = id;
   const u = id === null ? null : state.upstreams.find((x) => x.id === id);
+  // 自填代理的完整地址（可能含账密）不在列表里，编辑这一个站时单独取回；
+  // 取失败就别开弹窗，否则表单里是空值，保存会把配置抹掉
+  let egressRaw = '';
+  if (u && u.egress_kind === 'proxy') {
+    try {
+      egressRaw = (await api('GET', `/admin/api/upstreams/${u.id}/egress`)).egress || '';
+    } catch (e) {
+      return toast(`读取出口配置失败：${e.message}`, 'err');
+    }
+    if (state.editing !== id) return;   // 等响应期间用户已经点到别处了
+  }
   $('up-title').textContent = u ? `编辑供应商：${u.name}` : '添加供应商';
   $('up-name').value = u ? u.name : '';
   $('up-base').value = u ? u.base_url : '';
   $('up-override').value = u ? (u.header_override || '') : '';
   $('up-retry').value = u ? (u.retry_rules || '') : '';
   $('up-enabled').checked = u ? u.enabled : true;
-  fillEgress(u ? u.egress : '');
+  fillEgress(u ? (u.egress_kind || 'system') : 'system', egressRaw);
   baseHint();
   markOverride();
   markRetry();
@@ -576,18 +596,26 @@ const RETRY_PRESETS = {
   capacity: '[{"status":503,"times":2,"delay_ms":300}]',
 };
 
-function upstreamPayload(source = null, enabled = null) {
+function upstreamPayload() {
   return {
-    name: source ? source.name : $('up-name').value.trim(),
-    base_url: source ? source.base_url : $('up-base').value.trim(),
-    enabled: enabled ?? (source ? source.enabled : $('up-enabled').checked),
-    header_override: source ? (source.header_override || '') : $('up-override').value.trim(),
-    egress: source ? (source.egress || '') : egressValue(),
-    retry_rules: source ? (source.retry_rules || '') : $('up-retry').value.trim(),
+    name: $('up-name').value.trim(),
+    base_url: $('up-base').value.trim(),
+    enabled: $('up-enabled').checked,
+    header_override: $('up-override').value.trim(),
+    egress: egressValue(),
+    retry_rules: $('up-retry').value.trim(),
   };
 }
 
 async function saveUpstream() {
+  if (egressKind() === 'vps') {
+    try {
+      await ensureVpsPreset();      // 保存前取回预设原文；列表接口只给脱敏形状
+    } catch (e) {
+      return toast(`读取 VPS 出口失败：${e.message}`, 'err');
+    }
+    if (!vpsPresetRaw) return toast('设置表里没有 egress_vps，先在设置里配好这扇门', 'err');
+  }
   const payload = upstreamPayload();
   if (!payload.name || !payload.base_url) return toast('名称和 Base URL 都要填', 'err');
   if (egressKind() === 'proxy' && !payload.egress) {
@@ -639,13 +667,18 @@ async function saveUpstream() {
 
 /* 分组管「走哪种接口、用哪把 key、能看到哪些模型」。模型列表必须跟着 key 走 —— 同一个站的
    两把 key 能拉到的东西常常不一样，这也是分组存在的理由。 */
+
+/* 1M 上下文是协议自己的属性（后端 /admin/api/protocols 下发 supports_1m 投影），
+   别在前端写死 anthropic —— 以后加协议不用回来找这两处 */
+const protocolSupports1m = (iface) => Boolean(PROTO_INFO[iface] && PROTO_INFO[iface].supports_1m);
+
 function fillIfaceSelect(selectId, value) {
   $(selectId).innerHTML = PROTOCOLS.map((p) =>
     `<option value="${p}">${esc(PROTO_LABEL[p])}　${esc(PROTO_PATH[p])} · ${esc(PROTO_CLIENT[p])}</option>`).join('');
   $(selectId).value = value;
 }
 
-function openGroup(upstreamId, gid) {
+async function openGroup(upstreamId, gid) {
   if (!PROTOCOLS.length) return toast('协议选项还没加载完成，请稍后重试', 'err');
   const up = state.upstreams.find((u) => u.id === Number(upstreamId));
   if (!up) return toast('供应商不存在了，刷新一下', 'err');
@@ -653,9 +686,23 @@ function openGroup(upstreamId, gid) {
   const token = beginGroupEdit(up.id, g ? g.id : null);
   $('group-dialog').dataset.groupSession = String(token.seq);
 
+  // 列表接口只回脱敏 key；编辑时按需取回原文，取失败就别开弹窗 ——
+  // 否则表单里是掩码，一保存就把真 key 冲掉了
+  let key = '';
+  if (g) {
+    try {
+      key = (await api('GET', `/admin/api/groups/${g.id}/key`)).api_key || '';
+    } catch (e) {
+      closeGroupEdit(token.seq);
+      return toast(`读取分组 Key 失败：${e.message}`, 'err');
+    }
+    if (!isCurrentGroupEdit(token)) return;   // 等响应期间弹窗已被关掉/切走
+  }
+  editingKey = key;
+
   $('grp-title').textContent = g ? `编辑分组：${up.name} · ${g.name}` : `给「${up.name}」加分组`;
   $('grp-name').value = g ? g.name : '默认';
-  $('grp-key').value = g ? g.api_key : '';
+  $('grp-key').value = key;
   $('grp-key').type = 'password';
   $('grp-enabled').checked = g ? g.enabled : true;
 
@@ -705,6 +752,7 @@ async function saveGroup() {
   const token = currentGroupEdit();
   if (!token || !isCurrentGroupEdit(token)) return null;
   const original = token.groupId === null ? null : groupOf(token.groupId);
+  const keyBefore = editingKey;   // 列表接口没有 key 原文，脏检查拿打开弹窗时取回的那份比
   const targetUpstream = token.upstreamId;
   const targetGroup = token.groupId;
   const payload = {
@@ -727,6 +775,7 @@ async function saveGroup() {
     await api('PUT', `/admin/api/groups/${targetGroup}`, payload);
   }
   await refreshConfig();
+  editingKey = payload.api_key;
   if (!isCurrentGroupEdit(token)) return null;
   if (created) {
     updateGroupEdit(token, targetUpstream, created.id);
@@ -739,7 +788,7 @@ async function saveGroup() {
     updateGroupEdit(token, movedTo, targetGroup);
     toast(payload.upstream_id ? '已保存并搬到新供应商下' : '已保存', 'ok');
   }
-  if (original && (original.api_key !== payload.api_key
+  if (original && (keyBefore !== payload.api_key
     || original.protocol !== payload.protocol || original.upstream_id !== movedTo)) {
     invalidateRemoteModels(targetGroup);
   }
@@ -905,7 +954,7 @@ function openRoute(model, rid, proto) {
   const { bare, onem } = splitOneM(cand ? cand.remote_model : '');
   $('rt-remote').value = bare && bare !== model ? bare : '';
   $('rt-onem').checked = onem;
-  $('rt-onem-wrap').hidden = iface !== 'anthropic';   // beta 头只有 Anthropic 那边有
+  $('rt-onem-wrap').hidden = !protocolSupports1m(iface);   // 1M 是协议元数据说的，别写死
   fillRemoteList(Number($('rt-group').value));
   // 顺序只在「改某个候选」时能调：新增的那条还不在链上
   $('rt-order-wrap').hidden = !cand;
@@ -1193,7 +1242,8 @@ const ACTIONS = {
   'toggle-upstream': async ({ uid }, el) => {
     const u = state.upstreams.find((x) => x.id === Number(uid));
     try {
-      await api('PUT', `/admin/api/upstreams/${u.id}`, upstreamPayload(u, el.checked));
+      // 只翻启用位：整包 PUT 会拿内存快照把另一标签页/弹窗改过的字段覆盖回去
+      await api('POST', `/admin/api/upstreams/${u.id}/enabled`, { enabled: el.checked });
     } catch (e) {
       el.checked = !el.checked;
       throw e;
@@ -1239,9 +1289,7 @@ const ACTIONS = {
   'toggle-group': async ({ gid }, el) => {
     const g = groupOf(Number(gid));
     try {
-      await api('PUT', `/admin/api/groups/${g.id}`, {
-        name: g.name, protocol: g.protocol, api_key: g.api_key, enabled: el.checked,
-      });
+      await api('POST', `/admin/api/groups/${g.id}/enabled`, { enabled: el.checked });
     } catch (e) {
       el.checked = !el.checked;
       throw e;
@@ -1578,14 +1626,18 @@ const ACTIONS = {
   },
 };
 
-/* 分组弹窗上半部分（组名 / 接口 / key / 启用）有没有改过。拉取和删组之前要知道。 */
+/* 分组弹窗上半部分（组名 / 接口 / key / 启用 / 所属供应商）有没有改过。
+   拉取和删组之前要知道。key 原文只在打开弹窗时取回一次，存在 editingKey 里。 */
+let editingKey = '';
+
 function groupDirty() {
   const g = state.editingGroup === null ? null : groupOf(state.editingGroup);
   if (!g) return false;
   return $('grp-name').value.trim() !== g.name
     || $('grp-proto').value !== g.protocol
-    || $('grp-key').value.trim() !== g.api_key
-    || $('grp-enabled').checked !== g.enabled;
+    || $('grp-key').value.trim() !== editingKey
+    || $('grp-enabled').checked !== g.enabled
+    || Number($('grp-upstream').value) !== state.editingUp;
 }
 
 /* ---------------------------------------------------------------- 事件绑定 */
@@ -1664,7 +1716,7 @@ $('rt-iface').addEventListener('change', () => {
   fillUpstreamSelect('rt-upstream', pool);
   fillGroupSelect('rt-group', $('rt-upstream').value, iface);
   fillRemoteList(Number($('rt-group').value));
-  $('rt-onem-wrap').hidden = iface !== 'anthropic';
+  $('rt-onem-wrap').hidden = !protocolSupports1m(iface);
 });
 
 // 站根填/改的时候把补出来的两个地址实时显示出来，免得又把 /v1 带上

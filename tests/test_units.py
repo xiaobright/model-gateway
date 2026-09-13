@@ -869,3 +869,83 @@ def test_settings_port_ignores_booleans(tmp_path, monkeypatch):
 
     settings.write_text('{"port": "abc"}', encoding="utf-8")
     assert config.load_port() == config.DEFAULT_PORT
+
+
+def test_inflight_sweep_keeps_a_long_call_that_keeps_progressing():
+    """长流能跑几个小时：扫幽灵要看「最后进度」，不是开始时间 ——
+    否则流还在吐字节，实时页卡片先被扫没了，手动中断也跟着失效。"""
+    from gateway import inflight
+
+    inflight.reset()
+    try:
+        stale = inflight.begin(client="ua", protocol="openai", model="m", stream=True, req_bytes=1)
+        alive = inflight.begin(client="ua", protocol="openai", model="m", stream=True, req_bytes=1)
+        old = time.monotonic() - inflight.STALE_SECONDS - 5
+        stale.started = old
+        stale.progress_at = old
+        alive.started = old
+        alive.progress_at = old
+        inflight.progress(alive, 10)      # 刚刚还有字节流过去
+
+        inflight._sweep()
+        ids = {c["id"] for c in inflight.snapshot()["calls"]}
+        assert alive.id in ids, "一直在出内容的流不该被当幽灵扫掉"
+        assert stale.id not in ids, "真的没进度了才清"
+    finally:
+        inflight.reset()
+
+
+def test_inflight_cancel_wakes_a_pending_upstream_wait():
+    """取消要能立刻叫醒正在等的上游操作；重复取消无副作用，结束的不再受理。"""
+    from gateway import inflight
+
+    async def scenario() -> None:
+        inflight.reset()
+        call = inflight.begin(client="ua", protocol="openai", model="m", stream=False, req_bytes=1)
+
+        async def forever() -> None:
+            await asyncio.Event().wait()
+
+        waiter = asyncio.ensure_future(inflight.wait_for_upstream(call, forever()))
+        await asyncio.sleep(0)
+        assert inflight.cancel(call.id) is True
+        with pytest.raises(inflight.ManualAbort):
+            await waiter
+        assert inflight.cancel(call.id) is True, "重复中断无副作用"
+        inflight.finish(call, status=499, note="manual_abort")
+        assert inflight.cancel(call.id) is False, "已经结束的条目不再受理"
+
+    asyncio.run(scenario())
+
+
+def test_autostart_powershell_quoting_escapes_apostrophes():
+    """安装路径里有撇号（用户名 O'Brien 那种）不能破坏脚本，更不能注入。"""
+    from gateway.autostart import _ps_quote
+
+    assert _ps_quote("C:\O'Brien\main.py") == "'C:\O''Brien\main.py'"
+
+
+def _scope(**headers: str) -> dict:
+    return {
+        "type": "http", "path": "/admin/api/upstreams",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+    }
+
+
+def test_local_only_middleware_compares_origin_port_and_host():
+    """同 host 异端口是 same-site：必须比端口。缺 Host、跨站特征、Origin null 一律拒绝。"""
+    from gateway.app import _reject_reason
+
+    assert _reject_reason(_scope(host="127.0.0.1:8317", origin="http://127.0.0.1:8317")) is None
+    assert _reject_reason(_scope(host="localhost:8317", origin="http://localhost:8317")) is None
+    assert _reject_reason(
+        _scope(host="127.0.0.1:8317", origin="http://127.0.0.1:8317", **{"sec-fetch-site": "same-origin"})
+    ) is None
+
+    assert _reject_reason(_scope(host="127.0.0.1:8317", origin="http://127.0.0.1:9000"))
+    assert _reject_reason(_scope(host="127.0.0.1:8317", origin="http://[::1]:8317"))
+    assert _reject_reason(_scope(host="127.0.0.1:8317", origin="http://127.0.0.1"))  # 端口缺省 = 80
+    assert _reject_reason(_scope(host="127.0.0.1:8317", origin="null"))
+    assert _reject_reason(_scope(host="127.0.0.1:8317", **{"sec-fetch-site": "cross-site"}))
+    assert _reject_reason(_scope(host=""))
+    assert _reject_reason(_scope(host="evil.example", origin="http://127.0.0.1:8317"))
