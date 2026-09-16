@@ -288,17 +288,24 @@ async def forward(
     )
     if not chain:
         # 模型录在别的接口下时说清楚：这种 404 光看「未配置」会以为是没导入。
-        # 本接口也在暴露名单里时不算「别处」——那只是候选全停用了，文案该走默认
+        # 本接口也在暴露名单里时不算「别处」——那只是候选全停用了，文案该走默认。
+        # 转发死链（目标没有可用候选）优先说转发，否则只会看到一头雾水的「未配置」
+        hops = db.forward_path(asked, proto.name)
         others = [p for p in db.protocol_of_model(asked) if p != proto.name]
-        why = (
-            f"模型 {requested!r} 是在 {'、'.join(others)} 接口下暴露的，不能从 {endpoint} 调用"
-            if others
-            else f"模型 {requested!r} 未配置或当前上游已停用"
-        )
+        if hops:
+            why = f"模型 {requested!r} 转发到 {hops[-1]!r}，但那边没有可用候选"
+        elif others:
+            why = f"模型 {requested!r} 是在 {'、'.join(others)} 接口下暴露的，不能从 {endpoint} 调用"
+        else:
+            why = f"模型 {requested!r} 未配置或当前上游已停用"
         log(f"POST {endpoint} model={requested!r} -> 404 ({why}) req={len(body)}B")
         return _error(proto, 404, why)
     if chain[0].model_name != asked:
-        log(f"POST {endpoint} model={asked!r} 没配过，按档位关键字落到 {chain[0].model_name!r}")
+        hops = db.forward_path(asked, proto.name)
+        if hops:
+            log(f"POST {endpoint} model={asked!r} 转发 {' → '.join((asked, *hops))}")
+        else:
+            log(f"POST {endpoint} model={asked!r} 没配过，按档位关键字落到 {chain[0].model_name!r}")
 
     stream_flag = bool(payload.get("stream"))
     # 有副作用的 OpenAI 请求不降级：上游可能已经把它存下来了才失败，重试会留下两条

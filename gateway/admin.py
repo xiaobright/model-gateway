@@ -94,6 +94,14 @@ class OrderIn(BaseModel):
     order: tuple[int, ...] = Field(min_length=1)
 
 
+class ForwardIn(BaseModel):
+    """下游→下游转发：把 model_name 的整条链交给 target_model（同接口内）。"""
+
+    model_name: _NonBlank
+    protocol: str = Field(min_length=1)
+    target_model: _NonBlank
+
+
 class FailoverIn(BaseModel):
     protocol: str = Field(min_length=1)
     enabled: bool
@@ -698,6 +706,10 @@ def remove_group_model(
 def get_model_routes() -> list[dict[str, Any]]:
     disabled = db.disabled_protocols()
     cooling = {b["group_id"]: b for b in failover.snapshot()}
+    forwards = {
+        (row["model_name"], row["protocol"]): row["target_model"]
+        for row in db.list_forwards()
+    }
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for row in db.list_routes():
         if row["protocol"] in disabled:
@@ -714,6 +726,8 @@ def get_model_routes() -> list[dict[str, Any]]:
                 # 保存的首选和当前实际起点分开：停用首选后，自动降级仍可能有可用候选。
                 "preferred_route_id": None,
                 "active_route_id": None,
+                # 有转发布置的模型（下游→下游）：整条链交给目标，自己的候选不参与路由
+                "forward_to": forwards.get(key),
             },
         )
         is_active = bool(row["is_active"])
@@ -743,9 +757,29 @@ def get_model_routes() -> list[dict[str, Any]]:
         if is_active:
             group["preferred_route_id"] = row["route_id"]
 
+    # 纯转发模型（自己没有候选，只把整条链交给别的模型）也要在列表里 —— 它对下游
+    # 一样暴露，编排页要画得出它这个气泡。接口被停用时跟候选链同规则隐藏。
+    for (name, protocol), target in forwards.items():
+        if protocol in disabled:
+            continue
+        grouped.setdefault(
+            (name, protocol),
+            {
+                "model_name": name,
+                "protocol": protocol,
+                "candidates": [],
+                "preferred_route_id": None,
+                "active_route_id": None,
+                "forward_to": target,
+            },
+        )
+
     # 和 proxy.forward 使用同一条 resolve_chain + 断路器排序规则，返回当前真正会先
     # 尝试的候选。这里不能只看 is_active 那一行，否则首选停用时页面会误报无可用上游。
+    # 转发中的模型不报 active —— 它自己的链不参与路由，前端顺着 forward_to 看目标的状态。
     for group in grouped.values():
+        if group.get("forward_to"):
+            continue
         chain = db.resolve_chain(group["model_name"], group["protocol"])
         if chain:
             ordered = failover.order_chain(chain) if failover.enabled(group["protocol"]) else chain
@@ -820,6 +854,44 @@ def post_order(payload: OrderIn) -> dict[str, Any]:
         raise HTTPException(404, f"「{payload.model_name}」没有这些候选")
     log(f"ORDER model={payload.model_name!r} -> {list(payload.order)}")
     return {"ok": True, "ordered": n}
+
+
+@router.post("/models/forward")
+def post_model_forward(payload: ForwardIn) -> dict[str, Any]:
+    """设置下游→下游转发：把一条链整个交给另一个模型（同接口内）。"""
+    protocol = _validate_protocol(payload.protocol)
+    model_name = payload.model_name.strip()
+    target = payload.target_model.strip()
+    try:
+        db.set_forward(model_name, protocol, target)
+    except db.ForwardCycle as exc:
+        raise HTTPException(409, f"这条转发会绕成环：{' → '.join(exc.args[0])}") from exc
+    except db.ForwardMissingTarget as exc:
+        raise HTTPException(
+            409,
+            f"目标模型「{exc.args[0]}」在 {protocol} 接口下没有候选链，转发过去也是 404；"
+            "先给它配好上游再来指",
+        ) from exc
+    log(f"FORWARD {model_name!r} [{protocol}] -> {target!r}")
+    return {"ok": True, "model_name": model_name, "protocol": protocol, "target_model": target}
+
+
+@router.delete("/models/forward")
+def remove_model_forward(
+    request: Request,
+    model_name: str = Query(default="", description="模型名"),
+    protocol: str = Query(default="", description="接口"),
+) -> dict[str, Any]:
+    # 同 DELETE /models：模型名可能带 '/'，用 query 参数；未知参数直接拒，防手滑
+    unknown = set(request.query_params) - {"model_name", "protocol"}
+    if unknown:
+        raise HTTPException(400, f"不支持的删除参数：{', '.join(sorted(unknown))}")
+    if not model_name:
+        raise HTTPException(400, "要取消转发，给 model_name 和 protocol")
+    if not db.delete_forward(model_name, protocol.strip().lower()):
+        raise HTTPException(404, "这条转发不存在")
+    log(f"FORWARD off {model_name!r} [{protocol}]")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- 实时
@@ -963,10 +1035,13 @@ def remove_model_route(
         return {"ok": True, "removed": 1, "model_name": name}
     if not model_name:
         raise HTTPException(400, "要么给 route_id，要么给 model_name")
-    removed = db.delete_model(model_name, protocol)
-    if removed == 0:
+    removed, forwards = db.delete_model(model_name, protocol)
+    if not removed and not forwards:
         raise HTTPException(404, f"模型「{model_name}」不存在")
-    return {"ok": True, "removed": removed}
+    result: dict[str, Any] = {"ok": True, "removed": removed}
+    if forwards:
+        result["forwards_removed"] = forwards
+    return result
 
 
 # ---------------------------------------------------------------- 转发记录 / 运维

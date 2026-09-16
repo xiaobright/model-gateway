@@ -66,6 +66,18 @@ CREATE TABLE IF NOT EXISTS group_models(
   UNIQUE(group_id, remote_model)
 );
 CREATE TABLE IF NOT EXISTS model_routes({_ROUTE_COLUMNS});
+-- 下游模型转发：把「my-chat」的整条链交给「my-chat-v2」。源和目标都用
+-- (model_name, protocol) 定位 —— 同名模型可以在多种接口下各有一条链，转发只在
+-- 同接口内发生（跨接口的请求本来就互相看不见）。一个模型在一个接口下只有一条
+-- 转发布置；取消转发 = 删掉这一行，模型回到自己的候选链。
+CREATE TABLE IF NOT EXISTS model_forwards(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_name TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  target_model TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  UNIQUE(model_name, protocol)
+);
 CREATE TABLE IF NOT EXISTS request_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL DEFAULT (datetime('now','localtime')),
@@ -112,7 +124,8 @@ _since_trim = 0
 #   4 = request_log 记录 Anthropic 的缓存创建 token
 #   5 = 上游模型目录（group_models）与下游候选分开
 #   6 = 上游同站重试规则（retry_rules）
-SCHEMA_VERSION = 6
+#   7 = 下游模型转发（model_forwards）：一个下游模型可以把整条链交给另一个下游
+SCHEMA_VERSION = 7
 
 # 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
 BACKUP_KEEP = 3
@@ -134,6 +147,14 @@ class DuplicateRemote(Exception):
 
 class ProtocolLocked(Exception):
     """分组下已经有候选了，不能再改它的接口。args = (候选数,)。"""
+
+
+class ForwardCycle(Exception):
+    """转发会绕成一个环。args[0] = 环上的名字序列（首尾同名）。"""
+
+
+class ForwardMissingTarget(Exception):
+    """转发最终落地的模型在同接口下没有候选。args[0] = 那个模型名。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -885,15 +906,18 @@ def _group_protocol(conn: sqlite3.Connection, group_id: int) -> str:
 
 
 def _model_protocols(conn: sqlite3.Connection, model_name: str) -> tuple[str, ...]:
-    """模型在哪些接口下暴露 = 它各候选所在分组的接口集合。空 = 这个模型名还不存在。
+    """模型在哪些接口下暴露 = 它各候选所在分组的接口集合，外加转发布置的接口。
+    空 = 这个模型名还不存在。
 
     同一个模型名允许在多种接口下各挂一条链（一个站同时暴露 Responses 和 Chat
     Completions 很常见）：转发按「模型名 + 请求接口」选链（_CHAIN_QUERY 过滤协议），
-    两条链互不可见，跨接口调用照旧 404。"""
+    两条链互不可见，跨接口调用照旧 404。纯转发模型（自己没有候选）的接口由转发行
+    决定 —— 它一样算「在那些接口下暴露」。"""
     rows = conn.execute(
-        "SELECT DISTINCT g.protocol FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
-        " WHERE m.model_name=?",
-        (model_name,),
+        "SELECT DISTINCT g.protocol AS protocol FROM model_routes m"
+        " JOIN upstream_groups g ON g.id = m.group_id WHERE m.model_name=?"
+        " UNION SELECT protocol FROM model_forwards WHERE model_name=?",
+        (model_name, model_name),
     ).fetchall()
     return tuple(r["protocol"] for r in rows)
 
@@ -974,9 +998,13 @@ def delete_model_route(route_id: int) -> str:
         return row["model_name"]
 
 
-def delete_model(model_name: str, protocol: str = "") -> int:
-    """删掉一个模型名下的候选，返回删除条数。给了 protocol 就只删那条链 ——
-    同名模型在别的接口下的候选保留（整名删掉时不存在活跃位问题，不用重挂）。"""
+def delete_model(model_name: str, protocol: str = "") -> tuple[int, int]:
+    """删掉一个模型名下的候选和它自己的转发布置，返回 (删掉的候选条数, 删掉的转发条数)。
+    给了 protocol 就只删那条链 —— 同名模型在别的接口下的候选保留（整名删掉时不存在
+    活跃位问题，不用重挂）。
+
+    指向别处模型的转发不在删除范围内：目标没了时那条转发会显示为断链，由人决定取消
+    还是改指 —— 静默把别人改回自己的候选链比断链更难排查。"""
     with _conn() as conn:
         if protocol:
             removed = conn.execute(
@@ -988,11 +1016,18 @@ def delete_model(model_name: str, protocol: str = "") -> int:
             ).rowcount
             if removed:
                 _reattach_active(conn, model_name)
+            forwards = conn.execute(
+                "DELETE FROM model_forwards WHERE model_name=? AND protocol=?",
+                (model_name, protocol),
+            ).rowcount
         else:
             removed = conn.execute(
                 "DELETE FROM model_routes WHERE model_name=?", (model_name,)
             ).rowcount
-        return removed
+            forwards = conn.execute(
+                "DELETE FROM model_forwards WHERE model_name=?", (model_name,)
+            ).rowcount
+        return removed, forwards
 
 
 def switch_route(route_id: int) -> str:
@@ -1030,8 +1065,9 @@ def _tier_match(conn: sqlite3.Connection, model_name: str, protocol: str) -> str
         r["model_name"]
         for r in conn.execute(
             "SELECT DISTINCT m.model_name FROM model_routes m"
-            " JOIN upstream_groups g ON g.id = m.group_id WHERE g.protocol=?",
-            (protocol,),
+            " JOIN upstream_groups g ON g.id = m.group_id WHERE g.protocol=?"
+            " UNION SELECT model_name FROM model_forwards WHERE protocol=?",
+            (protocol, protocol),
         )
     ]
     same = [n for n in names if naming.tier_of(n) == tier]
@@ -1155,14 +1191,31 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
     档位关键字兜底和 resolve_route 是同一套：先定下实际命中的模型名，再取它的整条链。
     """
     with _conn() as conn:
+        path = _forward_walk(conn, model_name, protocol)
+        if path is None:
+            # 链上有环（正常写入被 set_forward 挡住，这是数据异常的兜底）：当无链
+            return ()
         matched = model_name
-        rows = conn.execute(_CHAIN_QUERY, (model_name, protocol)).fetchall()
-        # 只有从未配置的名字才做档位兼容。显式配置但全部停用的链必须保持不可用，
-        # 不能悄悄借用另一个同档位模型，更不能给管理页返回不属于本链的 active_route_id。
-        configured = protocol in _model_protocols(conn, model_name) if not rows else True
-        if not rows and not configured:
-            matched = _tier_match(conn, model_name, protocol)
-            rows = conn.execute(_CHAIN_QUERY, (matched, protocol)).fetchall() if matched else []
+        if path:
+            # 挂了转发：整条链交给最终目标。目标没链就是死链 —— 转发目标是明确指过的，
+            # 不做档位兜底，避免悄悄换到另一个模型上去
+            matched = path[-1]
+            rows = conn.execute(_CHAIN_QUERY, (matched, protocol)).fetchall()
+        else:
+            rows = conn.execute(_CHAIN_QUERY, (model_name, protocol)).fetchall()
+            # 只有从未配置的名字才做档位兼容。显式配置但全部停用的链必须保持不可用，
+            # 不能悄悄借用另一个同档位模型，更不能给管理页返回不属于本链的 active_route_id。
+            configured = protocol in _model_protocols(conn, model_name) if not rows else True
+            if not rows and not configured:
+                matched = _tier_match(conn, model_name, protocol)
+                if matched:
+                    # 兜底命中的名字自己也可能是一条转发，继续跟到落地
+                    hop = _forward_walk(conn, matched, protocol)
+                    if hop is None:
+                        return ()
+                    if hop:
+                        matched = hop[-1]
+                rows = conn.execute(_CHAIN_QUERY, (matched, protocol)).fetchall() if matched else []
     return tuple(
         Route(
             model_name=matched,
@@ -1176,6 +1229,121 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
     )
 
 
+# ---------------------------------------------------------------- 下游转发
+
+
+# 转发链最多几跳。正常维护出不了这么长（写入时也拒掉绕圈），这个上限只是兜底：
+# 万一库里被手改出一条超长链，解析时也不能无限走下去
+FORWARD_MAX_HOPS = 16
+
+
+def _forward_walk(
+    conn: sqlite3.Connection, model_name: str, protocol: str
+) -> tuple[str, ...] | None:
+    """从 model_name 出发沿转发链走到头。返回走过的名字（不含起点；空元组 = 没有转发）。
+
+    返回 None 表示链上有环或超长 —— 这是数据异常（写入被 set_forward 校验挡住），
+    解析方按「无链」处理，绝不死循环。
+    """
+    path: list[str] = []
+    seen = {model_name}
+    current = model_name
+    while True:
+        row = conn.execute(
+            "SELECT target_model FROM model_forwards WHERE model_name=? AND protocol=?",
+            (current, protocol),
+        ).fetchone()
+        if row is None:
+            return tuple(path)
+        nxt = row["target_model"]
+        if nxt in seen or len(path) >= FORWARD_MAX_HOPS:
+            return None
+        seen.add(nxt)
+        path.append(nxt)
+        current = nxt
+
+
+def forward_path(model_name: str, protocol: str) -> tuple[str, ...]:
+    """从 model_name 出发的转发链：('b', 'c') 表示 a→b→c。空元组 = 没有转发。
+    链上有环（数据异常）也返回空元组，调用方按「没有转发」处理即可。"""
+    with _conn() as conn:
+        path = _forward_walk(conn, model_name, protocol)
+    return () if path is None else path
+
+
+def list_forwards() -> tuple[dict, ...]:
+    """全部下游转发，按模型名和接口排。"""
+    with _conn() as conn:
+        return tuple(
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, model_name, protocol, target_model FROM model_forwards"
+                " ORDER BY model_name, protocol, id"
+            )
+        )
+
+
+def get_forward(model_name: str, protocol: str) -> dict | None:
+    """某个模型在某个接口下的转发布置；没有就是 None。"""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, model_name, protocol, target_model FROM model_forwards"
+            " WHERE model_name=? AND protocol=?",
+            (model_name, protocol),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def set_forward(model_name: str, protocol: str, target_model: str) -> None:
+    """设置转发：把 (model_name, protocol) 的整条链交给 target_model。
+
+    写入前的校验（都在一个事务里）：目标不能把链绕回自己（自环或环）、链长有限、
+    最终落地的模型必须在同接口下有候选 —— 目标没链的转发落地就是 404，不如现在
+    就说清楚。一个模型在一个接口下只有一条转发布置，再设置就是改指（幂等）。
+    """
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order = [model_name]
+        seen = {model_name}
+        current = target_model
+        for _ in range(FORWARD_MAX_HOPS):
+            if current in seen:
+                raise ForwardCycle(tuple(order + [current]))
+            seen.add(current)
+            order.append(current)
+            row = conn.execute(
+                "SELECT target_model FROM model_forwards WHERE model_name=? AND protocol=?",
+                (current, protocol),
+            ).fetchone()
+            if row is None:
+                break
+            current = row["target_model"]
+        else:
+            raise ForwardCycle(tuple(order))
+        landing = conn.execute(
+            "SELECT 1 FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=? LIMIT 1",
+            (current, protocol),
+        ).fetchone()
+        if landing is None:
+            raise ForwardMissingTarget(current)
+        conn.execute(
+            "INSERT INTO model_forwards(model_name, protocol, target_model) VALUES(?,?,?)"
+            " ON CONFLICT(model_name, protocol) DO UPDATE SET target_model=excluded.target_model",
+            (model_name, protocol, target_model),
+        )
+
+
+def delete_forward(model_name: str, protocol: str) -> bool:
+    """取消转发。返回是否真的删掉了一条。"""
+    with _conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM model_forwards WHERE model_name=? AND protocol=?",
+            (model_name, protocol),
+        )
+        return cur.rowcount > 0
+
+
 def protocol_of_model(model_name: str) -> tuple[str, ...]:
     """这个模型名在哪些接口下暴露；没录入过就是空。给 404 文案用。"""
     with _conn() as conn:
@@ -1186,18 +1354,25 @@ def exposed_models(protocol: str = "") -> tuple[str, ...]:
     """对下游暴露的模型清单。停用的接口不算暴露 —— 客户端不该看见调不动的名字。
 
     同名模型在多种接口下各有一条链时只列一次；只有在**所有**链都落在停用接口上时
-    才整个隐藏。"""
-    query = (
-        "SELECT DISTINCT m.model_name AS model_name, g.protocol AS protocol"
+    才整个隐藏。纯转发模型（自己没有候选、只把整条链交给别的模型）也算暴露 ——
+    它一样能按名字调。"""
+    routes_q = (
+        "SELECT m.model_name AS model_name, g.protocol AS protocol"
         " FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
     )
+    forwards_q = "SELECT model_name, protocol FROM model_forwards"
     args: tuple = ()
     if protocol:
-        query += " WHERE g.protocol=?"
-        args = (protocol,)
+        routes_q += " WHERE g.protocol=?"
+        forwards_q += " WHERE protocol=?"
+        args = (protocol, protocol)
     disabled = disabled_protocols()
     with _conn() as conn:
-        rows = conn.execute(query + " ORDER BY m.model_name", args).fetchall()
+        rows = conn.execute(
+            f"SELECT DISTINCT model_name, protocol FROM ({routes_q} UNION {forwards_q})"
+            " ORDER BY model_name",
+            args,
+        ).fetchall()
     visible: dict[str, bool] = {}
     for r in rows:
         visible[r["model_name"]] = visible.get(r["model_name"], False) or r["protocol"] not in disabled
