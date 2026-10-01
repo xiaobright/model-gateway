@@ -65,6 +65,10 @@ function harness(t) {
     window: { addEventListener: noop }, localStorage: { getItem: () => null, setItem: noop },
     location: { origin: 'http://127.0.0.1', hash: '' }, history: { replaceState: noop },
     views: new Proxy({}, { get: () => noop }),
+    // canvas.js 的行为在真实浏览器里验证（dev/check-canvas.mjs），这里只补 app.js
+    // 求值阶段就要读到的出口 —— ACTIONS 里 spread 了 canvasActions，少了它整个模块都跑不起来
+    canvasActions: {}, initCanvas: noop, renderCanvas: noop, renderPool: noop,
+    setCanvasFilter: noop, setCanvasIface: noop, saveForward: async () => {},
     toast: (...args) => h.toasts.push(args), run: (_el, fn) => fn(), confirmBox: async () => true,
     requestAnimationFrame: (fn) => fn(), setInterval: (fn, ms) => h.timers.push({ fn, ms }),
     withViewTransition: (_dir, fn) => fn(), moveMarker: noop, reduceMotion: () => true,
@@ -81,6 +85,7 @@ function harness(t) {
   h.app = vm.runInContext(`({
     openUpstream, saveUpstream, probeUpstream, openGroup, saveGroup, openRoute,
     fillRemoteList, saveRewrite, actions: ACTIONS, groupDirty,
+    openBatchAdd, scanModels, commitBatch, syncBatchSelection,
     editingKey: () => editingKey
   })`, context);
   h.evaluate = (code) => vm.runInContext(code, context);
@@ -247,32 +252,46 @@ test('模型写入后的刷新晚到时，不重画新弹窗', async (t) => {
   assert.equal(h.evaluate('pickerPaints'), paints);
 });
 
-test('候选弹窗重开同一组，会新拉列表；同会话仍去重', async (t) => {
+test('加候选只显示已登记模型，不请求上游，并将名称匹配项排前', async (t) => {
   const h = harness(t);
   const gid = 51;
-  groupEditor.invalidateRemoteModels(gid);
-  util.state.upstreams = [provider(1, [group(gid)])];
+  const g = { ...group(gid), models: ['zeta-model', 'gpt-6-astra-fast', 'alpha-model'] };
+  util.state.upstreams = [
+    { ...provider(2, [g]), name: 'Other provider' },
+    { ...provider(1, [g]), name: 'AgentRouter' },
+  ];
   h.element('rt-upstream').value = '1';
   h.element('rt-group').value = String(gid);
-  h.app.openRoute('', null, 'openai');
-  const oldRequest = h.latest();
-  h.app.fillRemoteList(gid);
-  assert.equal(h.requests.length, 1, '同会话不能重复 GET');
-  h.element('route-dialog').close();
-  h.app.openRoute('', null, 'openai');
-  assert.equal(h.requests.length, 2, '旧会话 busy 不能挡住重开后的 GET');
-  h.element('route-dialog').dispatch('close'); // 旧 close 事件晚于新会话打开，不能作废新请求
-  const currentRequest = h.latest();
-  oldRequest.resolve({ models: ['stale-model'] });
-  await tick();
-  assert.equal(groupEditor.remoteModels(gid), undefined);
-  currentRequest.resolve({ models: ['current-model'] });
-  await tick();
-  assert.deepEqual(groupEditor.remoteModels(gid), ['current-model']);
-  assert.match(h.element('rt-remote-list').innerHTML, /current-model/);
-  assert.doesNotMatch(h.element('rt-remote-hint').textContent, /正在拉/);
-  assert.equal(groupEditor.remoteBusy.has(gid), false);
+  h.app.openRoute('gpt-6-astra', null, 'openai');
+  assert.equal(h.requests.length, 0, '打开候选弹窗不能请求 remote-models');
+  assert.match(h.element('rt-remote-list').innerHTML, /gpt-6-astra-fast.*alpha-model.*zeta-model/);
+  assert.match(h.element('rt-remote-hint').textContent, /已登记 3 个上游模型/);
   assert.equal(h.element('route-dialog').open, true);
+});
+
+test('按展开宽度预排整颗胶囊，不为所有胶囊留空', () => {
+  const css = readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  assert.match(css, /\.route-cands\s*\{[^}]*flex-direction:\s*column/s);
+  assert.match(css, /\.route-cand-line\s*\{[^}]*flex-wrap:\s*wrap/s);
+  assert.match(css, /\.chip-measure-natural,\s*\.chip-measure-expanded\s*\{[^}]*align-self:\s*flex-start/s,
+    '测量时不能被纵向 flex 容器拉伸成整行宽度');
+  assert.match(css, /\.chip-measure-expanded \.chip-e\s*\{[^}]*width:\s*20px/s);
+  assert.doesNotMatch(css, /\.chip:hover \.chip-label[^}]*padding-right/s);
+  assert.doesNotMatch(css, /\.chip-label\s*\{[^}]*padding-right:\s*48px/s);
+});
+
+test('整颗展开后放不下时预先移到下一行', (t) => {
+  const h = harness(t);
+  const views = readFileSync(new URL('../web/views.js', import.meta.url), 'utf8')
+    .replace(/^import [\s\S]*? from '[^']+';\r?\n/gm, '')
+    .replace(/^export /gm, '');
+  h.evaluate(views);
+  const rows = JSON.parse(h.evaluate(`JSON.stringify(planCandidateRows([
+    { natural: 40, expanded: 55 },
+    { natural: 35, expanded: 65 },
+    { natural: 30, expanded: 45 },
+  ], 110, 7))`));
+  assert.deepEqual(rows, [[0], [1, 2]]);
 });
 
 test('旧 close 事件到达时，新分组仍在取 Key 也不能被作废', async (t) => {
@@ -347,4 +366,139 @@ test('路由次数按协议对应；热榜只裁展示，不裁其他模型的�
   assert.equal(h.evaluate('hotRows.length'), 8);
   assert.equal(h.evaluate('hotRows[0].label'), 'shared · Responses');
   assert.equal(h.evaluate('hotRows[1].label'), 'shared · Chat');
+});
+
+/* ---------------------------------------------------------------- 批量添加模型 */
+
+// 走 DOM 的那部分（勾选框是渲染出来的 HTML，测试宿主里没有真的 DOM）用一个
+// 按 data 属性筛的最小实现顶上：验的是「哪些行默认勾上」「提交发的是什么」，
+// 不是浏览器怎么画。
+function stubBatchRows(h, rows) {
+  const boxes = rows.map((r) => {
+    const attrs = { gid: String(r.group_id), remote: r.remote, act: 'batch-pick', done: r.done };
+    return {
+      checked: r.checked, disabled: false,
+      dataset: new Proxy(attrs, { set: (t, k, v) => { t[k] = v; return true; } }),
+      closest: () => ({ classList: { add: noop, remove: noop, toggle: noop } }),
+    };
+  });
+  h.element('batch-picker').querySelectorAll = (sel) => (sel.includes('batch-pick') ? boxes : []);
+  return boxes;
+}
+
+const scanRow = (gid, protocol, matches, extra = {}) => ({
+  group_id: gid, group_name: `group-${gid}`, upstream_name: `site-${gid}`,
+  protocol, protocol_enabled: true, group_enabled: true, matches, error: '', ...extra,
+});
+
+test('扫描结果：完全同名的默认勾上，部分匹配不许默认勾', async (t) => {
+  const h = harness(t);
+  h.app.openBatchAdd();
+  h.element('batch-model').value = 'gpt-test';
+  const scanning = h.app.scanModels();
+  h.latest().resolve({
+    model_name: 'gpt-test', scanned: 3, matched: 3, failed: 0, ms: 12,
+    groups: [
+      scanRow(1, 'openai', [{ remote_model: 'gpt-test', level: 'exact', from_catalog: false }]),
+      scanRow(2, 'anthropic', [
+        { remote_model: 'gpt-testing-preview', level: 'partial', from_catalog: false }]),
+      scanRow(3, 'openai-chat', [
+        { remote_model: 'gpt-test', level: 'exact', from_catalog: true }]),
+    ],
+  });
+  await scanning;
+  const html = h.element('batch-picker').innerHTML;
+  assert.match(html, /data-gid="1"[\s\S]*?data-remote="gpt-test"[^>]*checked/, '完全同名默认勾上');
+  assert.match(html, /data-gid="3"[\s\S]*?data-remote="gpt-test"[^>]*checked/, '另一种接口下的同名也默认勾上');
+  assert.match(html, /data-gid="2"[\s\S]*?data-remote="gpt-testing-preview"/, '部分匹配照样列出来');
+  assert.doesNotMatch(html, /data-remote="gpt-testing-preview"[^>]*checked/, '部分匹配不许默认勾');
+  assert.match(html, /部分匹配/);
+  assert.match(html, /目录里已登记/, '本地目录来的要标出来');
+  assert.match(html, /data-act="batch-pick"/);
+  // 段按「这一段里最好有多像」排：只有部分匹配的 Messages 段不能顶在 Responses 前面。
+  // anthropic 不在这个宿主注册的协议表里，所以段名退回协议名本身。
+  const order = [...html.matchAll(/pick-sep">([^<]+)</g)].map((m) => m[1]);
+  assert.deepEqual(order, ['Responses', 'Chat', 'anthropic'],
+    `段的顺序应该是 ${JSON.stringify(order)}`);
+});
+
+test('扫描结果为空时说明白，不给一个空列表', async (t) => {
+  const h = harness(t);
+  h.app.openBatchAdd();
+  h.element('batch-model').value = 'nope';
+  const scanning = h.app.scanModels();
+  h.latest().resolve({
+    model_name: 'nope', scanned: 2, matched: 0, failed: 1, ms: 8,
+    groups: [scanRow(1, 'openai', [], { error: '拉取超时' })],
+  });
+  await scanning;
+  const html = h.element('batch-picker').innerHTML;
+  assert.match(html, /没问到/);
+  assert.match(html, /拉取超时/);
+  assert.equal(h.element('batch-save').disabled, true);
+});
+
+test('提交只发勾中的行，并且加过的行不会重复提交', async (t) => {
+  const h = harness(t);
+  h.app.openBatchAdd();
+  h.element('batch-model').value = 'gpt-test';
+  const scanning = h.app.scanModels();
+  h.latest().resolve({
+    model_name: 'gpt-test', scanned: 2, matched: 2, failed: 0, ms: 5,
+    groups: [
+      scanRow(1, 'openai', [{ remote_model: 'gpt-test', level: 'exact', from_catalog: false }]),
+      scanRow(2, 'openai', [
+        { remote_model: 'gpt-test', level: 'exact', from_catalog: false },
+        { remote_model: 'gpt-test-2024', level: 'partial', from_catalog: false },
+      ]),
+    ],
+  });
+  await scanning;
+  const boxes = stubBatchRows(h, [
+    { group_id: 1, remote: 'gpt-test', checked: true },
+    { group_id: 2, remote: 'gpt-test', checked: true },
+    { group_id: 2, remote: 'gpt-test-2024', checked: false },
+  ]);
+  h.app.syncBatchSelection();
+  const saving = h.app.commitBatch();
+  const job = h.latest();
+  assert.equal(job.path, '/admin/api/models/batch');
+  assert.deepEqual(job.body.groups, [
+    { group_id: 1, remote_model: 'gpt-test' },
+    { group_id: 2, remote_model: 'gpt-test' },
+  ], '没勾的那条不能进去');
+  job.resolve({ committed: 2, skipped: [], protocols: ['openai'] });
+  h.releaseRefreshes();
+  await saving;
+  assert.match(h.element('batch-hint').textContent, /已加 2 条候选/);
+  assert.equal(h.toasts.at(-1)[0], '已添加 2 条候选');
+
+  // 加过的两条在重新渲染后已经是 disabled 的（渲染走 batchAdded 这个集合，
+  // 不靠 dataset —— 提交后的 refreshConfig 会把整个列表重画一遍）
+  for (const box of boxes) box.disabled = box.dataset.remote !== 'gpt-test-2024';
+  h.element('batch-picker').querySelectorAll = (sel) => (sel.includes('batch-pick') ? boxes : []);
+  h.app.syncBatchSelection();
+  assert.equal(h.element('batch-save').disabled, true, '没有新勾的了');
+  const before = h.requests.length;
+  await h.app.commitBatch();
+  assert.equal(h.requests.length, before, '不许再发一次提交');
+  assert.match(h.toasts.at(-1)[0], /没有新的了/);
+  assert.equal(h.element('batch-save').disabled, true, '按钮要重新摆回不可点');
+});
+
+test('弹窗关掉之后，迟到的扫描结果不许写进新会话', async (t) => {
+  const h = harness(t);
+  h.app.openBatchAdd();
+  h.element('batch-model').value = 'gpt-test';
+  const scanning = h.app.scanModels();
+  h.element('batch-dialog').close();      // 触发 close 监听：旧扫描作废
+  h.app.openBatchAdd();
+  h.latest().resolve({
+    model_name: 'gpt-test', scanned: 1, matched: 1, failed: 0, ms: 3,
+    groups: [scanRow(1, 'openai', [{ remote_model: 'gpt-test', level: 'exact', from_catalog: false }])],
+  });
+  await scanning;
+  assert.equal(h.element('batch-picker').innerHTML, '');
+  assert.equal(h.element('batch-count').textContent, '');
+  assert.equal(h.element('batch-status').textContent, '填个模型名，点「扫描所有上游站」');
 });

@@ -11,7 +11,8 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from . import capture, db, failover, inflight, protocols, proxy as proxy_mod, rewrite
+from . import capture, canvas, db, failover, inflight, protocols, proxy as proxy_mod, rewrite
+from . import model_batch
 from . import stats as stats_mod
 from . import upstream as upstream_mod
 from .reqlog import log
@@ -88,6 +89,36 @@ class SwitchIn(BaseModel):
     route_id: int
 
 
+class ModelScanIn(BaseModel):
+    """批量添加新模型的第一步：只输入模型名，由后端去问每个分组有没有它。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = Field(min_length=1, max_length=200)
+
+
+class BatchGroupIn(BaseModel):
+    """勾中的一行：哪个分组、用哪个上游真名。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: int = Field(gt=0)
+    remote_model: str = Field(default="", max_length=200)
+
+
+class ModelBatchIn(BaseModel):
+    """第二步：把勾中的分组一次性登记进上游目录并暴露给下游。
+
+    模型名只有一个 —— 所有选中的分组都拿它当**下游名字**，上游真名则各按各的
+    （同一个模型在不同站的 id 常常带不同的日期后缀）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = Field(min_length=1, max_length=200)
+    groups: tuple[BatchGroupIn, ...] = Field(default=(), max_length=200)
+
+
 class OrderIn(BaseModel):
     model_name: _NonBlank
     # 自动降级依次尝试的顺序，从先到后。元素是候选 id
@@ -105,6 +136,30 @@ class ForwardIn(BaseModel):
 class FailoverIn(BaseModel):
     protocol: str = Field(min_length=1)
     enabled: bool
+
+
+class CanvasViewIn(BaseModel):
+    """画布的平移和缩放。用来「下次打开还在刚才那个位置」。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: float = Field(default=0.0, allow_inf_nan=False)
+    y: float = Field(default=0.0, allow_inf_nan=False)
+    z: float = Field(default=1.0, gt=0, le=4, allow_inf_nan=False)
+
+
+class CanvasLayoutIn(BaseModel):
+    """编排画布上各节点的坐标。**只收位置**：路由配置一律走 /models 那几个接口。
+
+    `nodes` 的键是后端 canvas 模块拼出来的节点标识，这里不解析它 —— 形状校验和剪枝都在
+    canvas.save 里做，管理接口只负责挡住明显超量的请求体。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 值是 [x, y]。上限按「手滑塞进来」定，正常人摆不到几百个模型
+    nodes: dict[str, tuple[float, float]] = Field(default_factory=dict)
+    view: CanvasViewIn = Field(default_factory=CanvasViewIn)
 
 
 class ProtocolSwitchIn(BaseModel):
@@ -808,6 +863,87 @@ def post_model_route(payload: ModelRouteIn) -> dict[str, Any]:
     }
 
 
+def _scan_row(item: model_batch.GroupMatch, disabled: frozenset[str]) -> dict[str, Any]:
+    group = item.group
+    return {
+        "group_id": group.id,
+        "group_name": group.name,
+        "upstream_name": item.upstream_name,
+        "protocol": group.protocol,
+        "protocol_enabled": group.protocol not in disabled,
+        "group_enabled": group.enabled,
+        # 精确 / 部分各自的条数由前端自己从 matches 里数；这里不再发一份可能对不上的计数
+        "matches": [
+            {
+                "remote_model": name,
+                "level": model_batch.match_level(value),
+                # 这个名字在上游这次的列表里没出现，是本地目录里登记过的。
+                # 界面据此说明「为什么拉不到也还列着」，别让人以为是缓存脏了
+                "from_catalog": item.is_registered(name),
+            }
+            for name, value in item.matches
+        ],
+        "error": item.error,
+    }
+
+
+@router.post("/models/scan")
+async def scan_model(payload: ModelScanIn) -> dict[str, Any]:
+    """问每个启用的分组有没有这个模型：只读，不写任何配置。
+
+    一个站连不上或超时不会让整轮失败 —— 那个分组单独带一条 error 回来，其余照常。
+    前端据此把「精确命中」「部分匹配」「问不到」分三段展示。
+    """
+    query = payload.model_name.strip()
+    if not query:
+        raise HTTPException(400, "要填一个模型名")
+    started = time.monotonic()
+    found = await model_batch.scan(query)
+    disabled = db.disabled_protocols()
+    items = [_scan_row(item, disabled) for item in found]
+    empty = sum(1 for item in items if not item["matches"] and not item["error"])
+    failed = sum(1 for item in items if item["error"])
+    # 「没问到」里既有连不上的，也有整轮预算用完还没轮到的。两种都会被列出来，
+    # 后面那句错误原文会写清是哪种 —— 不必再单独发一个 partial 标记
+    budget_hit = any("没轮到" in item["error"] for item in items)
+    log(
+        f"MODEL-SCAN {query!r}: {len(items)} group(s), "
+        f"{sum(1 for i in items if i['matches'])} with a match, {failed} failed, {empty} empty"
+    )
+    return {
+        "model_name": query,
+        "scanned": len(items),
+        "matched": sum(1 for item in items if item["matches"]),
+        "failed": failed,
+        "budget_hit": budget_hit,
+        # 没匹配上的分组连名字都不发：几十个站一轮就是几千行，前端也用不上
+        "groups": [item for item in items if item["matches"] or item["error"]],
+        "ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+@router.post("/models/batch")
+async def post_model_batch(payload: ModelBatchIn) -> dict[str, Any]:
+    """把勾中的（分组，上游真名）一次性登记进上游目录 + 在模型路由里建候选。
+
+    重复的、分组被删掉的都跳过并在 skipped 里说明，不返回 409 —— 用户勾的是
+    「这些站」，中间有条目刚好已经被别处加过不该让整次点击失败。
+    """
+    model_name = payload.model_name.strip()
+    if not model_name:
+        raise HTTPException(400, "要填一个模型名")
+    plan = [
+        model_batch.BatchGroup(group_id=item.group_id, remote_model=item.remote_model.strip())
+        for item in payload.groups
+    ]
+    result = await model_batch.commit(model_name, plan)
+    return {
+        **result,
+        "models": list(db.exposed_models()),
+        "enabled": _protocol_switches()["enabled"],
+    }
+
+
 @router.put("/models")
 def put_model_route(payload: RouteEditIn) -> dict[str, Any]:
     """改一个已有候选的「上游那边的真实模型名」。1M 开关也走这里（存成 `名字[1m]`）。"""
@@ -892,6 +1028,25 @@ def remove_model_forward(
         raise HTTPException(404, "这条转发不存在")
     log(f"FORWARD off {model_name!r} [{protocol}]")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 编排画布
+
+
+@router.get("/canvas-layout")
+def get_canvas_layout() -> dict[str, Any]:
+    """画布上各节点的摆放位置。纯展示状态，坏了一份也只是回到自动摆放。"""
+    return canvas.load()
+
+
+@router.put("/canvas-layout")
+def put_canvas_layout(payload: CanvasLayoutIn) -> dict[str, Any]:
+    if len(payload.nodes) > canvas.MAX_NODES:
+        raise HTTPException(400, f"节点太多（最多 {canvas.MAX_NODES} 个）")
+    try:
+        return canvas.save(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ---------------------------------------------------------------- 实时

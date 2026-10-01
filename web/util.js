@@ -168,13 +168,17 @@ export function confirmBox({ title, body, ok = '确定', danger = true }) {
 /* 点了就禁用按钮，避免重复提交；错误统一弹提示条 */
 export async function run(el, fn) {
   if (el && el.disabled) return;
+  const wasLocked = Boolean(el && el.dataset.locked);
   if (el) el.disabled = true;
   try {
     await fn();
   } catch (e) {
     toast(e.message, 'err');
   } finally {
-    if (el) el.disabled = false;
+    // dataset.locked 是给「按钮的可用性由业务状态说了算」的入口留的出口：
+    // 批量添加模型那个按钮在一次点击里会用同一个元素做两件事（先扫描、后提交），
+    // 收尾时无条件启用会让它看着能点、点了却什么也不发生。
+    if (el && !wasLocked && !el.dataset.locked) el.disabled = false;
   }
 }
 

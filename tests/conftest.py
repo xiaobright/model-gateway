@@ -16,6 +16,7 @@ import helpers
 @pytest.fixture()
 def gateway(tmp_path, monkeypatch, request):
     from gateway import config, failover, inflight
+    from gateway import canvas as canvas_mod
     from gateway import upstream as upstream_mod
     from gateway import stats as stats_mod
     from gateway.app import create_app
@@ -29,6 +30,8 @@ def gateway(tmp_path, monkeypatch, request):
     failover.reset()
     inflight.reset()
     stats_mod.reset()
+    # 画布布局也按原始文本缓存，换库必须一起清，否则上一个用例的坐标会漏过来
+    canvas_mod.forget_cache()
 
     use_network = request.node.get_closest_marker("network") is not None
     helpers.IN_PROCESS_UPSTREAMS = not use_network

@@ -132,14 +132,21 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
     @app.get("/v1/models")
     def models(request: Request) -> dict:
         # 按 key / 按接口返回不同的模型列表 —— 同一个站的两把 key 能看到的东西常常不一样，
-        # 而 Anthropic 那边认的是 x-api-key + anthropic-version，两件事都得能断言
-        ids = ["gpt-test", "claude-test"]
-        if request.headers.get("anthropic-version"):
+        # 而 Anthropic 那边认的是 x-api-key + anthropic-version，两件事都得能断言。
+        # models 是 set_models() 给这份清单的覆盖：给了就照它回，内容形状和下面默认那份一样。
+        override = sick.get("models")
+        if override is not None:
+            data = [{"id": i, "object": "model"} for i in list(override)]
+        elif request.headers.get("anthropic-version"):
             ids = ["claude-test", "claude-haiku-test"] if request.headers.get("x-api-key") \
                 else ["missing-x-api-key"]
-        elif request.headers.get("authorization", "").endswith("-vip"):
-            ids = ["gpt-test", "vip-only"]
-        return {"object": "list", "data": [{"id": i, "object": "model"} for i in ids]}
+            data = [{"id": i, "object": "model"} for i in ids]
+        else:
+            ids = ["gpt-test", "claude-test"]
+            if request.headers.get("authorization", "").endswith("-vip"):
+                ids = ["gpt-test", "vip-only"]
+            data = [{"id": i, "object": "model"} for i in ids]
+        return {"object": "list", "data": data}
 
     @app.post("/v1/responses")
     @app.post("/v1/responses/compact")
@@ -481,9 +488,18 @@ class MockUpstream:
         """这个站不再认这几个模型 id（带日期后缀的那种最常被下掉）。"""
         self.sick["missing"].update(names)
 
+    def set_models(self, *names: str) -> None:
+        """这个站 /v1/models 返回的清单。默认给的是 gpt-test / claude-test 那两条。
+
+        聚合站的名字往往带厂商前缀和日期后缀，而残缺的 /v1/models 也很常见 ——
+        批量添加模型那套匹配逻辑两种情况都要能演。
+        """
+        self.sick["models"] = list(names)
+
     def heal(self) -> None:
         self.sick["status"] = None
         self.sick["missing"] = set()
+        self.sick.pop("models", None)
 
     def last_responses_request(self) -> dict:
         """这个站最近一次收到的 Responses 请求体（透传规范化测试用）。"""
@@ -560,17 +576,22 @@ def add_route(client: httpx.Client, model_name: str, group_id: int, remote_model
     return int(resp.json()["route_id"])
 
 
-def cands(client: httpx.Client, model_name: str) -> list[dict]:
-    """某个模型的候选，按链上的顺序。"""
+def cands(client: httpx.Client, model_name: str, protocol: str = "") -> list[dict]:
+    """某个模型的候选，按链上的顺序。同名模型可以在多种接口下各有一条链，给了 protocol 就只看那条。"""
     row = next(
-        (r for r in client.get("/admin/api/models").json() if r["model_name"] == model_name), None
+        (
+            r
+            for r in client.get("/admin/api/models").json()
+            if r["model_name"] == model_name and (not protocol or r["protocol"] == protocol)
+        ),
+        None,
     )
     return list(row["candidates"]) if row else []
 
 
-def route_id(client: httpx.Client, model_name: str, group_id: int) -> int:
+def route_id(client: httpx.Client, model_name: str, group_id: int, protocol: str = "") -> int:
     """这个模型在某个分组下的唯一候选 id（不知道 id 时从列表里找）。"""
-    hit = [c for c in cands(client, model_name) if c["group_id"] == group_id]
+    hit = [c for c in cands(client, model_name, protocol) if c["group_id"] == group_id]
     assert len(hit) == 1, f"{model_name} 在 g{group_id} 下有 {len(hit)} 条候选"
     return int(hit[0]["route_id"])
 

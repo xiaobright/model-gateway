@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable
 
@@ -7,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, upstream
+from . import config, db, learning, upstream
 from .admin import router as admin_router
 from .proxy import router as proxy_router
 
@@ -105,8 +106,18 @@ class NoCacheStatic(StaticFiles):
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    yield
-    await upstream.aclose_client()
+    collector = learning.Collector(
+        config.DATA_DIR / "learning", enabled=learning.enabled_from_env(),
+    )
+    app.state.learning = collector
+    collector.start()
+    try:
+        yield
+    finally:
+        try:
+            await upstream.aclose_client()
+        finally:
+            await asyncio.to_thread(collector.stop)
 
 
 def create_app() -> FastAPI:
@@ -124,5 +135,11 @@ def create_app() -> FastAPI:
     def health() -> dict[str, bool]:
         return {"ok": True}
 
+    @app.get("/admin/api/learning-status")
+    def learning_status() -> dict:
+        collector = getattr(app.state, "learning", None)
+        return collector.status() if collector else {"enabled": False, "writer_alive": False}
+
+    app.add_middleware(learning.Lifecycle)
     app.add_middleware(LocalOnly)
     return app

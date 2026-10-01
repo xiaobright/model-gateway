@@ -895,6 +895,27 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 /* 正在提交的那一行压暗一下，网慢的时候能看出来点了没有 */
 .picker label.busy { opacity: .55; pointer-events: none; }
 
+/* 批量添加模型的扫描结果：一行 = 一个分组的一个上游真名，比 .picker 多两截信息
+   （站点 · 分组、匹配等级），所以单独一套，名字和状态标签各自对齐成一列 */
+.picker .pick-row { display: flex; align-items: center; gap: 8px; }
+.picker label.pick-row {
+  font-family: -apple-system, sans-serif; font-size: 12.5px;
+  padding: 6px 6px;
+}
+.picker label.pick-row .pick-name {
+  font-family: var(--mono); font-size: 12.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.picker label.pick-row .pick-where {
+  margin-left: auto; color: var(--ink-3); font-size: 11.5px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 42%;
+}
+.picker label.pick-row .tag { margin-left: 0; }
+/* 完全同名的排一档：底色提示「这些是默认勾上的」，人一眼能看出分界 */
+.picker label.pick-row.is-partial .pick-name { color: var(--ink-2); }
+.picker label.pick-row[hidden] { display: none; }
+.pick-note { font-size: 11.5px; color: var(--ink-3); padding: 6px; font-family: -apple-system, sans-serif; }
+
 /* 侧栏底部：「下游接入」和主题切换并排，接入按钮占满剩余宽度 */
 .foot-row { display: flex; align-items: center; gap: 8px; }
 .foot-row .btn:first-child { flex: 1; }
@@ -1183,7 +1204,8 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .route:hover { background: var(--hover); border-radius: var(--r-sm); }
 .route-name { font-family: var(--mono); font-size: 13px; font-weight: 500; word-break: break-all; padding-top: 3px; }
 .route-name .tag { margin-left: 4px; }
-.route-cands { display: flex; flex-wrap: wrap; gap: 7px; }
+.route-cands { display: flex; flex-direction: column; gap: 7px; }
+.route-cand-line { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 7px; }
 .route-side { padding-top: 3px; }
 .route-usage {
   font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums;
@@ -1195,6 +1217,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 
 /* 候选圆片与微震感 */
 .chip {
+  position: relative;
   display: inline-flex; align-items: center;
   border: 1px solid var(--hair-2); border-radius: 999px; background: var(--glass-2);
   color: var(--ink);
@@ -1205,9 +1228,8 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .chip-label {
   display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px;
   border: none; background: none; color: inherit; font: inherit; font-size: 12.5px;
-  cursor: pointer; border-radius: 999px; transition: padding .15s;
+  cursor: pointer; border-radius: 999px;
 }
-.chip:hover .chip-label, .chip:focus-within .chip-label { padding-right: 5px; }
 .chip-label:focus-visible, .chip-x:focus-visible, .chip-e:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 1px;
 }
@@ -1239,15 +1261,27 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
   font-size: 12px; color: var(--ink-2);
   border: 1px solid var(--line-2); border-radius: 6px; background: transparent;
 }
-/* 圆片右侧的两个动作（改配置 / 移除）：平时收成 0 宽，指过去才展开 */
+/* 操作按钮随悬停展开；布局器按展开后的宽度预排胶囊，不让它悬停时自己跳行。 */
+.chip-tools {
+  display: inline-flex; align-items: center; flex: none;
+}
 .chip-x, .chip-e {
   display: grid; place-items: center; width: 0; height: 20px; margin-right: 0;
   border-radius: 50%; color: var(--ink-3); font-size: 11px; line-height: 1;
   border: none; background: none; cursor: pointer; padding: 0; flex: none;
-  overflow: hidden; opacity: 0; transition: width .15s, opacity .15s, margin .15s;
+  overflow: hidden; opacity: 0; transition: width .15s, opacity .15s, margin .15s, background .14s, color .14s;
 }
-.chip:hover .chip-x, .chip:focus-within .chip-x { width: 20px; margin-right: 4px; opacity: 1; }
-.chip:hover .chip-e, .chip:focus-within .chip-e { width: 20px; margin-right: 1px; opacity: 1; }
+.chip:hover .chip-x, .chip:focus-within .chip-x,
+.chip-measure-expanded .chip-x { width: 20px; margin-right: 4px; opacity: 1; }
+.chip:hover .chip-e, .chip:focus-within .chip-e,
+.chip-measure-expanded .chip-e { width: 20px; margin-right: 1px; opacity: 1; }
+.chip-measure-natural, .chip-measure-expanded {
+  align-self: flex-start; flex: none;
+}
+.chip.chip-measure-natural .chip-x, .chip.chip-measure-natural .chip-e {
+  width: 0; margin-right: 0; opacity: 0;
+}
+.chip-measure-expanded .chip-x, .chip-measure-expanded .chip-e { transition: none; }
 .chip-x:hover { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit-ink); }
 .chip-e:hover { background: var(--accent-wash); color: var(--accent); }
 

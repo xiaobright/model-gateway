@@ -810,6 +810,26 @@ def add_group_models(group_id: int, remote_models: Iterable[str]) -> int:
     return added
 
 
+def add_group_models_many(pairs: Iterable[tuple[int, str]]) -> int:
+    """一次事务里给多个分组登记模型（分组 id, 上游真名）。返回真正加上的条数。
+
+    批量入口存在的理由只有性能：一次「加新模型」可能同时勾中十几个站，逐个走
+    add_group_models 就是十几次开库 + 提交。语义和它完全一样，重复的照样忽略。
+    """
+    added = 0
+    with _conn() as conn:
+        for group_id, raw in pairs:
+            name = (raw or "").strip()
+            if not name:
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO group_models(group_id, remote_model) VALUES(?,?)",
+                (group_id, name),
+            )
+            added += cur.rowcount
+    return added
+
+
 def delete_group_model(group_id: int, remote_model: str) -> tuple[int, int]:
     """从目录里去掉一个上游模型。指向它的下游映射会一起下线（它们已经无处可去），
     返回 (删掉的目录条数, 连带删掉的候选条数)。"""
@@ -1405,6 +1425,17 @@ def _reattach_active(conn: sqlite3.Connection, model_name: str) -> None:
         ).fetchone()
         if remaining is not None:
             conn.execute("UPDATE model_routes SET is_active=1 WHERE id=?", (remaining["id"],))
+
+
+def reattach_active(model_name: str) -> None:
+    """公开入口：一次写入多条候选之后，确保这条链还有活跃候选。
+
+    _reattach_active 只处理「一条活跃候选都没有」的情况，所以已经在链上的模型
+    重复调用它是安全的（批量添加的顺序不一定和链上原有候选一致）。
+    """
+    with _conn() as conn:
+        _reattach_active(conn, model_name)
+
 
 # ---------------------------------------------------------------- 转发记录
 

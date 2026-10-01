@@ -275,10 +275,12 @@ function chipHtml(model, c, showGroup, showRemote, activeRouteId, proto) {
   return `<span class="${cls}" data-rid="${c.route_id}">
     <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"${protoAttr}
             data-rid="${c.route_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
-    <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"${protoAttr}
-            data-rid="${c.route_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
-    <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"${protoAttr}
-            data-rid="${c.route_id}" title="移除这一条候选">✕</button>
+    <span class="chip-tools">
+      <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"${protoAttr}
+              data-rid="${c.route_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
+      <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"${protoAttr}
+              data-rid="${c.route_id}" title="移除这一条候选">✕</button>
+    </span>
   </span>`;
 }
 
@@ -332,12 +334,14 @@ export function renderRoutes() {
     $('route-list').innerHTML =
       '<div class="empty">还没有模型。先在「上游站点」加一个供应商，给它建一个分组（选接口 + 填 key），'
       + '再点右上角「新增模型」配置下游路由。只登记上游目录不会出现在这里。</div>';
+    $('route-list').dataset.routesHtml = $('route-list').innerHTML;
     return;
   }
   if (!list.length) {
     $('route-list').innerHTML = `<div class="empty">${
       kw ? '没有匹配的模型名' : (EMPTY_BY_IFACE[iface] || '这个接口下还没有模型')
     }</div>`;
+    $('route-list').dataset.routesHtml = $('route-list').innerHTML;
     return;
   }
 
@@ -379,11 +383,63 @@ export function renderRoutes() {
       </div>
     </div>`;
   }).join('');
-  if (host.innerHTML !== html) {
+  const changed = host.dataset.routesHtml !== html;
+  if (changed) {
     // 内容没变就不碰 DOM：滚动位置（scroll-y 容器）不该每 15 秒被打回顶部
     const keep = host.scrollTop;
     host.innerHTML = html;
+    host.dataset.routesHtml = html;
     host.scrollTop = keep;
+  }
+  layoutRouteChips(host, changed);
+}
+
+export function planCandidateRows(items, width, gap = 7) {
+  const rows = [[]];
+  let used = 0;
+  for (const [index, item] of items.entries()) {
+    if (rows.at(-1).length && used + item.expanded > width) {
+      rows.push([]);
+      used = 0;
+    }
+    rows.at(-1).push(index);
+    used += item.natural + gap;
+  }
+  return rows;
+}
+
+/* 按悬停展开后的宽度预排整颗候选胶囊。放不下就预先放到下一行，避免悬停时
+   胶囊自身跳行、鼠标移出后又弹回。测量在未悬停状态进行；视图显示和窗口变化时重排。 */
+export function layoutRouteChips(host = $('route-list'), force = false) {
+  if (!host?.querySelectorAll) return;
+  for (const container of host.querySelectorAll('.route-cands')) {
+    const width = container.clientWidth;
+    if (!width) continue; // 隐藏视图等显示后再排
+    if (!force && container.dataset.chipLayoutWidth === String(width)) continue;
+
+    const chips = [...container.querySelectorAll('.chip')];
+    if (!chips.length) continue;
+    const gap = Number.parseFloat(getComputedStyle(container).columnGap) || 7;
+    const sizes = chips.map((chip) => {
+      chip.classList.add('chip-measure-natural');
+      const naturalWidth = chip.getBoundingClientRect().width;
+      chip.classList.remove('chip-measure-natural');
+      chip.classList.add('chip-measure-expanded');
+      const expandedWidth = chip.getBoundingClientRect().width;
+      chip.classList.remove('chip-measure-expanded');
+      return { natural: naturalWidth, expanded: expandedWidth };
+    });
+
+    const lines = planCandidateRows(sizes, width, gap);
+    const fragment = document.createDocumentFragment();
+    for (const indexes of lines) {
+      const line = document.createElement('span');
+      line.className = 'route-cand-line';
+      for (const index of indexes) line.append(chips[index]);
+      fragment.append(line);
+    }
+    container.replaceChildren(fragment);
+    container.dataset.chipLayoutWidth = String(width);
   }
 }
 

@@ -16,6 +16,7 @@ from . import (
     db,
     failover,
     inflight,
+    learning,
     naming,
     protocols,
     rewrite,
@@ -352,6 +353,13 @@ async def forward(
         protocol=proto.name, model=asked, stream=stream_flag,
         req_bytes=len(body), meta=not record,
     )
+    # Separate metadata stream; count_tokens and rejected input stay out of it.
+    trace = learning.begin(
+        request.scope, protocol=proto.name, endpoint=path, model=asked, stream=stream_flag,
+        req_bytes=len(body), stateful=stateful, can_failover=can_failover, stall_s=stall_s,
+        candidate_ids=[r.route_id for r in candidates], start_deadline_s=failover.START_DEADLINE,
+        client=_client_label(request.headers.get("user-agent", "")),
+    ) if record else learning.Trace(None)
 
     def advance() -> int:
         """还该不该再打一个？返回下一个候选的下标，-1 = 到此为止。
@@ -363,6 +371,8 @@ async def forward(
 
     def abort_request(note: str, *, record_attempt: bool = True) -> JSONResponse:
         """首字前中断：发送等待、重试间隔共用收尾，不把手动取消记成上游故障。"""
+        trace.end_attempt(status=499, note=note, action="stop")
+        trace.result(499, note)
         inflight.finish(call, status=499, note=note)
         if record and record_attempt:
             _record(
@@ -442,6 +452,11 @@ async def forward(
             group_id=route.group_id, remote_model=remote, req_bytes=len(sent_body),
         )
         began = time.monotonic()
+        trace.start_attempt(
+            route_id=route.route_id, upstream_id=route.upstream.id, group_id=route.group_id,
+            remote_model=remote, candidate_attempt=attempt,
+            same_retries=same_counts.get(route.upstream.id, 0), req_bytes=len(sent_body),
+        )
         try:
             # 出口是**供应商**的属性，而每个候选可能属于不同的供应商，所以 client 在循环里取。
             # 放在 try 里：出口配坏了（比如 #ca 指的证书被删了）是「这扇门不通」，
@@ -482,6 +497,7 @@ async def forward(
                 route.upstream.retry_rules, 502, same_counts.get(route.upstream.id, 0)
             )
             if delay is not None:
+                trace.end_attempt(status=502, note="connect_failed", action="same_retry", delay_s=delay)
                 same_counts[route.upstream.id] = same_counts.get(route.upstream.id, 0) + 1
                 log(
                     f"  同站重试：{route.upstream.name} 连不上，{delay:.2f}s 后再试"
@@ -512,12 +528,19 @@ async def forward(
                     usage=NO_USAGE, note="connect_failed", attempt=attempt,
                 )
             index = advance()
+            trace.end_attempt(
+                status=502, note="connect_failed", action="failover" if index >= 0 else "stop",
+            )
             if index < 0:
                 break
             continue
 
         # 这次拿到响应头了，之前候选的连接异常不再算数
         fail = None
+        trace.headers(
+            resp.status_code,
+            resp.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "text/event-stream",
+        )
         inflight.phase(call, inflight.WAIT, status=resp.status_code)
         # 带了 stateful 字段的请求不降级，日志里标出来 —— 排查「为什么这条没换站」时靠它
         detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}" if stateful else ""
@@ -537,6 +560,9 @@ async def forward(
             route.upstream.retry_rules, resp.status_code, same_counts.get(route.upstream.id, 0)
         )
         if delay is not None:
+            trace.end_attempt(
+                status=resp.status_code, note="http_error", action="same_retry", delay_s=delay,
+            )
             same_counts[route.upstream.id] = same_counts.get(route.upstream.id, 0) + 1
             log(
                 f"  同站重试：{route.upstream.name} 返回 {resp.status_code}，"
@@ -566,6 +592,9 @@ async def forward(
             # just try the next candidate, if one is configured.
             nxt = advance()
             if nxt >= 0:
+                trace.end_attempt(
+                    status=resp.status_code, note="http_error", action="search_failover",
+                )
                 log(
                     f"  alpha/search unsupported ({resp.status_code}) at {label}，"
                     "关闭响应后尝试下一个候选"
@@ -600,6 +629,7 @@ async def forward(
         # 还有候选可试：错误体不能挡住降级。没有退路时上面的 response 会照旧原样透传，
         # 这里直接关掉响应，日志只记状态和候选，不等待可能永远不来的正文。
         log(f"  上游返回 {resp.status_code}，关闭响应后换下一个候选")
+        trace.end_attempt(status=resp.status_code, note="http_error", action="failover")
         with contextlib.suppress(Exception):
             await resp.aclose()
         elapsed = time.monotonic() - began
@@ -627,6 +657,7 @@ async def forward(
         if attempt > 1:
             why += f"（试过 {attempt} 个候选）"
         inflight.finish(call, status=502, note="connect_failed")
+        trace.result(502, "connect_failed")
         return _error(proto, 502, why)
 
     won = route
@@ -665,6 +696,7 @@ async def forward(
         content_type = upstream_resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         observer = protocols.SSEObserver(
             proto, collect_types=cap is not None, collect_compaction=compaction_capture,
+            on_event=trace.event if trace.collector else None,
         ) if content_type == "text/event-stream" else None
         json_body = bytearray()
         json_capped = False
@@ -684,6 +716,7 @@ async def forward(
                 except StopAsyncIteration:
                     break
                 inflight.phase(call, inflight.STREAM)
+                trace.chunk(len(chunk))
                 sent += len(chunk)
                 if len(head) < HEAD_KEEP:
                     head.extend(chunk[: HEAD_KEEP - len(head)])
@@ -708,6 +741,7 @@ async def forward(
                             seen_content_events = observer.content_events
                             content_deadline = time.monotonic() + stall_s
                     except Exception as exc:
+                        trace.event("observation_error")
                         log(f"  SSE observe failed: {exc.__class__.__name__}: {exc}")
                 else:
                     # 非 SSE 响应没有观察器可看：第一块字节就算「开始出正文」，每来一块
@@ -760,6 +794,10 @@ async def forward(
             if observer is not None:
                 # flush 可能刚补完最后一帧；收尾时取一次，不在每个 chunk 复制诊断清单。
                 text_bytes, thinking = observer.text_bytes, observer.thinking
+                trace.observe_end(
+                    ended=observer.ended, oversized_frames=observer.oversized_frames,
+                    text_bytes=text_bytes,
+                )
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
                 if compaction_capture:
                     compaction_observations = observer.compaction_items
@@ -781,11 +819,15 @@ async def forward(
                 try:
                     json_payload = json.loads(json_body)
                     if isinstance(json_payload, dict):
+                        if (json_payload.get("error") is not None
+                                or json_payload.get("status") in ("failed", "incomplete")):
+                            trace.event("protocol_error")
                         text_bytes, thinking = proto.count_json_content(json_payload)
                         if compaction_capture:
                             compaction_observations = protocols.compaction_observations(json_payload)
                             response_payload_types = capture.response_types(json_payload)
                 except Exception as exc:
+                    trace.event("observation_error")
                     log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
                 inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
             if compaction_capture:
@@ -805,6 +847,8 @@ async def forward(
                 )
             # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
             usage = proto.extract_usage(bytes(head), bytes(tail))
+            trace.end_attempt(status=upstream_resp.status_code, note=note, usage=usage)
+            trace.result(upstream_resp.status_code, note)
             # 先落库（纯同步，即使外层在取消也能跑完），再还连接
             inflight.finish(
                 call, status=upstream_resp.status_code, note=note, sent=sent,

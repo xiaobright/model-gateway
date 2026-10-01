@@ -6,6 +6,7 @@
 <title>Model Gateway 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css?v=9">
+<link rel="stylesheet" href="/static/canvas.css?v=1">
 </head>
 <body>
 <div class="blob blob-1"></div>
@@ -28,6 +29,9 @@
       <span class="nav-marker" id="nav-marker" aria-hidden="true"></span>
       <button type="button" class="nav-item" data-view="overview" aria-current="page">
         <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">概览</span>
+      </button>
+      <button type="button" class="nav-item" data-view="canvas">
+        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">编排</span>
       </button>
       <button type="button" class="nav-item" data-view="live">
         <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">实时</span>
@@ -95,6 +99,8 @@
           <button class="btn btn-ghost btn-sm" data-act="open-search"
                   title="Codex 联网搜索（Alpha Search）专用的上游分组">搜索上游</button>
           <span class="tag tag-accent" id="search-target-tag" hidden></span>
+          <button class="btn btn-ghost btn-sm" data-act="batch-add"
+                  title="填一个模型名，一次问遍所有上游站，勾选要加的分组">批量添加模型</button>
           <button class="btn btn-sm" data-act="new-route">新增模型</button>
         </div>
         <p class="card-hint">点候选圆片即把该模型切到那一条（高亮的是当前生效的，也是自动降级的起点）。
@@ -123,6 +129,52 @@
           <div class="card-head"><h2>模型热度</h2><span class="count" id="hot-count"></span></div>
           <div class="card-body" id="hot-list"></div>
         </section>
+      </div>
+    </section>
+
+    <!-- ---------- 编排 ---------- -->
+    <section class="view" data-view="canvas" hidden>
+      <div class="view-head">
+        <h2>编排</h2><span class="count" id="cv-count"></span>
+        <span class="grow"></span>
+        <span class="seg" id="cv-seg-iface" role="group" aria-label="按接口筛选"></span>
+        <input type="search" class="search" id="cv-filter" placeholder="筛选模型名…" aria-label="筛选模型名">
+        <button class="btn btn-ghost btn-sm" data-act="cv-fit" title="把所有气泡挪进视野">适配</button>
+        <button class="btn btn-ghost btn-sm" data-act="cv-reset" title="忘掉手动摆的位置，重新自动排列">重排</button>
+        <button class="btn btn-sm" data-act="cv-new-model">＋ 下游模型</button>
+      </div>
+      <p class="card-hint">每个大气泡是<b>一个下游模型</b>（一个「模型名 + 接口」= 一条链）。
+        绕着它一圈的小圆片是它的<b>候选</b>，<b>顺时针方向就是自动降级的尝试顺序</b>；
+        指针指向的那条是<b>当前实际会先打的</b>，端口上的数字是顺序。
+        指针可以<b>拨</b>（拖动针尖那个圆点旋转），指到哪条就切到哪条，自动降级也是这根指针自己转过去。
+        从左边的上游池拖一个模型到气泡上就连上一条候选（<b>拖断不会删</b>，要用端口右键菜单里的「移除」）。
+        上游节点是参考层，排在气泡左边，按住空白处可以平移画布、滚轮缩放。</p>
+      <div class="cv-wrap">
+        <aside class="cv-pool" id="cv-pool" aria-label="上游池"></aside>
+        <div class="cv-host" id="cv-host">
+          <svg class="cv-wires" aria-hidden="true">
+            <defs>
+              <!-- markerUnits 必须显式写 userSpaceOnUse：默认是 strokeWidth，箭头会跟着
+                   线宽一起放大 —— 粗的交接箭头会长成一个大三角，把画布糊掉 -->
+              <marker id="cv-ah" class="cv-ah" markerUnits="userSpaceOnUse"
+                      markerWidth="9" markerHeight="9" refX="8" refY="4.5"
+                      orient="auto-start-reverse"><path d="M0,0 L9,4.5 L0,9 z"></path></marker>
+              <marker id="cv-ah-on" class="cv-ah-on" markerUnits="userSpaceOnUse"
+                      markerWidth="10" markerHeight="10" refX="9" refY="5"
+                      orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"></path></marker>
+              <marker id="cv-ah-fwd" class="cv-ah-fwd" markerUnits="userSpaceOnUse"
+                      markerWidth="13" markerHeight="13" refX="11" refY="6.5"
+                      orient="auto-start-reverse"><path d="M0,0 L13,6.5 L0,13 z"></path></marker>
+            </defs>
+            <g id="cv-cam">
+              <g id="cv-links"></g>
+              <g id="cv-forwards"></g>
+            </g>
+          </svg>
+          <div class="cv-world" id="cv-world"></div>
+          <div class="cv-menu" id="cv-menu" role="menu" hidden></div>
+          <div class="cv-empty" id="cv-empty" hidden></div>
+        </div>
       </div>
     </section>
 
@@ -427,6 +479,39 @@
   </form>
 </dialog>
 
+<!-- ============ 批量添加新模型：一次问遍所有上游站，勾选要加的分组 ============ -->
+<dialog id="batch-dialog" class="wide">
+  <form id="batch-form">
+    <div class="dlg-head">
+      <h2>批量添加新模型</h2><span class="grow"></span>
+      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+    </div>
+    <div class="dlg-body">
+      <p class="card-hint" style="margin:0 0 12px">
+        填一个模型名，先看<b>哪些上游站有它</b>：<b>完全同名</b>的默认勾上，只沾一部分的排后面、
+        默认不勾 —— 上游的 id 往往带日期后缀或厂商前缀，得自己认一下再用。
+        勾中即意味着两件事一起做：把这个站登记进上游模型目录，并在「模型路由」里建一条候选。</p>
+      <div class="field-row">
+        <input type="search" class="search" id="batch-model" style="flex:1;min-width:200px"
+               placeholder="模型名，如 deepseek-v3 / gpt-5.2" autocomplete="off" aria-label="模型名">
+        <button type="button" class="btn" data-act="batch-scan">扫描所有上游站</button>
+      </div>
+      <div class="field-row" style="margin-top:10px">
+        <input type="search" class="search" id="batch-filter" style="flex:1;min-width:160px"
+               placeholder="在结果里过滤…" aria-label="过滤扫描结果">
+        <span class="dim" id="batch-status" style="font-size:12px"></span>
+      </div>
+      <div class="picker" id="batch-picker"></div>
+      <p class="dim" id="batch-hint" style="font-size:12px;margin:10px 0 0"></p>
+    </div>
+    <div class="dlg-foot">
+      <span class="dim" id="batch-count" style="font-size:12px"></span>
+      <span class="grow"></span>
+      <button type="submit" class="btn" id="batch-save" disabled>添加选中的分组</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- ============ 搜索上游：Codex Alpha Search 专用的 OpenAI 分组 ============ -->
 <dialog id="search-dialog" class="sm">
   <form id="search-form">
@@ -457,6 +542,31 @@
   </form>
 </dialog>
 
+<!-- ============ 编排：整条链交给另一个下游模型 ============ -->
+<dialog id="cv-fwd-dialog" class="sm">
+  <form id="cv-fwd-form">
+    <div class="dlg-head">
+      <h2 id="cv-fwd-title">整条链交给…</h2><span class="grow"></span>
+      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+    </div>
+    <div class="dlg-body">
+      <p class="card-hint" style="margin:0 0 12px" id="cv-fwd-hint"></p>
+      <label class="field">接到哪个下游模型
+        <select id="cv-fwd-target"></select>
+      </label>
+      <p class="dim" style="font-size:12px;margin:10px 0 0">
+        转发是<b>同接口内</b>的：目标必须在同一个接口下有可用候选，否则转过去也是 404。
+        设置后自己这条链的候选<b>不参与路由</b>（配置留着，取消转发就恢复）。
+      </p>
+    </div>
+    <div class="dlg-foot">
+      <button type="button" class="btn btn-danger" data-act="cv-unforward" id="cv-fwd-clear" hidden>取消转发</button>
+      <span class="grow"></span>
+      <button type="submit" class="btn" id="cv-fwd-save">交接</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- ============ 下游接入信息 ============ -->
 <dialog id="access-dialog">
   <div class="dlg-head">
@@ -478,6 +588,6 @@
 </dialog>
 
 <div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
-<script type="module" src="/static/app.js?v=9"></script>
+<script type="module" src="/static/app.js?v=10"></script>
 </body>
 </html>

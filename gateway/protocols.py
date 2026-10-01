@@ -376,9 +376,12 @@ class SSEObserver:
     """
 
     def __init__(
-        self, proto: Protocol, *, collect_types: bool = False, collect_compaction: bool = False
+        self, proto: Protocol, *, collect_types: bool = False, collect_compaction: bool = False,
+        on_event: Callable[[str, int], None] | None = None,
     ) -> None:
         self.proto = proto
+        # Metadata-only hook. Exceptions must never change stream forwarding.
+        self._on_event = on_event
         self._collect_types = collect_types or collect_compaction
         self._collect_compaction = collect_compaction
         self._buffer = bytearray()
@@ -435,6 +438,7 @@ class SSEObserver:
                 data.append(line[5:].lstrip())
 
         if not data and not event:
+            self._notify("heartbeat", 0)
             return
         if event and self._collect_types:
             self.event_types[event] = self.event_types.get(event, 0) + 1
@@ -453,7 +457,7 @@ class SSEObserver:
 
         data_text = data_bytes.decode("utf-8", "ignore").strip()
         payload: object = None
-        if data_text and (self._collect_types or not event):
+        if data_text and (self._collect_types or not event or self._on_event is not None):
             try:
                 payload = json.loads(data_text)
             except (TypeError, ValueError):
@@ -463,6 +467,29 @@ class SSEObserver:
             self.payload_types[payload_type] = self.payload_types.get(payload_type, 0) + 1
         if self._collect_compaction:
             self.compaction_items.extend(compaction_observations(payload, event=event))
+
+        kind = event or (payload.get("type", "") if isinstance(payload, dict) else "")
+        if not isinstance(kind, str):
+            kind = ""
+        malformed = bool(
+            self._on_event is not None and data_text and payload is None
+            and data_text not in self.proto.end_data_markers
+        )
+        if malformed:
+            self._notify("malformed", 0)
+        if (kind in {"error", "response.failed", "response.incomplete"}
+                or isinstance(payload, dict) and payload.get("error") is not None):
+            self._notify("protocol_error", 0)
+        elif (event in self.proto.end_event_types or data_text in self.proto.end_data_markers
+              or not event and kind in self.proto.end_event_types):
+            self._notify("completion", 0)
+        elif got or think or _TOOL_DELTA.search(frame):
+            tool = bool(_TOOL_DELTA.search(frame)) or "function_call_arguments" in str(kind)
+            self._notify("tool" if tool else "reasoning" if think else "content", got)
+        elif kind == "ping":
+            self._notify("heartbeat", 0)
+        elif not malformed:
+            self._notify("metadata", 0)
 
         if event in self.proto.end_event_types:
             self.ended = True
@@ -478,6 +505,13 @@ class SSEObserver:
             return
         if isinstance(payload, dict) and payload.get("type") in self.proto.end_event_types:
             self.ended = True
+
+    def _notify(self, kind: str, size: int) -> None:
+        if self._on_event is not None:
+            try:
+                self._on_event(kind, size)
+            except Exception:
+                pass
 
 
 def compaction_observations(payload: object, *, event: str = "") -> list[dict[str, object]]:
