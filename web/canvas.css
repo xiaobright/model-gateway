@@ -1,8 +1,8 @@
 /* ============================================================
    编排画布
    ------------------------------------------------------------
-   一个下游气泡 = 一条链；绕它一圈的端口 = 候选，**顺时针就是降级顺序**；
-   指针指向当前实际会先打的那条。连线交给 SVG，节点交给 DOM —— 文字和按钮
+   一个下游气泡 = 一条链；只展开选中的气泡，指针表示保存的首选。
+   候选顺序在下方箭头链中编辑。连线交给 SVG，节点交给 DOM —— 文字和按钮
    必须是真元素，缩放时才有正常的选择、悬停和无障碍行为。
 
    颜色一律走 style.css 那套变量，深浅色自动跟随，这里不另开一套配色。
@@ -546,3 +546,27 @@
   .cv-needle, .cv-port, .cv-chip { transition: none; }
   .cv-bub.is-shift .cv-core { animation: none; }
 }
+/* 单模型展开：画布只保留下游拓扑，完整名称和操作放在候选链。 */
+.cv-wrap { height: 420px; min-height: 320px; }
+.cv-bub:not(.is-selected) .cv-dial,
+.cv-bub:not(.is-selected) .cv-ports,
+.cv-bub:not(.is-selected) .cv-needle,
+.cv-bub.is-fwd .cv-dial,
+.cv-bub.is-fwd .cv-ports,
+.cv-bub.is-fwd .cv-needle { display: none; }
+.cv-bub.is-selected .cv-core { border: 2px solid var(--accent); }
+.cv-core { font: inherit; cursor: pointer; }
+.cv-port-label { display: none; }
+.cv-chain { margin-top: 14px; padding: 16px; border: 1px solid var(--edge); border-radius: 14px; background: var(--glass-2); }
+.cv-chain-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.cv-chain-head > span, .cv-route-summary { color: var(--ink-3); font-size: 12px; line-height: 1.8; }
+.cv-chain-list { display: flex; align-items: center; overflow-x: auto; gap: 10px; padding: 4px 0 10px; }
+.cv-chain-card { flex: 0 0 240px; padding: 12px; border: 1px solid var(--edge); border-radius: 12px; background: var(--glass); }
+.cv-chain-card.is-preferred { border-color: var(--accent); }
+.cv-chain-card > b, .cv-chain-card > span, .cv-chain-card > small { display: block; overflow-wrap: anywhere; margin-bottom: 7px; }
+.cv-chain-card > span, .cv-chain-card > small { color: var(--ink-3); font-size: 12px; }
+.cv-chain-card .btn { padding: 4px 7px; }
+.cv-chain-arrow { color: var(--accent); font-size: 24px; }
+.cv-forward-path { color: var(--accent-ink); overflow-wrap: anywhere; }
+@media (max-width: 700px) { .cv-wrap { grid-template-columns: 150px minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { .cv-needle { transition: none; } }

@@ -143,12 +143,8 @@
         <button class="btn btn-ghost btn-sm" data-act="cv-reset" title="忘掉手动摆的位置，重新自动排列">重排</button>
         <button class="btn btn-sm" data-act="cv-new-model">＋ 下游模型</button>
       </div>
-      <p class="card-hint">每个大气泡是<b>一个下游模型</b>（一个「模型名 + 接口」= 一条链）。
-        绕着它一圈的小圆片是它的<b>候选</b>，<b>顺时针方向就是自动降级的尝试顺序</b>；
-        指针指向的那条是<b>当前实际会先打的</b>，端口上的数字是顺序。
-        指针可以<b>拨</b>（拖动针尖那个圆点旋转），指到哪条就切到哪条，自动降级也是这根指针自己转过去。
-        从左边的上游池拖一个模型到气泡上就连上一条候选（<b>拖断不会删</b>，要用端口右键菜单里的「移除」）。
-        上游节点是参考层，排在气泡左边，按住空白处可以平移画布、滚轮缩放。</p>
+      <p class="card-hint">点一个下游气泡展开候选链。箭头表示候选顺序，拨盘只改变首选，失败时仍按开关自动降级。
+        从上游池拖到气泡可连接候选；拖气泡上的 ↦ 到另一个气泡可设置全部转发。</p>
       <div class="cv-wrap">
         <aside class="cv-pool" id="cv-pool" aria-label="上游池"></aside>
         <div class="cv-host" id="cv-host">
@@ -176,6 +172,7 @@
           <div class="cv-empty" id="cv-empty" hidden></div>
         </div>
       </div>
+      <div class="cv-chain" id="cv-chain" aria-label="选中模型的候选链"></div>
     </section>
 
     <!-- ---------- 实时 ---------- -->

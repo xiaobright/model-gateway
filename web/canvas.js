@@ -1,39 +1,13 @@
 'use strict';
-/* 编排画布：下游气泡 + 候选环（轮盘）+ 上游节点 + 挂载箭头 + 转发箭头。
-
-这套界面只表达三件事，别的一律不进画布：
-
-1. **下游气泡**——一个「模型名 + 接口」= 一条链。一个气泡就是一个下游模型。
-2. **候选环（轮盘）**——绕着气泡一圈的端口就是这条链的候选，**顺时针方向就是自动降级的
-   尝试顺序**。指针指向的那条是「现在实际会先打的」，端口上的数字是顺序位。
-3. **箭头**——上游节点连到端口 = 这条上游挂在这个模型上；气泡连气泡 = 整条链交给那边。
-
-两条硬规矩（定死了才好维护）：
-
-- **顺序只有一个出处：环。** 箭头永远不表达顺序，它只表示「挂上了」。所以调顺序是拖端口，
-  不是挪箭头。
-- **拨盘只「选」，不改结构。** 指针转到哪个端口就是切到那条候选；自动降级是指针自己顺时针
-  转到下一个端口。改真名、删候选走端口菜单，别让同一个手势既选又改。
-
-手势分工（同一个气泡上重叠了好几个动作，必须互不抢）：
-
-| 位置 | 左键点 | 拖动 |
-| --- | --- | --- |
-| 气泡本体 | 无（只是按住） | 挪气泡 |
-| 指针 / 针尖圆点 | 无 | **拨盘**：转到最近那个端口，松手就切过去 |
-| 端口圆片 | **切到这条** | **调降级顺序** |
-| 端口 / 气泡右键 | 打开菜单 | — |
-| 气泡上的 ↦ | — | **拉一条交接箭头**到另一个气泡 |
-| 上游池的片子 | — | 拖到某个气泡上 = 挂一条候选 |
-
-坐标是纯展示状态，存在 `/admin/api/canvas-layout`，和路由配置完全分开：画布坏了、位置丢了，
-只是节点回到自动摆放，不可能把配置带坏。
-*/
+/* 下游气泡一次只展开一条候选链。箭头排列候选，轮盘只修改保存的首选。
+   状态显示是下一次请求的起点预测，不模拟单次请求的自动降级轨迹。
+   坐标只负责展示；路由写操作仍通过已有管理接口。 */
 
 import {
   $, state, api, toast, esc, clamp, confirmBox, groupOf, upstreamOfGroup, splitOneM,
   PROTO_LABEL, PROTO_SHORT, PROTOCOLS, protocolOn,
 } from './util.js';
+import { orderedCandidates, attemptOrder, forwardPath, forwardTargets, moveCandidate } from './canvas-model.js';
 
 /* ---------------------------------------------------------------- 注入 */
 
@@ -50,18 +24,15 @@ const hooks = {
 const CORE_R = 42;          // 气泡本体半径
 const PORT_R = 12;          // 端口圆片半径
 const PORT_GAP = 8;         // 端口之间留的弧距，挤不下就把环撑大
-const UP_W = 168;           // 上游节点宽
-const UP_H = 50;            // 上游节点高
 const HIT = 6;              // 位移超过这么多像素才算拖动，否则算点击
 /* 缩放下限不能太小：环上的端口是按世界坐标排的，缩到 0.25 时相邻端口在屏幕上会
    叠到一起，点哪个都点不准（点到的是叠在最上面那个）。0.45 时最挤的环仍有 20px 间距 */
 const Z_MIN = 0.45, Z_MAX = 2.6;
-/* 首次自动框视野时缩放的底线。再往下字就要靠猜了，宁可让上游那几列留在视野外，
-   反正它只是参考层，平移一下就能看到 */
+/* 首次适配保留可读字号，超出部分可平移查看。 */
 const FIT_MIN = 0.62;
 
 /* 针尖要站在环**外面**：和端口同半径的话，端口在 DOM 里排在指针后面、会盖住针尖，
-   拖到的就成了端口（变成调顺序），拨盘根本拨不动。往外挪一段就互不相干，
+   拖到的就成了端口，拨盘根本拨不动。往外挪一段就互不相干，
    正好也是老式轮盘那个指挡的位置。 */
 const KNOB_OUT = 26;
 
@@ -74,7 +45,7 @@ function ringRadius(n) {
 /** 气泡外框半边长：要装得下环外那个指挡（R + KNOB_OUT + 半径）再留点标签的余量 */
 const boxHalf = (r) => r + KNOB_OUT + 12;
 
-/** 第 i 个端口的角度（度）。0 在最上面，顺时针递增 —— 也就是降级的方向。 */
+/** 第 i 个端口的角度（度）。0 在最上面，顺时针递增 —— 对应保存的候选编号。 */
 const portAngle = (i, n) => (i * 360) / n;
 const polar = (r, deg) => {
   const rad = ((deg - 90) * Math.PI) / 180;
@@ -89,19 +60,17 @@ let loading = false;
 let needFit = false;               // 一次都没摆过：第一次画完要自动框进视野
 let iface = '';                    // 画布自己的接口筛选，和概览那个互不影响
 let filter = '';
+let selectedKey = null;
 let pos = new Map();               // 节点键 -> [x, y]
 let nodeEls = new Map();           // 节点键 -> 元素（复用：轮询不重建，悬停和拖拽才不会断）
 let rotState = new Map();          // 气泡键 -> 已经转过的角度（只增不减，指针才永远向前转）
-let seenActive = new Map();        // 气泡键 -> 上次看到的 active_route_id，用来认自动降级
 let drag = null;
 let saveTimer = 0;
 let view = { x: 0, y: 0, z: 1 };
 
 /* 键的格式写在这儿，和后端 gateway/canvas.py 一一对应。改一处必须改两处。 */
 const BUBBLE_PREFIX = 'm|';
-const UPSTREAM_PREFIX = 'u|';
 const bubKey = (model, proto) => `${BUBBLE_PREFIX}${model}|${proto}`;
-const upKey = (group_id, remote) => `${UPSTREAM_PREFIX}${group_id}|${remote}`;
 
 function bubbleOf(key) {
   for (const row of state.routes) if (bubKey(row.model_name, row.protocol) === key) return row;
@@ -109,8 +78,7 @@ function bubbleOf(key) {
 }
 
 /** 候选按 priority 排。后端已经排好了，这里只是不依赖它地再保证一次 —— 环上位置就是顺序 */
-const orderedCands = (row) =>
-  [...row.candidates].sort((a, b) => (a.priority - b.priority) || (a.route_id - b.route_id));
+const orderedCands = orderedCandidates;
 
 function groupLabelOf(gid) {
   const up = upstreamOfGroup(gid);
@@ -137,30 +105,11 @@ const visibleBubbles = () => state.routes.filter((row) =>
   && (!iface || row.protocol === iface)
   && (!filter || row.model_name.toLowerCase().includes(filter)));
 
-/** 所有候选用到的上游节点。同一个 (分组, 真名) 只画一个 —— 几个模型共用它时是同一个节点 */
-function upstreamNodes() {
-  const map = new Map();
-  for (const row of visibleBubbles()) {
-    for (const c of row.candidates) {
-      const key = upKey(c.group_id, c.remote_model);
-      if (!map.has(key)) {
-        map.set(key, {
-          key, group_id: c.group_id, remote_model: c.remote_model,
-          upstream_id: c.upstream_id, upstream_name: c.upstream_name,
-          group_name: c.group_name, protocol: c.protocol,
-          enabled: candUsable(c),
-        });
-      }
-    }
-  }
-  return [...map.values()];
-}
-
 /* ---------------------------------------------------------------- 位置 */
 
-/** 还没摆过的节点给个可预测的位置：上游一列在左，气泡网格在右。
+/** 还没摆过的节点给个可预测的位置：气泡按网格排列。
 
-    间距按「首次打开能一眼看清」定的：气泡 320×330、上游节点 62 高、一列最多 10 个。
+    间距按「首次打开能一眼看清」定的：气泡间距 320×330。
     排得太散的话首次适配会缩到 0.5 以下，字就糊了。 */
 function autoPlace() {
   const bubbles = [...visibleBubbles()].sort((a, b) =>
@@ -172,13 +121,7 @@ function autoPlace() {
       pos.set(key, [150 + (i % cols) * 320, 130 + Math.floor(i / cols) * 330]);
     }
   });
-  const ups = upstreamNodes().sort((a, b) =>
-    a.upstream_name.localeCompare(b.upstream_name) || a.remote_model.localeCompare(b.remote_model));
-  ups.forEach((node, i) => {
-    if (!pos.has(node.key)) {
-      pos.set(node.key, [-260 - Math.floor(i / 10) * 200, 70 + (i % 10) * 62]);
-    }
-  });
+
 }
 
 const posOf = (key) => pos.get(key) || [0, 0];
@@ -256,22 +199,18 @@ function zoomAt(clientX, clientY, factor) {
   markDirty();
 }
 
-/** 把节点框进视野。返回是否真的算过 —— 视图还没显示出来时量不到尺寸，不能硬算。
-
-    `scope` 决定框谁：首次进来自动框的是**气泡**（上游节点是参考层，为一列竖着排的
-    上游把缩放压到 0.5 以下，字就全糊了）；用户手动点「适配」才连上游一起框。 */
-export function fitCanvas(scope = 'bubbles') {
+/** 框住当前筛选可见的气泡；隐藏节点和历史上游坐标不参与适配。 */
+export function fitCanvas() {
   const rect = host.getBoundingClientRect();
   // 切换视图用的是 View Transition，DOM 变形发生在下一帧的回调里：刚 showView 完就
   // 量的话会量到 0×0，算出来的缩放会掉到下限、把所有节点叠成一团
   if (rect.width < 80 || rect.height < 80) return false;
-  const prefix = scope === 'all' ? '' : BUBBLE_PREFIX;
-  const keys = [...pos.keys()].filter((k) => k.startsWith(prefix));
+  const keys = visibleBubbles().map(row => bubKey(row.model_name, row.protocol));
   if (!keys.length) return false;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const key of keys) {
     const [x, y] = posOf(key);
-    const half = key.startsWith(BUBBLE_PREFIX) ? boxHalf(ringRadius(6)) : UP_W / 2;
+    const half = boxHalf(ringRadius(bubbleOf(key)?.candidates.length || 0));
     x0 = Math.min(x0, x - half); x1 = Math.max(x1, x + half);
     y0 = Math.min(y0, y - half); y1 = Math.max(y1, y + half);
   }
@@ -279,7 +218,7 @@ export function fitCanvas(scope = 'bubbles') {
   const z = clamp(Math.min(
     (rect.width - pad * 2) / Math.max(1, x1 - x0),
     (rect.height - pad * 2) / Math.max(1, y1 - y0),
-  ), scope === 'all' ? Z_MIN : FIT_MIN, 1.05);
+  ), FIT_MIN, 1.05);
   view = {
     z,
     x: (rect.width - (x1 - x0) * z) / 2 - x0 * z,
@@ -297,6 +236,44 @@ function paint(el, html) {
   if (el.__html !== html) { el.innerHTML = html; el.__html = html; }
 }
 
+function renderChain() {
+  const panel = $('cv-chain');
+  const row = bubbleOf(selectedKey);
+  if (!row) { paint(panel, '<p>选择一个下游气泡，展开它的候选链。</p>'); return; }
+  const data = `data-model="${esc(row.model_name)}" data-proto="${esc(row.protocol)}"`;
+  const button = (act, label, extra = '', disabled = false) =>
+    `<button type="button" class="btn btn-ghost btn-sm" data-act="${act}" ${data} ${extra}${disabled ? ' disabled' : ''}>${label}</button>`;
+  const cands = orderedCands(row);
+  const failover = Boolean(state.failover.enabled[row.protocol]);
+  const attempts = attemptOrder(row, failover);
+  const preferred = cands.find((c) => c.route_id === row.preferred_route_id);
+  let body;
+  if (row.forward_to) {
+    const path = forwardPath(row, state.routes);
+    body = `<p class="cv-forward-path">全部转发：${esc(row.model_name)} → ${path
+      ? path.map((r) => esc(r.model_name)).join(' → ') : `${esc(row.forward_to)}（链路不可用）`}</p>
+      <p>自己的 ${cands.length} 个候选保留，但不参与路由。取消转发后恢复。</p>
+      ${button('cv-unforward', '取消全部转发')}`;
+  } else {
+    body = `<p class="cv-route-summary">保存的首选：${preferred ? esc(candLabel(preferred)) : '未指定'}<br>
+      当前可用起点：${attempts.length ? esc(candLabel(attempts[0])) : '无可用候选'} · 自动降级${failover ? '已开启' : '已关闭'}
+      <br>候选按箭头排序；首选先试，冷却候选在启用降级时后移。此处不是单次请求的实时轨迹。</p>
+      <div class="cv-chain-list">${cands.map((c, i) => {
+        const extra = `data-rid="${c.route_id}"`;
+        return `<article class="cv-chain-card${c.route_id === row.preferred_route_id ? ' is-preferred' : ''}">
+          <b>${i + 1}. ${esc(c.remote_model)}</b><span>${esc(groupLabelOf(c.group_id))}</span>
+          <small>${!candUsable(c) ? '停用' : coolingLeft(c) ? '冷却中' : '可用'}${c.route_id === row.preferred_route_id ? ' · 首选' : ''}</small>
+          <div>${button('cv-switch', '设为首选', extra, !candUsable(c) || c.route_id === row.preferred_route_id)}
+          ${button('cv-move', '前移', `${extra} data-delta="-1"`, i === 0)}
+          ${button('cv-move', '后移', `${extra} data-delta="1"`, i === cands.length - 1)}</div>
+          <div>${button('cv-edit-cand', '编辑', extra)}${button('cv-del-cand', '移除', extra)}</div></article>`;
+      }).join('<span class="cv-chain-arrow" aria-hidden="true">→</span>')}
+      ${button('cv-add-cand', '＋ 连接上游')}</div>`;
+  }
+  paint(panel, `<div class="cv-chain-head"><b>${esc(row.model_name)}</b><span>${esc(PROTO_LABEL[row.protocol] || row.protocol)}</span>
+    ${button('cv-forward', '全部转发到…')}${button('cv-del-model', '删除模型')}</div>${body}`);
+}
+
 /* 气泡的骨架建一次就不动了。指针必须是常驻元素：它一变就重建的话，旋转的过渡动画
    永远来不及播 —— 而「自动拨动」正是靠这个过渡看出来的。
 
@@ -311,7 +288,7 @@ function buildBubble() {
       <i class="cv-line"></i><i class="cv-knob"></i>
     </button>
     <div class="cv-ports"></div>
-    <div class="cv-core"></div>
+    <button type="button" class="cv-core" aria-label="展开候选链"></button>
     <button type="button" class="cv-tag" data-act="cv-menu" title="点这里改这个模型：加候选 / 交接 / 删除"></button>
     <button type="button" class="cv-wire" title="拖到另一个模型上：整条链交给它">↦</button>`;
   return el;
@@ -323,7 +300,7 @@ function portsHtml(row, n, R) {
     const u = polar(1, portAngle(i, n));      // 向外的单位向量，标签顺着它往外推
     const usable = candUsable(c);
     const cool = coolingLeft(c);
-    const on = row.active_route_id === c.route_id && !row.forward_to;
+    const on = attemptOrder(row, state.failover.enabled[row.protocol])[0]?.route_id === c.route_id;
     const cls = ['cv-port'];
     if (on) cls.push('is-on');
     if (row.preferred_route_id === c.route_id) cls.push('is-preferred');
@@ -361,19 +338,7 @@ function forwardArrowTarget(row) {
     多跳要按后端那套走完整条链：`a → b → c` 里 a 的直接目标是 b（它自己一个候选都没有），
     但整条链是通的，不能因为 b 没有候选就说 a 断了。上限和后端 FORWARD_MAX_HOPS 对齐。 */
 function forwardTarget(row) {
-  const HOPS = 16;
-  let cur = row;
-  const seen = new Set([bubKey(row.model_name, row.protocol)]);
-  for (let i = 0; i < HOPS; i += 1) {
-    if (!cur.forward_to) return cur.candidates.length ? cur : null;
-    if (seen.has(bubKey(cur.forward_to, cur.protocol))) return null;   // 绕回来了
-    const next = state.routes.find(
-      (r) => r.model_name === cur.forward_to && r.protocol === cur.protocol);
-    if (!next) return null;
-    seen.add(bubKey(next.model_name, next.protocol));
-    cur = next;
-  }
-  return null;
+  return forwardPath(row, state.routes)?.at(-1) || (!row.forward_to && row.candidates.length ? row : null);
 }
 
 const forwardDead = (row) => Boolean(row.forward_to) && forwardTarget(row) === null;
@@ -392,6 +357,7 @@ function paintBubble(el, row) {
   el.dataset.proto = row.protocol;
   el.dataset.protoClass = row.protocol;
   el.classList.toggle('is-fwd', Boolean(row.forward_to));
+  el.classList.toggle('is-selected', el.dataset.key === selectedKey);
   el.classList.toggle('is-dead', forwardDead(row));
   el.classList.toggle('is-alone', !row.forward_to && cands.length === 0);
 
@@ -410,11 +376,11 @@ function paintBubble(el, row) {
   paintNeedle(el, row, n);
 }
 
-/** 指针的角度。只增不减地累加，切到更靠前的端口也不会倒着转回去 —— 降级永远顺时针。 */
+/** 指针的角度。只增不减地累加，切到更靠前的端口也不会倒着转回去。 */
 function paintNeedle(el, row, n) {
   const needle = el.querySelector('.cv-needle');
   const cands = orderedCands(row);
-  const activeId = row.forward_to ? null : row.active_route_id;
+  const activeId = row.forward_to ? null : row.preferred_route_id;
   const idx = cands.findIndex((c) => c.route_id === activeId);
   needle.dataset.rid = String(activeId ?? '');
   if (idx < 0) {
@@ -429,27 +395,15 @@ function paintNeedle(el, row, n) {
   needle.style.transform = `rotate(${target}deg)`;
 }
 
-function paintUpstream(el, node) {
-  el.classList.toggle('is-off', !node.enabled);
-  el.dataset.proto = node.protocol;
-  el.dataset.protoClass = node.protocol;
-  paint(el, `<span class="cv-up-name" title="${esc(node.upstream_name)}">${esc(node.upstream_name)}</span>
-    <span class="cv-up-remote" title="${esc(node.remote_model)}">${esc(node.remote_model)}</span>
-    <span class="cv-up-grp">${esc(node.group_name)}</span>`);
-  const [x, y] = posOf(node.key);
-  el.style.left = `${x - UP_W / 2}px`;
-  el.style.top = `${y - UP_H / 2}px`;
-}
-
 /** 空白画布上写什么。刚装好的机器上游也是空的，那时候「从上游池拖一个过来」根本做不到 */
 function emptyHint() {
   if (filter || iface) return '没有匹配的模型，清掉上面的筛选看看。';
   const hasSource = state.upstreams.some((u) => (u.groups || []).some(
     (g) => protocolOn(g.protocol) && (g.models || []).length));
   return hasSource
-    ? '还没有对下游暴露任何模型。点右上角「＋ 下游模型」，或者从左边的上游池拖一个模型过来。'
+    ? '还没有对下游暴露任何模型。点右上角「＋ 下游模型」，再从上游池连接候选。'
     : '还没有可用的上游。先去「上游站点」添加一个供应商、建分组并拉一次模型列表，'
-      + '再回这里把模型拖出来。';
+      + '再回这里添加下游模型。';
 }
 
 export function renderCanvas() {
@@ -461,7 +415,9 @@ export function renderCanvas() {
 
   autoPlace();
   const bubbles = visibleBubbles();
-  const ups = upstreamNodes();
+  if (!bubbles.some((row) => bubKey(row.model_name, row.protocol) === selectedKey)) {
+    selectedKey = bubbles.length ? bubKey(bubbles[0].model_name, bubbles[0].protocol) : null;
+  }
   const alive = new Set();
 
   for (const row of bubbles) {
@@ -475,89 +431,39 @@ export function renderCanvas() {
     }
     paintBubble(el, row);
   }
-  for (const node of ups) {
-    alive.add(node.key);
-    let el = nodeEls.get(node.key);
-    if (!el) {
-      el = document.createElement('div');
-      el.className = 'cv-node cv-up';
-      el.dataset.key = node.key;
-      el.style.width = `${UP_W}px`;
-      el.style.height = `${UP_H}px`;
-      world.append(el);
-      nodeEls.set(node.key, el);
-    }
-    paintUpstream(el, node);
-  }
   // 已经不在画面上的节点收掉（被筛掉、被删掉、接口被停用）
   for (const [key, el] of [...nodeEls]) {
     if (alive.has(key)) continue;
     el.remove();
     nodeEls.delete(key);
     rotState.delete(key);
-    seenActive.delete(key);
   }
 
-  drawWires(bubbles, ups);
+  drawWires(bubbles);
   applyView();
-  detectFallback(bubbles);
+  renderChain();
   // 首次进来框一次视野。量不到尺寸就先不做，下一个 rAF 再试 —— needFit 不清掉，
   // 所以不会漏；量到了就会自己停
   if (needFit && bubbles.length) {
-    if (fitCanvas('bubbles')) needFit = false;
+    if (fitCanvas()) needFit = false;
     else requestAnimationFrame(() => { if (needFit) renderCanvas(); });
   }
 
   $('cv-count').textContent = bubbles.length
-    ? `${bubbles.length} 个下游模型 · ${ups.length} 个上游`
+    ? `${bubbles.length} 个下游模型`
     : '';
   emptyEl.hidden = bubbles.length > 0;
   if (!bubbles.length) emptyEl.textContent = emptyHint();
 }
 
-/** 认「自动降级」：active 变了但没人拨盘，就是断路器把流量拨走了，闪一下让人看见 */
-function detectFallback(bubbles) {
-  for (const row of bubbles) {
-    const key = bubKey(row.model_name, row.protocol);
-    const now = row.forward_to ? null : row.active_route_id;
-    const was = seenActive.get(key);
-    if (was !== undefined && was !== now && !drag && was !== null) {
-      const el = nodeEls.get(key);
-      if (el) {
-        el.classList.add('is-shift');
-        setTimeout(() => el.classList.remove('is-shift'), 1000);
-      }
-    }
-    seenActive.set(key, now);
-  }
-}
-
-function drawWires(bubbles, ups) {
-  const upPos = new Map(ups.map((n) => [n.key, posOf(n.key)]));
-  const links = [];
+function drawWires(bubbles) {
   const forwards = [];
 
   for (const row of bubbles) {
-    const key = bubKey(row.model_name, row.protocol);
-    const [bx, by] = posOf(key);
-    const cands = orderedCands(row);
-    const n = cands.length || 1;
-    const R = ringRadius(cands.length);
-    cands.forEach((c, i) => {
-      const from = upPos.get(upKey(c.group_id, c.remote_model));
-      if (!from) return;
-      const p = polar(R, portAngle(i, n));
-      const usable = candUsable(c);
-      const on = row.active_route_id === c.route_id && !row.forward_to;
-      links.push(`<path class="cv-link${on ? ' is-on' : ''}${usable ? '' : ' is-off'}"
-        d="M ${from[0]} ${from[1]} L ${(bx + p.x).toFixed(1)} ${(by + p.y).toFixed(1)}"
-        marker-end="url(#${on ? 'cv-ah-on' : 'cv-ah'})"></path>`);
-    });
-  }
-
-  for (const row of bubbles) {
     if (!row.forward_to) continue;
+    if (bubKey(row.model_name, row.protocol) !== selectedKey) continue;
     const target = forwardArrowTarget(row);
+    if (target && !bubbles.includes(target)) continue;
     const [x0, y0] = posOf(bubKey(row.model_name, row.protocol));
     if (!target) {
       // 断链：目标是明确指过的，但那边现在没有这个模型。画根短刺提醒，不偷偷改回自己的候选
@@ -570,13 +476,13 @@ function drawWires(bubbles, ups) {
     const len = Math.hypot(dx, dy) || 1;
     // 箭头正好落在两边的环上（不是更外面），读起来就是「从那个盘指进这个盘」；
     // 落在框边上会离得老远，像没接上
-    const r0 = ringRadius(orderedCands(row).length);
-    const r1 = ringRadius(orderedCands(target).length);
+    const r0 = CORE_R;
+    const r1 = CORE_R;
     const cls = `cv-fwd${forwardDead(row) ? ' is-dead' : ''}`;
     forwards.push(`<path class="${cls}" d="M ${(x0 + (dx / len) * r0).toFixed(1)} ${(y0 + (dy / len) * r0).toFixed(1)} L ${(x1 - (dx / len) * r1).toFixed(1)} ${(y1 - (dy / len) * r1).toFixed(1)}" marker-end="url(#cv-ah-fwd)"></path>`);
   }
 
-  linksG.innerHTML = links.join('');
+  linksG.innerHTML = '';
   fwdG.innerHTML = forwards.join('');
 }
 
@@ -681,7 +587,8 @@ export async function switchTo(model, proto, rid) {
   if (!c) return;
   if (!c.upstream_enabled) return toast('这个供应商是停用状态，先在「上游站点」里启用它', 'err');
   if (!c.group_enabled) return toast('这个分组是停用状态，展开那一行把它打开', 'err');
-  if (row.active_route_id === c.route_id) return;
+  if (row.forward_to) return toast('先取消全部转发，再选择自己的首选', 'err');
+  if (row.preferred_route_id === c.route_id) return;
   await api('POST', '/admin/api/models/switch', { route_id: c.route_id });
   await hooks.refreshConfig();
   toast(`${model} → ${candLabel(c)}`, 'ok');
@@ -722,7 +629,7 @@ export async function removeModel(model, proto) {
   toast('已删除', 'ok');
 }
 
-/** 从上游池 / 另一个上游节点挂一条候选上来。重复的交给后端 409，这里先说清楚 */
+/** 从上游池挂一条候选上来。重复的交给后端 409，这里先说清楚 */
 async function attachCandidate(model, proto, group_id, remote_model) {
   const row = bubbleOf(bubKey(model, proto));
   if (!row) return;
@@ -764,10 +671,9 @@ export function openForwardDialog(model, proto) {
   if (!row) return;
   fwdEditing = { model, proto };
   // 目标必须同接口、而且**自己有候选** —— 后端也这么校验，先把不可能的选项藏掉
-  const pool = state.routes.filter((r) =>
-    r.protocol === proto && r.model_name !== model && r.candidates.length && !r.forward_to);
+  const pool = forwardTargets(row, state.routes);
   if (!pool.length) {
-    return toast('这个接口下没有别的可交接模型 —— 目标自己得先有候选链', 'err');
+    return toast('这个接口下没有可用的转发目标（目标须有完整候选链且不能成环）', 'err');
   }
   $('cv-fwd-title').textContent = `「${model}」整条链交给…`;
   $('cv-fwd-hint').innerHTML = `接口：<b>${esc(PROTO_LABEL[proto] || proto)}</b>。`
@@ -784,16 +690,16 @@ export async function saveForward() {
   if (!fwdEditing) return;
   const target = $('cv-fwd-target').value;
   if (!target) return toast('先选一个目标模型', 'err');
-  const pending = { ...fwdEditing };
+  const pending = fwdEditing;
   await setForward(pending.model, pending.proto, target);
-  $('cv-fwd-dialog').close();
+  if (fwdEditing === pending) $('cv-fwd-dialog').close();
 }
 
 export async function clearForwardFromDialog() {
   if (!fwdEditing) return;
-  const pending = { ...fwdEditing };
+  const pending = fwdEditing;
   await clearForward(pending.model, pending.proto);
-  $('cv-fwd-dialog').close();
+  if (fwdEditing === pending) $('cv-fwd-dialog').close();
 }
 
 /* ---------------------------------------------------------------- 手势 */
@@ -924,7 +830,7 @@ function onMove(ev) {
     const h = parseFloat(drag.el.style.height) / 2;
     drag.el.style.left = `${x - w}px`;
     drag.el.style.top = `${y - h}px`;
-    drawWires(visibleBubbles(), upstreamNodes());
+    drawWires(visibleBubbles());
     return;
   }
   if (drag.kind === 'pool') {
@@ -936,7 +842,7 @@ function onMove(ev) {
     drag.ghost.classList.toggle('is-over', Boolean(over && over.proto === drag.grpProto));
     return;
   }
-  if (drag.kind === 'dial' || drag.kind === 'port') {
+  if (drag.kind === 'dial') {
     const row = bubbleOf(drag.key);
     if (!row) return;
     const cands = orderedCands(row);
@@ -948,16 +854,9 @@ function onMove(ev) {
     const idx = Math.round((deg / 360) * n) % n;
     drag.idx = idx;
     const needle = drag.el.querySelector('.cv-needle');
-    if (drag.kind === 'dial') {
-      const c = cands[idx];
-      drag.rid = c ? c.route_id : null;
-      if (needle) needle.style.transform = `rotate(${deg}deg)`;
-    } else {
-      const R = ringRadius(cands.length);
-      const off = polar(R, deg);
-      drag.port.style.left = `calc(50% + ${off.x.toFixed(1)}px)`;
-      drag.port.style.top = `calc(50% + ${off.y.toFixed(1)}px)`;
-    }
+    const c = cands[idx];
+    drag.rid = c ? c.route_id : null;
+    if (needle) needle.style.transform = `rotate(${deg}deg)`;
     return;
   }
   if (drag.kind === 'fwd') {
@@ -982,7 +881,11 @@ function onUp(ev) {
   // 平移和挪节点没有写操作，走不到下面那个 run()；这里补一次重画，
   // 好让拖拽期间被跳过的配置刷新马上补上
   if (d.kind === 'pan') { if (d.moved) markDirty(); return renderCanvas(); }
-  if (d.kind === 'node') { if (d.moved) markDirty(); return renderCanvas(); }
+  if (d.kind === 'node') {
+    if (d.moved) markDirty();
+    else selectedKey = d.key;
+    return renderCanvas();
+  }
 
   if (d.kind === 'pool') {
     d.ghost?.remove();
@@ -1007,17 +910,7 @@ function onUp(ev) {
 
   if (d.kind === 'port') {
     if (!d.moved) return run(switchTo(row.model_name, row.protocol, d.rid));
-    const cands = orderedCands(row);
-    const from = cands.findIndex((c) => c.route_id === d.rid);
-    const to = d.idx ?? from;
-    if (from < 0 || to < 0 || from === to) return renderCanvas();
-    const ids = cands.map((c) => c.route_id);
-    ids.splice(to, 0, ids.splice(from, 1)[0]);
-    return run((async () => {
-      await api('POST', '/admin/api/models/order', { model_name: row.model_name, order: ids });
-      await hooks.refreshConfig();
-      toast('降级顺序已更新', 'ok');
-    })());
+    return renderCanvas();
   }
 
   if (d.kind === 'fwd') {
@@ -1073,6 +966,16 @@ export function initCanvas(injected) {
   if (!host) return;
 
   host.addEventListener('pointerdown', onDown);
+  host.addEventListener('click', (ev) => {
+    if (ev.detail !== 0) return; // 键盘激活，鼠标选择由拖动结束处理。
+    const core = ev.target.closest('.cv-core');
+    if (core) { selectedKey = core.closest('.cv-bub').dataset.key; renderCanvas(); }
+    const port = ev.target.closest('.cv-port');
+    if (port) {
+      const row = bubbleOf(port.closest('.cv-bub').dataset.key);
+      if (row) run(switchTo(row.model_name, row.protocol, port.dataset.rid));
+    }
+  });
   host.addEventListener('wheel', onWheel, { passive: false });
   host.addEventListener('contextmenu', (ev) => {
     const port = ev.target.closest('.cv-port');
@@ -1136,7 +1039,6 @@ export async function relayout() {
   if (!okay) return;
   pos = new Map();
   rotState = new Map();
-  seenActive = new Map();
   renderCanvas();
   fitCanvas();
   markDirty();
@@ -1145,8 +1047,15 @@ export async function relayout() {
 
 /** 画布上的按钮都走 app.js 那套 data-act 分发，这里把动作表交给它 */
 export const canvasActions = {
+  'cv-move': async (d) => {
+    const row = bubbleOf(bubKey(d.model, d.proto));
+    const order = row && moveCandidate(row, d.rid, d.delta);
+    if (!order || row.forward_to) return;
+    await api('POST', '/admin/api/models/order', { model_name: d.model, order });
+    await hooks.refreshConfig();
+  },
   'cv-new-model': () => hooks.openRoute(null, null, iface || null),
-  'cv-fit': () => fitCanvas('all'),
+  'cv-fit': () => fitCanvas(),
   'cv-reset': () => relayout(),
   'cv-open-up': ({ uid }) => hooks.openUpstream(Number(uid)),
   // 气泡下方那个接口角标：点它是「这个模型能做什么」，和右键气泡同一个菜单
@@ -1170,7 +1079,7 @@ export const canvasActions = {
       c.upstream_enabled ? '供应商启用中' : '供应商已停用',
       c.group_enabled ? '分组启用中' : '分组已停用',
       coolingLeft(c) ? `分组冷却剩 ${Math.ceil(coolingLeft(c) / 1000)}s` : '没有冷却',
-      row.active_route_id === c.route_id ? '当前就在打这条' : '现在轮不到它',
+      row.preferred_route_id === c.route_id ? '保存的首选' : '备用候选',
     ].join(' · '), 'ok');
   },
 };
