@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS upstreams(
   header_override TEXT NOT NULL DEFAULT '',
   egress TEXT NOT NULL DEFAULT '',
   retry_rules TEXT NOT NULL DEFAULT '',
+  hold_retry TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS upstream_groups(
@@ -125,7 +126,8 @@ _since_trim = 0
 #   5 = 上游模型目录（group_models）与下游候选分开
 #   6 = 上游同站重试规则（retry_rules）
 #   7 = 下游模型转发（model_forwards）：一个下游模型可以把整条链交给另一个下游
-SCHEMA_VERSION = 7
+#   8 = 200 截断守卫（hold_retry）：连着拿回同一个没有正文的 200 就先扣住、原站重发
+SCHEMA_VERSION = 8
 
 # 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
 BACKUP_KEEP = 3
@@ -170,6 +172,9 @@ class Upstream:
     # 同站重试：JSON 数组 [{"status":400,"times":2,"delay_ms":0}, ...]。
     # 空串 = 不配。规则绑供应商，优先于自动降级换站。
     retry_rules: str = ""
+    # 200 截断守卫：JSON 对象 {"after":2,"times":3,"delay_ms":0}。
+    # 空串 = 不配。命中「连着几次 200 且没有正文」就把响应先扣住、原站重发。
+    hold_retry: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +224,7 @@ def _to_upstream(row: sqlite3.Row, api_key: str = "") -> Upstream:
         header_override=row["header_override"],
         egress=row["egress"],
         retry_rules=row["retry_rules"] if "retry_rules" in row.keys() else "",
+        hold_retry=row["hold_retry"] if "hold_retry" in row.keys() else "",
     )
 
 
@@ -464,6 +470,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             ("egress", "TEXT NOT NULL DEFAULT ''"),
             # 同站重试规则（JSON）。空串 = 不配；见 failover.parse_retry_rules
             ("retry_rules", "TEXT NOT NULL DEFAULT ''"),
+            # 200 截断守卫（JSON）。空串 = 不配；见 truncation.parse_rules
+            ("hold_retry", "TEXT NOT NULL DEFAULT ''"),
         ],
         "model_routes": [
             # 自动降级的尝试顺序：小的先试。0 = 还没排过，按 group_id 兜底
@@ -616,6 +624,7 @@ def create_upstream(
     enabled: bool = True,
     egress: str = "",
     retry_rules: str = "",
+    hold_retry: str = "",
 ) -> Upstream:
     """只建供应商本身。分组（key + 接口）由调用方紧接着建 —— 接口得选，猜不出来。"""
     base = normalize_base(base_url)
@@ -623,9 +632,9 @@ def create_upstream(
         _check_base_url(conn, base)
         try:
             cur = conn.execute(
-                "INSERT INTO upstreams(name, base_url, header_override, enabled, egress, retry_rules)"
-                " VALUES(?,?,?,?,?,?)",
-                (name, base, header_override, int(enabled), egress, retry_rules),
+                "INSERT INTO upstreams(name, base_url, header_override, enabled, egress,"
+                " retry_rules, hold_retry) VALUES(?,?,?,?,?,?,?)",
+                (name, base, header_override, int(enabled), egress, retry_rules, hold_retry),
             )
         except sqlite3.IntegrityError as exc:
             raise DuplicateName(name) from exc
@@ -641,6 +650,7 @@ def update_upstream(
     header_override: str = "",
     egress: str = "",
     retry_rules: str = "",
+    hold_retry: str = "",
 ) -> bool:
     base = normalize_base(base_url)
     with _conn() as conn:
@@ -648,8 +658,9 @@ def update_upstream(
         try:
             cur = conn.execute(
                 "UPDATE upstreams SET name=?, base_url=?, enabled=?, header_override=?,"
-                " egress=?, retry_rules=? WHERE id=?",
-                (name, base, int(enabled), header_override, egress, retry_rules, upstream_id),
+                " egress=?, retry_rules=?, hold_retry=? WHERE id=?",
+                (name, base, int(enabled), header_override, egress, retry_rules, hold_retry,
+                 upstream_id),
             )
         except sqlite3.IntegrityError as exc:
             raise DuplicateName(name) from exc

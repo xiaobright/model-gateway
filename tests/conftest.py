@@ -57,6 +57,7 @@ def pytest_terminal_summary(terminalreporter, config):
 def gateway(tmp_path, monkeypatch, request):
     from gateway import config, failover, inflight
     from gateway import canvas as canvas_mod
+    from gateway import truncation as truncation_mod
     from gateway import upstream as upstream_mod
     from gateway import stats as stats_mod
     from gateway.app import create_app
@@ -72,6 +73,9 @@ def gateway(tmp_path, monkeypatch, request):
     failover.reset()
     inflight.reset()
     stats_mod.reset()
+    # 200 截断守卫那张表同样是进程内的，而且键是「分组 id + 请求体指纹」——
+    # 临时库里分组 id 每个用例都从 1 开始，不清就会串到下一个用例
+    truncation_mod.reset()
     # 画布布局也按原始文本缓存，换库必须一起清，否则上一个用例的坐标会漏过来
     canvas_mod.forget_cache()
 

@@ -181,8 +181,31 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             )
         if body.get("stream"):
             mode = body.get("mode", "")
+            # mode="script"：按 stream_script() 排好的剧本逐步响应，用来演「同一个请求
+            # 先连着回几次空响应、然后恢复正常」这类时间序列。剧本用完就一律走普通流。
+            step = None
+            if mode == "script":
+                script = sick.get("script")
+                step = script.pop(0) if script else "good"
 
             async def gen():
+                # "empty"：200、只有生命周期事件，没有一个字的正文，也没有完成事件 ——
+                # 公益站排队排不进去时回的就是这种东西。每次字节完全相同（真站上那种
+                # 错误信封也是固定的一段）。
+                if step == "empty":
+                    for _ in range(4):
+                        yield b'data: {"type":"response.in_progress"}\n\n'
+                    return
+                # "delta" / "delta_cut"：正文增量（观察器按它统计「收到多少正文」）加
+                # 完成事件 / 加一处截断。200 截断拦截「一见到正文就放行」靠的就是它。
+                if step in ("delta", "delta_cut"):
+                    for i in range(3):
+                        yield (
+                            f'data: {json.dumps({"type": "response.output_text.delta", "delta": f"chunk{i}"})}\n\n'
+                        ).encode()
+                    if step == "delta":
+                        yield b"data: [DONE]\n\n"
+                    return
                 for i in range(6):
                     if not IN_PROCESS_UPSTREAMS:
                         await asyncio.sleep(0.04)
@@ -501,6 +524,20 @@ class MockUpstream:
         self.sick["status"] = None
         self.sick["missing"] = set()
         self.sick.pop("models", None)
+        self.sick.pop("script", None)
+
+    def stream_script(self, *steps: str) -> None:
+        """按剧本逐个响应流式请求（请求体里要带 ``mode="script"``）。每一步是：
+
+        - ``"empty"``：200，只有生命周期事件，没有正文也没有完成事件
+          —— 公益站排队排不进去时回的正是这种东西；
+        - ``"delta"``：正文增量 + 完成事件；
+        - ``"delta_cut"``：有正文，但没等来完成事件就断（真的回答到一半被截断）；
+        - ``"good"``：现在这种普通模拟流。
+
+        剧本放完了一律走 ``"good"``。用来演「同一个请求先连着空几次、然后恢复」。
+        """
+        self.sick["script"] = list(steps)
 
     def last_responses_request(self) -> dict:
         """这个站最近一次收到的 Responses 请求体（透传规范化测试用）。"""

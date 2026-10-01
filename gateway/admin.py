@@ -11,7 +11,9 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from . import capture, canvas, db, failover, inflight, protocols, proxy as proxy_mod, rewrite
+from . import (
+    capture, canvas, db, failover, inflight, protocols, proxy as proxy_mod, rewrite, truncation,
+)
 from . import model_batch
 from . import stats as stats_mod
 from . import upstream as upstream_mod
@@ -44,6 +46,8 @@ class UpstreamIn(BaseModel):
     egress: str | None = None
     # 同站重试：JSON 数组 [{"status":400,"times":2,"delay_ms":0}, ...]；空串 = 关
     retry_rules: str = ""
+    # 200 截断守卫：JSON 对象 {"after":2,"times":3,"delay_ms":0}；空串 = 关
+    hold_retry: str = ""
 
 
 class GroupIn(BaseModel):
@@ -254,6 +258,43 @@ def _validate_retry_rules(raw: str) -> str:
     return json.dumps(out, separators=(",", ":"))
 
 
+def _validate_hold_retry(raw: str) -> str:
+    """200 截断守卫：{"after":2,"times":3,"delay_ms":0}。空串 = 不配。
+
+    和同站重试不同，这里只认一个对象而不是一张表：触发条件不是状态码，而是
+    「状态码 200、但连着几次都没有正文也没有完成事件」这一种形状，见 truncation.py。
+    """
+    if not raw.strip():
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, f"截断拦截不是合法 JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(400, '截断拦截必须是对象，例如 {"after":2,"times":3}')
+    out: dict[str, int | bool] = {}
+    for key, default, low, high in (
+        ("after", truncation.DEFAULT_AFTER, 1, truncation.MAX_AFTER),
+        ("times", truncation.DEFAULT_TIMES, 1, truncation.MAX_TIMES),
+        ("delay_ms", 0, 0, truncation.MAX_DELAY_MS),
+    ):
+        if key not in parsed:
+            out[key] = default
+            continue
+        try:
+            value = int(parsed[key])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"{key} 必须是整数") from exc
+        if not (low <= value <= high):
+            raise HTTPException(400, f"{key} 只能在 {low}–{high}（收到 {value}）")
+        out[key] = value
+    if "same_body" in parsed:
+        if not isinstance(parsed["same_body"], bool):
+            raise HTTPException(400, "same_body 只能是 true / false")
+        out["same_body"] = parsed["same_body"]
+    return json.dumps(out, separators=(",", ":"))
+
+
 def _validate_egress(raw: str) -> str:
     """出口：'' 跟随系统 / 'direct' 直连 / 一个代理 URL。
 
@@ -365,6 +406,7 @@ def _serialize_upstream(
         "egress_kind": _egress_kind(u.egress),
         "egress_masked": _mask_userinfo(u.egress),
         "retry_rules": u.retry_rules,
+        "hold_retry": u.hold_retry,
         "supports": [p for p in protocols.NAMES if any(g.protocol == p for g in groups)],
         "groups": [_serialize_group(g, models_by_group.get(g.id, ())) for g in groups],
     }
@@ -453,6 +495,7 @@ def post_upstream(payload: UpstreamIn) -> dict[str, Any]:
             payload.enabled,
             _validate_egress(payload.egress or ""),
             _validate_retry_rules(payload.retry_rules),
+            _validate_hold_retry(payload.hold_retry),
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
@@ -475,6 +518,7 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
             _validate_override(payload.header_override),
             egress,
             _validate_retry_rules(payload.retry_rules),
+            _validate_hold_retry(payload.hold_retry),
         )
     except db.DuplicateName as exc:
         raise HTTPException(409, f"已有同名供应商「{name}」") from exc
@@ -1145,7 +1189,15 @@ def put_rewrite_rules(payload: RewriteRulesIn) -> dict[str, Any]:
 
 @router.get("/failover")
 def get_failover() -> dict[str, Any]:
-    return {"enabled": failover.all_enabled(), "breakers": failover.snapshot()}
+    """自动降级开关 + 两张内存状态表：分组冷却、200 截断守卫。
+
+    守卫那部分是给排查用的（页面上没有位置），形状见 truncation.snapshot()。
+    """
+    return {
+        "enabled": failover.all_enabled(),
+        "breakers": failover.snapshot(),
+        "truncation": truncation.snapshot(),
+    }
 
 
 @router.post("/failover")

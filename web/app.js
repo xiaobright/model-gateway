@@ -566,11 +566,13 @@ async function openUpstream(id) {
   $('up-base').value = u ? u.base_url : '';
   $('up-override').value = u ? (u.header_override || '') : '';
   $('up-retry').value = u ? (u.retry_rules || '') : '';
+  $('up-hold').value = u ? (u.hold_retry || '') : '';
   $('up-enabled').checked = u ? u.enabled : true;
   fillEgress(u ? (u.egress_kind || 'system') : 'system', egressRaw);
   baseHint();
   markOverride();
   markRetry();
+  markHold();
 
   const hint = $('up-groups-hint');
   hint.hidden = Boolean(u);
@@ -618,6 +620,31 @@ const RETRY_PRESETS = {
   capacity: '[{"status":503,"times":2,"delay_ms":300}]',
 };
 
+/* 200 截断拦截：形状是一个对象，不是一张状态码表（触发条件不是状态码）。
+   标签上直接把它翻成人话，省得每次都要去读那个 JSON。 */
+function markHold() {
+  const raw = $('up-hold').value.trim();
+  const tag = $('up-hold-tag');
+  let text = '';
+  if (raw) {
+    try {
+      const p = JSON.parse(raw);
+      if (typeof p !== 'object' || p === null || Array.isArray(p)) throw new Error('必须是一个对象');
+      text = `连错 ${p.after ?? 2} 次后拦截，重发 ${p.times ?? 3} 次`;
+      if (p.same_body) text += '（要求响应相同）';
+    } catch { text = '格式有问题'; }
+  }
+  tag.hidden = !raw;
+  tag.textContent = text;
+  tag.className = text === '格式有问题' ? 'tag tag-warn' : 'tag tag-accent';
+  $('up-hold-adv').open = Boolean(raw);
+}
+
+const HOLD_PRESETS = {
+  default: '{"after":2,"times":3,"delay_ms":0}',
+  strict: '{"after":2,"times":3,"delay_ms":0,"same_body":true}',
+};
+
 function upstreamPayload() {
   return {
     name: $('up-name').value.trim(),
@@ -626,6 +653,7 @@ function upstreamPayload() {
     header_override: $('up-override').value.trim(),
     egress: egressValue(),
     retry_rules: $('up-retry').value.trim(),
+    hold_retry: $('up-hold').value.trim(),
   };
 }
 
@@ -663,6 +691,16 @@ async function saveUpstream() {
       if (!Array.isArray(parsed)) throw new Error('必须是一个数组');
     } catch (e) {
       return toast('同站重试不是合法 JSON：' + e.message, 'err');
+    }
+  }
+  if (payload.hold_retry) {
+    try {
+      const parsed = JSON.parse(payload.hold_retry);
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('必须是一个对象');
+      }
+    } catch (e) {
+      return toast('200 截断拦截不是合法 JSON：' + e.message, 'err');
     }
   }
   if (editingAt === null) {
@@ -1620,6 +1658,11 @@ const ACTIONS = {
     markRetry();
   },
 
+  'preset-hold': ({ h }) => {
+    $('up-hold').value = HOLD_PRESETS[h] || '';
+    markHold();
+  },
+
   /* 拉取用的是**服务端存着的**那把 key。key 改了没保存就点拉取，拉的是旧 key，
      回来一个 401 让人一头雾水 —— 先把改动落库，再拉。 */
   'pull-models': async () => {
@@ -2042,6 +2085,7 @@ $('rt-iface').addEventListener('change', () => {
 $('up-base').addEventListener('input', baseHint);
 $('up-override').addEventListener('input', markOverride);
 $('up-retry').addEventListener('input', markRetry);
+$('up-hold').addEventListener('input', markHold);
 $('rewrite-rules').addEventListener('input', () => {
   rewriteDirty = true;
   const count = $('rewrite-count');

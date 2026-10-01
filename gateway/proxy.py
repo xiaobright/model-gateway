@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import time
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 import httpx
@@ -20,6 +22,7 @@ from . import (
     naming,
     protocols,
     rewrite,
+    truncation,
     upstream as upstream_mod,
 )
 from .reqlog import log
@@ -215,6 +218,104 @@ def _build_headers(
 # ---------------------------------------------------------------- 转发
 
 
+@dataclass
+class _Held:
+    """扣住的那一段响应，以及「能不能交给下游」的判定。"""
+
+    verdict: str                       # "good" = 交给下游 / "bad" = 在原站重发
+    chunks: list[bytes] = field(default_factory=list)
+    sent: int = 0
+    text_bytes: int = 0
+    digest: str = ""
+
+
+async def _hold_probe(
+    request: Request,
+    call: inflight.Call,
+    proto: protocols.Protocol,
+    resp: httpx.Response,
+    iterator: AsyncIterator[bytes],
+) -> _Held:
+    """把上游响应的开头扣住读一段，判断这到底是不是「200 但什么都没回」。
+
+    判定就一个字：**一见到正文（或完成事件）就放行**。正常流式第一个字一到就交给下游，
+    不额外增加等待；只有那种一个正文字节都没有的空响应会被读到上游 EOF —— 而那正是
+    公益站排队排不进去时回的东西（形状和成因见 truncation.py）。
+
+    上游自己明说失败（error / response.failed / response.incomplete）就更早收手：这种
+    响应后面剩多少字节都没有意义，直接回去重发。字节数还有一道上限兜底，别把一条长
+    回答整条憋在内存里（见 truncation.MAX_HOLD_BYTES）。
+
+    只有 200/2xx 的 SSE 才会走到这里，判定口径和 relay 记 `truncated` 的那一处一致。
+    """
+    seen_error = False
+
+    def on_event(kind: str, size: int) -> None:
+        nonlocal seen_error
+        if kind == "protocol_error":
+            seen_error = True
+
+    observer = protocols.SSEObserver(proto, on_event=on_event)
+    hasher = hashlib.sha1()
+    held = _Held(verdict="good")
+    decided = False
+    while True:
+        try:
+            chunk = await inflight.wait_for_upstream(call, anext(iterator))
+        except StopAsyncIteration:
+            break
+        except httpx.HTTPError as exc:
+            # 扣住期间上游把连接断了：还什么都没发给下游，所以这一次直接算坏的、
+            # 原站重发。重发次数用完时交出去，由 relay 按 upstream_abort 收尾
+            # （和没有守卫时一致 —— 不能让异常从 forward 里穿出去，那样连记录都没有）
+            log(f"  截断守卫：扣住期间上游断流（{exc.__class__.__name__}: {exc}）")
+            held.verdict = "bad"
+            decided = True
+            break
+        held.chunks.append(chunk)
+        held.sent += len(chunk)
+        hasher.update(chunk)
+        try:
+            observer.feed(chunk)
+        except Exception as exc:
+            log(f"  SSE observe failed（扣住期间）: {exc.__class__.__name__}: {exc}")
+        inflight.phase(call, inflight.STREAM)
+        inflight.progress(
+            call, held.sent, text_bytes=observer.text_bytes, thinking=observer.thinking
+        )
+        # 已经有正文/完成事件了：再扣下去只是白白拖慢正常请求
+        if observer.ended or observer.content_events:
+            decided = True
+            break
+        if seen_error:
+            held.verdict = "bad"
+            decided = True
+            break
+        if held.sent > truncation.MAX_HOLD_BYTES:
+            # 这么长的响应不可能是那种短错误信封：放出去继续实时转发
+            decided = True
+            break
+        if await request.is_disconnected():
+            raise ClientDisconnected
+    if not decided:
+        # 上游 EOF 才停下来的：没有完成事件、也没有一个正文字节，就是 200 截断
+        with contextlib.suppress(Exception):
+            observer.flush()
+        if not observer.ended and not observer.content_events:
+            held.verdict = "bad"
+    held.text_bytes = observer.text_bytes
+    held.digest = hasher.hexdigest()
+    return held
+
+
+async def _preplay(first: list[bytes], rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """先重放扣住期间已经读掉的那几块，再接着读上游。"""
+    for blob in first:
+        yield blob
+    async for blob in rest:
+        yield blob
+
+
 async def forward(
     request: Request,
     proto: protocols.Protocol,
@@ -404,10 +505,16 @@ async def forward(
 
     # 每个上游在本次请求里已经同站重试过几次（键是 upstream.id）
     same_counts: dict[int, int] = {}
+    # 截断守卫在本次请求里已经为每个上游扣住重发过几次（键是 upstream.id）
+    hold_counts: dict[int, int] = {}
     # True = 上一轮决定同站再发，本轮不把 attempt 加一（同站重试优先于换站降级）
     same_mode = False
     # 客户端在中途走了（重试间隙被检测到）。收尾要记 499/client_abort，不能冤枉成上游连不上
     client_left = False
+    # 截断守卫扣住又放行时留下的现场：已经读掉的字节和那条还没读完的迭代器。
+    # 交给 relay 重放，别让上游以为客户端消失了，也别把同一段字节读两遍。
+    won_prelude: list[bytes] = []
+    won_iter: AsyncIterator[bytes] | None = None
 
     # 这里是「自动降级」唯一安全的落点：状态码已经拿到手，但还没往下游发过任何字节，
     # 换个上游重试客户端完全无感。第一个字节一旦发出去就不能再换了。
@@ -418,7 +525,11 @@ async def forward(
             same_mode = False
         else:
             attempt += 1
-        if attempt > 1 or same_counts.get(route.upstream.id, 0) > 0:
+        if (
+            attempt > 1
+            or same_counts.get(route.upstream.id, 0) > 0
+            or hold_counts.get(route.upstream.id, 0) > 0
+        ):
             if await request.is_disconnected():
                 client_left = True
                 if attempt > 1:
@@ -443,6 +554,10 @@ async def forward(
             ).encode()
 
         capture.maybe_capture_headers(request, payload, len(body))
+        # 200 截断守卫的配置和「这一份请求」的指纹。没给这个站配守卫就不算指纹 ——
+        # 几百 KB 的请求体做摘要是有成本的，不该让所有站都付这笔钱（见 truncation.py）
+        hold_rules = truncation.parse_rules(route.upstream.hold_retry)
+        request_fp = truncation.fingerprint(sent_body) if hold_rules is not None else ""
         # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
@@ -537,10 +652,11 @@ async def forward(
 
         # 这次拿到响应头了，之前候选的连接异常不再算数
         fail = None
-        trace.headers(
-            resp.status_code,
-            resp.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "text/event-stream",
+        resp_is_sse = (
+            resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            == "text/event-stream"
         )
+        trace.headers(resp.status_code, resp_is_sse)
         inflight.phase(call, inflight.WAIT, status=resp.status_code)
         # 带了 stateful 字段的请求不降级，日志里标出来 —— 排查「为什么这条没换站」时靠它
         detail = f" store={payload.get('store')} prev_id={payload.get('previous_response_id')!r}" if stateful else ""
@@ -615,6 +731,74 @@ async def forward(
                 continue
         if not site_bad and not candidate_bad:
             failover.note_ok(route.group_id)
+            # 200 截断守卫：这一份请求已经连着几次拿回「没有正文的 200」时，先把这次
+            # 响应扣在网关里读完再决定 —— 还是那种空响应就原站原样重发，客户端连
+            # 「被截断」都看不到；是正常流式就立刻放行（见 truncation.py）。
+            if (
+                hold_rules is not None
+                and resp_is_sse
+                and resp.status_code < 300
+                and truncation.armed(route.group_id, request_fp, hold_rules)
+            ):
+                chunks_iter = resp.aiter_bytes()
+                try:
+                    probe = await _hold_probe(request, call, proto, resp, chunks_iter)
+                except ClientDisconnected:
+                    with contextlib.suppress(Exception):
+                        await resp.aclose()
+                    return abort_request("client_abort")
+                except inflight.ManualAbort:
+                    with contextlib.suppress(Exception):
+                        await resp.aclose()
+                    return abort_request("manual_abort")
+                if (
+                    probe.verdict == "bad"
+                    and hold_counts.get(route.upstream.id, 0) < int(hold_rules["times"])
+                ):
+                    delay = int(hold_rules["delay_ms"]) / 1000.0
+                    hold_counts[route.upstream.id] = hold_counts.get(route.upstream.id, 0) + 1
+                    truncation.note_held(route.group_id, request_fp)
+                    truncation.note_bad(route.group_id, request_fp, probe.digest, asked)
+                    log(
+                        f"  截断守卫：{route.upstream.name}/{route.group_name} 这份请求又回了一次"
+                        f"没有正文的 200（{probe.sent}B，连续 {truncation.fails(route.group_id, request_fp)} 次），"
+                        f"{delay:.2f}s 后原站重发（第 {hold_counts[route.upstream.id]} 次）"
+                    )
+                    trace.end_attempt(
+                        status=resp.status_code, note="hold_retry", action="same_retry",
+                        delay_s=delay,
+                    )
+                    elapsed = time.monotonic() - began
+                    with contextlib.suppress(Exception):
+                        await resp.aclose()
+                    inflight.failed(
+                        call, status=resp.status_code, note="hold_retry", ms=int(elapsed * 1000)
+                    )
+                    if record:
+                        _record(
+                            request=request, route=route, proto=proto, model=asked,
+                            remote_model=remote, status=resp.status_code,
+                            stream_flag=stream_flag, req_bytes=len(sent_body),
+                            resp_bytes=probe.sent, elapsed=elapsed, usage=NO_USAGE,
+                            note="hold_retry", attempt=attempt,
+                        )
+                    resp = None
+                    if not await same_retry_pause(delay):
+                        client_left = not call.cancel_requested
+                        break
+                    same_mode = True
+                    continue
+                if probe.verdict == "bad":
+                    log(
+                        f"  截断守卫：{route.upstream.name} 重发 {hold_counts.get(route.upstream.id, 0)} 次"
+                        f"仍是空响应，把最后一次原样交给下游（不再重发）"
+                    )
+                else:
+                    log(
+                        f"  截断守卫：扣住的 {probe.sent}B 判定为可用，交给下游继续转发"
+                        f"（正文 {probe.text_bytes}B）"
+                    )
+                won_prelude, won_iter = probe.chunks, chunks_iter
             break
         if site_bad:
             failover.note_fail(route.group_id, resp.status_code, label)
@@ -664,6 +848,8 @@ async def forward(
     won_attempt = attempt
     won_remote = remote
     won_bytes = len(sent_body)
+    won_rules = hold_rules
+    won_fp = request_fp
     upstream_resp = resp
 
     async def relay() -> AsyncIterator[bytes]:
@@ -703,9 +889,15 @@ async def forward(
         head = bytearray()
         tail = bytearray()
         note = "ok"
+        # 配了截断守卫的站才逐块算响应摘要：它是「上行下行完全一样」里「下行」那一半，
+        # 只用于诊断和 same_body 判定（见 truncation.py），不值得让所有站都付这个成本
+        digest = hashlib.sha1() if won_rules is not None else None
         # 第一块字节开始往下走才算「正在返回」：在这之前是「等上游出字」，两件事的
         # 处置完全不同（卡在等待是模型在想，卡在连接是站连不上）
-        chunks = upstream_resp.aiter_bytes()
+        chunks = won_iter if won_iter is not None else upstream_resp.aiter_bytes()
+        if won_prelude:
+            # 截断守卫扣住期间已经读掉的那几块：原样重放一遍，观察器和记账照走
+            chunks = _preplay(won_prelude, chunks)
         try:
             while True:
                 timeout: float | None = None
@@ -718,6 +910,8 @@ async def forward(
                 inflight.phase(call, inflight.STREAM)
                 trace.chunk(len(chunk))
                 sent += len(chunk)
+                if digest is not None:
+                    digest.update(chunk)
                 if len(head) < HEAD_KEEP:
                     head.extend(chunk[: HEAD_KEEP - len(head)])
                     # Anthropic 把输入 token 放在流开头的 message_start 里，也就是说这个数
@@ -863,6 +1057,28 @@ async def forward(
                     usage=usage, note=note, attempt=won_attempt,
                     text_bytes=text_bytes, thinking=thinking,
                 )
+            if won_rules is not None:
+                # 200 截断守卫的记账。判据和 relay 记 truncated 的那一处对齐：
+                #   坏 = 2xx + 没有完成事件 + 一个正文字节都没有（公益站那种空响应）
+                #   好 = 真出了正文，或者干净地收了尾
+                # 客户端自己断开、页面手动中断、上游报错都不算数：下一次该不该扣照旧。
+                # 注意「好」里那条 `text_bytes`：出了正文就说明这份请求已经不是
+                # 「站上什么都拿不到」了，扣住它没有任何好处，只有多等一个首字的代价。
+                if (
+                    upstream_resp.status_code < 300
+                    and note in ("truncated", "upstream_abort")
+                    and not text_bytes
+                ):
+                    count = truncation.note_bad(
+                        won.group_id, won_fp, digest.hexdigest() if digest is not None else "", asked
+                    )
+                    if count == int(won_rules["after"]):
+                        log(
+                            f"  WARN 截断守卫：{won.upstream.name}/{won.group_name} 的这份请求连着 "
+                            f"{count} 次 200 空响应（无完成事件、无正文），下次同一请求先扣住重发"
+                        )
+                elif text_bytes or (note == "ok" and upstream_resp.status_code < 300):
+                    truncation.note_ok(won.group_id, won_fp)
             with contextlib.suppress(Exception):
                 await upstream_resp.aclose()
 

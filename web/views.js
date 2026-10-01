@@ -849,6 +849,8 @@ const NOTE_LABEL = {
   stall_timeout: ['warn', '卡住超时'],
   // 这一次失败被自动降级接住了：客户端没看到它，但钱和时间是真花了，所以照样留痕
   failed_over: ['warn', '已降级'],
+  // 这一次是「200 但一个字都没有」：网关扣住没发给客户端，正在原站重发（见 truncation.py）
+  hold_retry: ['warn', '截断重发'],
 };
 
 function noteTag(note) {

@@ -230,17 +230,21 @@ def test_forward_protocol_scoped(gateway):
         assert gateway.post("/v1/messages", json=msg("multi")).json()["upstream"] == "siteT"
 
 
-def test_v7_upgrade_creates_forwards_table(gateway):
-    """v6 库升到 v7：只建表、不动数据。"""
+def test_old_db_upgrade_creates_forwards_table_and_hold_retry(gateway):
+    """老库升到当前版本：建回 model_forwards，并补上 200 截断守卫那一列。"""
     from gateway import config, db
 
     with sqlite3.connect(config.DB_PATH) as conn:
         conn.execute("DROP TABLE model_forwards")
-        conn.execute("PRAGMA user_version=6")
+        # v7 及以前的 upstreams 没有 hold_retry：CREATE TABLE IF NOT EXISTS 不会给
+        # 已存在的表加字段，只能靠迁移补
+        conn.execute("ALTER TABLE upstreams DROP COLUMN hold_retry")
+        conn.execute("PRAGMA user_version=7")
 
     db.init_db()
 
     with sqlite3.connect(config.DB_PATH) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "model_forwards" in tables
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert "hold_retry" in db._columns(config.DB_PATH, "upstreams")
