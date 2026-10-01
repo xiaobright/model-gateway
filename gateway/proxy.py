@@ -554,10 +554,8 @@ async def forward(
             ).encode()
 
         capture.maybe_capture_headers(request, payload, len(body))
-        # 200 截断守卫的配置和「这一份请求」的指纹。没给这个站配守卫就不算指纹 ——
-        # 几百 KB 的请求体做摘要是有成本的，不该让所有站都付这笔钱（见 truncation.py）
+        # 200 截断守卫的配置。没给这个站配守卫的话下面整条路都不走（见 truncation.py）
         hold_rules = truncation.parse_rules(route.upstream.hold_retry)
-        request_fp = truncation.fingerprint(sent_body) if hold_rules is not None else ""
         # base_url 存的是站根，/v1 由这里按接口补上（两种接口的路径都在 /v1 底下）
         url = upstream_endpoint(route.upstream.base_url, path)
         headers = _build_headers(request, route.upstream, proto, want_1m)
@@ -731,14 +729,14 @@ async def forward(
                 continue
         if not site_bad and not candidate_bad:
             failover.note_ok(route.group_id)
-            # 200 截断守卫：这一份请求已经连着几次拿回「没有正文的 200」时，先把这次
-            # 响应扣在网关里读完再决定 —— 还是那种空响应就原站原样重发，客户端连
+            # 200 截断守卫：这个站的这个模型已经连着几次拿回「没有正文的 200」时，先把
+            # 这次响应扣在网关里读完再决定 —— 还是那种空响应就原站原样重发，客户端连
             # 「被截断」都看不到；是正常流式就立刻放行（见 truncation.py）。
             if (
                 hold_rules is not None
                 and resp_is_sse
                 and resp.status_code < 300
-                and truncation.armed(route.group_id, request_fp, hold_rules)
+                and truncation.armed(route.group_id, asked, path, hold_rules)
             ):
                 chunks_iter = resp.aiter_bytes()
                 try:
@@ -757,11 +755,11 @@ async def forward(
                 ):
                     delay = int(hold_rules["delay_ms"]) / 1000.0
                     hold_counts[route.upstream.id] = hold_counts.get(route.upstream.id, 0) + 1
-                    truncation.note_held(route.group_id, request_fp)
-                    truncation.note_bad(route.group_id, request_fp, probe.digest, asked)
+                    truncation.note_held(route.group_id, asked, path)
+                    truncation.note_bad(route.group_id, asked, path, probe.digest)
                     log(
-                        f"  截断守卫：{route.upstream.name}/{route.group_name} 这份请求又回了一次"
-                        f"没有正文的 200（{probe.sent}B，连续 {truncation.fails(route.group_id, request_fp)} 次），"
+                        f"  截断守卫：{route.upstream.name}/{route.group_name} 的 {asked} 又回了一次"
+                        f"没有正文的 200（{probe.sent}B，连续 {truncation.fails(route.group_id, asked, path)} 次），"
                         f"{delay:.2f}s 后原站重发（第 {hold_counts[route.upstream.id]} 次）"
                     )
                     trace.end_attempt(
@@ -849,7 +847,6 @@ async def forward(
     won_remote = remote
     won_bytes = len(sent_body)
     won_rules = hold_rules
-    won_fp = request_fp
     upstream_resp = resp
 
     async def relay() -> AsyncIterator[bytes]:
@@ -1057,8 +1054,10 @@ async def forward(
                     usage=usage, note=note, attempt=won_attempt,
                     text_bytes=text_bytes, thinking=thinking,
                 )
-            if won_rules is not None:
-                # 200 截断守卫的记账。判据和 relay 记 truncated 的那一处对齐：
+            if won_rules is not None and observer is not None:
+                # 200 截断守卫的记账。只认**流式**响应（observer 就是「上游给的是 SSE」）：
+                # count_tokens、compaction 那些 JSON 响应既不该算坏，也不该把已经攒起来的
+                # 「连着坏」清掉。判据和 relay 记 truncated 的那一处对齐：
                 #   坏 = 2xx + 没有完成事件 + 一个正文字节都没有（公益站那种空响应）
                 #   好 = 真出了正文，或者干净地收了尾
                 # 客户端自己断开、页面手动中断、上游报错都不算数：下一次该不该扣照旧。
@@ -1070,15 +1069,16 @@ async def forward(
                     and not text_bytes
                 ):
                     count = truncation.note_bad(
-                        won.group_id, won_fp, digest.hexdigest() if digest is not None else "", asked
+                        won.group_id, asked, path,
+                        digest.hexdigest() if digest is not None else "",
                     )
                     if count == int(won_rules["after"]):
                         log(
-                            f"  WARN 截断守卫：{won.upstream.name}/{won.group_name} 的这份请求连着 "
-                            f"{count} 次 200 空响应（无完成事件、无正文），下次同一请求先扣住重发"
+                            f"  WARN 截断守卫：{won.upstream.name}/{won.group_name} 的 {asked} 连着 "
+                            f"{count} 次 200 空响应（无完成事件、无正文），下次先扣住重发"
                         )
                 elif text_bytes or (note == "ok" and upstream_resp.status_code < 300):
-                    truncation.note_ok(won.group_id, won_fp)
+                    truncation.note_ok(won.group_id, asked, path)
             with contextlib.suppress(Exception):
                 await upstream_resp.aclose()
 

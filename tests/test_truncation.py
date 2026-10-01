@@ -4,8 +4,12 @@
 （`rate limit exceeded: ... exceeded token rate limit`），没有一个字、也没有完成事件，
 客户端只看到「流被截断」，自己重试几次全是这个，于是整轮停下来要人手动继续。
 
-这里演的「空响应」是同一件事的最小形状：200 + 只有生命周期事件、没有正文、没有完成事件，
-而且每次字节完全相同。上游用 helpers 的 stream_script() 按顺序排。
+这里演的「空响应」是同一件事的最小形状：200 + 只有生命周期事件、没有正文、没有完成事件。
+上游用 helpers 的 stream_script() 按顺序排。
+
+**注意「连着坏」认的是站 + 模型 + 端点，不是同一份请求**：真跑起来客户端每次重试的
+请求体内容都不一样（长度倒是相同），按请求体摘要认「同一条」的话守卫永远不武装。
+`test_guard_arms_across_retries_though_the_body_changes` 盯着这件事。
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from helpers import (
 
 from gateway import truncation
 
-# 请求体里带 mode="script" 才会走剧本；mode 一起进请求指纹，所以同一个用例里要固定
+# 请求体里带 mode="script" 才会走剧本
 BODY = {"model": "gpt-6-astra", "stream": True, "mode": "script", "input": "hi"}
 
 
@@ -125,27 +129,87 @@ def test_hold_retry_gives_up_after_times(gateway):
         ]
 
 
-def test_different_request_body_is_not_held(gateway):
-    """「同一份请求」是前提：请求体不一样就是另一把，不跟着一起被扣。"""
+def test_guard_arms_across_retries_though_the_body_changes(gateway):
+    """客户端重试时请求体并不逐字节相同 —— 拦截不能要求「同一份请求」。
+
+    2026-10-01 实测：codex 在 anyrouter 上连着 6 次重试，请求体字节数完全相同
+    （1005868B）、内容却每次都不一样；按整份请求体的摘要认「同一条」的话，8 次空响应
+    会留下 8 个指纹、每个只计 1 次，守卫永远不武装（真发生了一次）。
+    """
     with MockUpstream("siteA") as a:
         g = add_upstream(gateway, a, "siteA", "openai")
         _set_hold(gateway, provider_id(gateway, "siteA"), '{"after":2,"times":3}')
         add_route(gateway, "gpt-6-astra", g)
-        a.stream_script(*(["empty"] * 8))
+        a.stream_script("empty", "empty", "empty", "good")
+
+        # 三次请求的请求体各不相同，长度也不一样
+        bodies = [{**BODY, "input": f"第 {i} 次，内容各不相同"} for i in range(4)]
+
+        for body in bodies[:2]:
+            assert "[DONE]" not in gateway.post("/v1/responses", json=body).text
+        rows = wait_rows(gateway, 2)
+        assert [r["note"] for r in rows] == ["truncated", "truncated"]
+        armed = _armed(gateway)
+        assert len(armed) == 1 and armed[0]["fails"] == 2, "两次空响应就该武装，与请求体无关"
+
+        # 第三份请求体又不一样，照样被扣住、重发，并被救回来
+        third = gateway.post("/v1/responses", json=bodies[2])
+        assert third.status_code == 200 and "[DONE]" in third.text
+
+        rows = wait_rows(gateway, 4)
+        assert [r["note"] for r in rows] == [
+            "truncated", "truncated", "hold_retry", "ok",
+        ]
+
+
+def test_guard_is_per_site_model_and_endpoint(gateway):
+    """键是「站 + 模型 + 端点」：换个模型、换个端点、换个站都各算各的。"""
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA", "openai")
+        _set_hold(gateway, provider_id(gateway, "siteA"), '{"after":2,"times":3}')
+        add_route(gateway, "gpt-6-astra", g)
+        add_route(gateway, "gpt-6-other", g)
+        a.stream_script(*(["empty"] * 12))
 
         for _ in range(2):
             gateway.post("/v1/responses", json=BODY)
         wait_rows(gateway, 2)
-        assert len(_armed(gateway)) == 1, "BODY 已经被武装"
 
-        other = {**BODY, "input": "完全不同的一份请求"}
-        resp = gateway.post("/v1/responses", json=other)
-        assert resp.status_code == 200
-        assert "[DONE]" not in resp.text
+        armed = {(r["model"], r["endpoint"]) for r in _armed(gateway)}
+        assert armed == {("gpt-6-astra", "/responses")}, armed
 
+        # 另一个模型不共享这份计数
+        other = {**BODY, "model": "gpt-6-other"}
+        assert "[DONE]" not in gateway.post("/v1/responses", json=other).text
         rows = wait_rows(gateway, 3)
-        assert [r["note"] for r in rows] == ["truncated"] * 3, "新指纹只记了 1 次，不该被扣"
-        assert len(_armed(gateway)) == 2
+        assert [r["note"] for r in rows] == ["truncated"] * 3, "换模型就是另一条记录，不该被扣"
+
+        armed = {(r["model"], r["endpoint"]): r["fails"] for r in _armed(gateway)}
+        assert armed == {("gpt-6-astra", "/responses"): 2, ("gpt-6-other", "/responses"): 1}
+
+
+def test_a_successful_search_does_not_disarm_the_main_turn(gateway):
+    """同一个模型的另一种端点成功，不能把主对话攒下的拦截悄悄解除。
+
+    Codex 会在主对话之间穿插 standalone search；两者打的是同一个站和模型，
+    但「搜索能通」不等于「主对话能拿到东西」。
+    """
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA", "openai")
+        _set_hold(gateway, provider_id(gateway, "siteA"), '{"after":2,"times":3}')
+        add_route(gateway, "gpt-6-astra", g)
+        a.stream_script("empty", "empty", "good")
+
+        for _ in range(2):
+            gateway.post("/v1/responses", json=BODY)
+        wait_rows(gateway, 2)
+        assert _armed(gateway)[0]["endpoint"] == "/responses"
+
+        # 搜索成功：走的是另一个端点，主对话那份记录必须还在
+        gateway.post("/v1/alpha/search", json=BODY)
+        wait_rows(gateway, 3)
+        armed = _armed(gateway)
+        assert len(armed) == 1 and armed[0]["endpoint"] == "/responses", armed
 
 
 def test_armed_guard_delivers_good_stream(gateway):
@@ -249,58 +313,62 @@ def test_parse_rules_never_raises_on_dirty_config():
 
 
 def test_guard_arms_after_consecutive_empty_responses():
-    """连着几次坏才武装；成功一次或换一份请求都另算。"""
+    """连着几次坏才武装；成功一次或换一个维度都另算。"""
     truncation.reset()
     rules = truncation.parse_rules('{"after":2}')
     try:
-        assert not truncation.armed(7, "fp", rules)
-        assert truncation.note_bad(7, "fp", "aaa") == 1
-        assert not truncation.armed(7, "fp", rules), "一次不武装（可能只是抖动）"
-        assert truncation.note_bad(7, "fp", "aaa") == 2
-        assert truncation.armed(7, "fp", rules)
+        assert not truncation.armed(7, "m", "/responses", rules)
+        assert truncation.note_bad(7, "m", "/responses", "aaa") == 1
+        assert not truncation.armed(7, "m", "/responses", rules), "一次不武装（可能只是抖动）"
+        assert truncation.note_bad(7, "m", "/responses", "aaa") == 2
+        assert truncation.armed(7, "m", "/responses", rules)
 
-        # 别的分组、别的请求体互不影响
-        assert not truncation.armed(8, "fp", rules)
-        assert not truncation.armed(7, "other", rules)
+        # 三个维度各算各的：换站、换模型、换端点都不共享
+        assert not truncation.armed(8, "m", "/responses", rules)
+        assert not truncation.armed(7, "other", "/responses", rules)
+        assert not truncation.armed(7, "m", "/alpha/search", rules)
 
         # 成功一次就忘掉，重新从 0 数
-        truncation.note_ok(7, "fp")
-        assert not truncation.armed(7, "fp", rules)
-        assert truncation.note_bad(7, "fp", "aaa") == 1
+        truncation.note_ok(7, "m", "/responses")
+        assert not truncation.armed(7, "m", "/responses", rules)
+        assert truncation.note_bad(7, "m", "/responses", "aaa") == 1
     finally:
         truncation.reset()
 
 
 def test_same_body_rule_needs_byte_identical_responses():
-    """same_body=true 时，连着几次的响应字节必须一样才武装（严格版，默认关）。"""
+    """same_body=true 时，连着几次的响应字节必须一样才武装（严格版，默认关）。
+
+    这两个公益站**永远**不满足它：错误信封长度固定、内容每次都变。这里只验证规则本身。
+    """
     truncation.reset()
     strict = truncation.parse_rules('{"after":2,"same_body":true}')
     loose = truncation.parse_rules('{"after":2}')
     try:
-        truncation.note_bad(1, "fp", "aaa")
-        truncation.note_bad(1, "fp", "bbb")
-        assert truncation.fails(1, "fp") == 2, "默认口径照样算「连着坏」"
-        assert truncation.armed(1, "fp", loose), "默认口径只看「连着几次都是空响应」"
-        assert not truncation.armed(1, "fp", strict), "响应字节不同，严格口径不武装"
+        truncation.note_bad(1, "m", "/responses", "aaa")
+        truncation.note_bad(1, "m", "/responses", "bbb")
+        assert truncation.fails(1, "m", "/responses") == 2, "默认口径照样算「连着坏」"
+        assert truncation.armed(1, "m", "/responses", loose), "默认口径只看「连着几次都是空响应」"
+        assert not truncation.armed(1, "m", "/responses", strict), "响应字节不同，严格口径不武装"
 
         # 三段完全一样时严格口径也武装
-        truncation.note_ok(1, "fp")
-        truncation.note_bad(1, "fp", "ccc")
-        truncation.note_bad(1, "fp", "ccc")
-        assert truncation.armed(1, "fp", strict)
+        truncation.note_ok(1, "m", "/responses")
+        truncation.note_bad(1, "m", "/responses", "ccc")
+        truncation.note_bad(1, "m", "/responses", "ccc")
+        assert truncation.armed(1, "m", "/responses", strict)
     finally:
         truncation.reset()
 
 
 def test_guard_table_is_bounded():
-    """记住的请求体有上限，长期跑不会无限涨。"""
+    """记住的条目有上限，长期跑不会无限涨。"""
     truncation.reset()
     try:
         for i in range(truncation.MAX_ENTRIES + 20):
-            truncation.note_bad(1, f"fp{i:04d}", "same")
+            truncation.note_bad(1, f"model{i:04d}", "/responses", "same")
         rows = truncation.snapshot()
         assert len(rows) == truncation.MAX_ENTRIES
-        assert {r["fingerprint"] for r in rows}.isdisjoint({"fp0000", "fp0001"}), "最旧的先淘汰"
+        assert {r["model"] for r in rows}.isdisjoint({"model0000", "model0001"}), "最旧的先淘汰"
     finally:
         truncation.reset()
 
