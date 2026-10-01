@@ -99,34 +99,36 @@ def test_token_ratio_is_learned_from_the_log(gateway):
     """`≈ N tok` 的标尺是从转发记录里量出来的，不是拍的常数。"""
     from gateway import db, stats as stats_mod
 
-    def logged(protocol: str, req: int, text: int, it: int, ot: int, ct: int,
+    def logged(protocol: str, req: int, texts: list[int], it: int, ot: int, ct: int,
                thinking: bool = False) -> None:
-        db.insert_request(
-            client="Claude Code", model="m", upstream="siteA", status=200, stream=True,
-            req_bytes=req, resp_bytes=text * 20, resp_text_bytes=text, thinking=thinking,
-            duration_ms=100, input_tokens=it, output_tokens=ot, cached_tokens=ct,
-            note="ok", protocol=protocol,
-        )
+        # 本例验证读库后的统计口径；样本一次提交，不重复验证逐请求写入路径。
+        with db._conn() as conn:
+            conn.executemany(
+                "INSERT INTO request_log(client, model, upstream, status, stream,"
+                " req_bytes, resp_bytes, resp_text_bytes, thinking, duration_ms,"
+                " input_tokens, output_tokens, cached_tokens, note, protocol)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [("Claude Code", "m", "siteA", 200, 1, req, text * 20, text,
+                  int(thinking), 100, it, ot, ct, "ok", protocol) for text in texts],
+            )
 
     # 25 条整整齐齐的：上行 10 字节一个 token（上下文 = 800 + 200 缓存），
     # 下行 4 字节一个（只数内容字节，不数整条响应 —— 上面故意让 resp_bytes 是它的 20 倍）
-    for _ in range(25):
-        logged("anthropic", req=10_000, text=2_000, it=800, ot=500, ct=200)
+    logged("anthropic", req=10_000, texts=[2_000] * 25, it=800, ot=500, ct=200)
     stats_mod.reset()
     assert stats_mod.token_ratio()["anthropic"] == {"up": 10.0, "down": 4.0}
 
     # 有思维链的记录不能进下行的标尺：发下来的是总结、计费按完整的算，
     # 这种记录里「收到多少字节」和「被计多少 token」不是一回事
-    for _ in range(200):
-        logged("openai", req=5_000, text=200, it=1000, ot=5_000, ct=0, thinking=True)
+    logged("openai", req=5_000, texts=[200] * 200, it=1000, ot=5_000, ct=0, thinking=True)
     stats_mod.reset()
     ratio = stats_mod.token_ratio()["openai"]
     assert ratio["up"] == 5.0, "上行照旧量得出来"
     assert ratio["down"] == stats_mod.RATIO_FALLBACK["openai"][1], "全是带思维链的 -> 退回兜底"
 
     # 忽大忽小时干脆不给估值：那说明字节数里有个跟 token 数无关的大常数项
-    for i in range(25):
-        logged("anthropic", req=10_000, text=100 if i % 2 else 4_000, it=800, ot=100, ct=200)
+    logged("anthropic", req=10_000, texts=[100 if i % 2 else 4_000 for i in range(25)],
+           it=800, ot=100, ct=200)
     stats_mod.reset()
     assert stats_mod.token_ratio()["anthropic"]["down"] == 0.0, "张幅太大 = 估不出来"
 

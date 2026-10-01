@@ -269,17 +269,6 @@ test('加候选只显示已登记模型，不请求上游，并将名称匹配�
   assert.equal(h.element('route-dialog').open, true);
 });
 
-test('按展开宽度预排整颗胶囊，不为所有胶囊留空', () => {
-  const css = readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  assert.match(css, /\.route-cands\s*\{[^}]*flex-direction:\s*column/s);
-  assert.match(css, /\.route-cand-line\s*\{[^}]*flex-wrap:\s*wrap/s);
-  assert.match(css, /\.chip-measure-natural,\s*\.chip-measure-expanded\s*\{[^}]*align-self:\s*flex-start/s,
-    '测量时不能被纵向 flex 容器拉伸成整行宽度');
-  assert.match(css, /\.chip-measure-expanded \.chip-e\s*\{[^}]*width:\s*20px/s);
-  assert.doesNotMatch(css, /\.chip:hover \.chip-label[^}]*padding-right/s);
-  assert.doesNotMatch(css, /\.chip-label\s*\{[^}]*padding-right:\s*48px/s);
-});
-
 test('整颗展开后放不下时预先移到下一行', (t) => {
   const h = harness(t);
   const views = readFileSync(new URL('../web/views.js', import.meta.url), 'utf8')

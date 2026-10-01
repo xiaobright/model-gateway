@@ -1,6 +1,5 @@
-"""gateway fixture：每个用例一个临时库、一个独立端口，跑完把进程内的状态清干净。
+"""每例独立临时库；默认进程内运行，network 用例才启动本机端口。
 
-和 helpers.py 一起，是原来那个 2000 行的 test_e2e.py 里所有「不是断言」的部分。
 helpers 能被直接 import，靠的是 pytest 会把测试文件所在目录放进 sys.path。
 """
 
@@ -11,6 +10,47 @@ import pytest
 from starlette.testclient import TestClient
 
 import helpers
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("gateway", "网关测试范围")
+    group.addoption("--full", action="store_true", help="运行全部测试，包括本机网络组")
+    group.addoption("--network", action="store_true", help="只运行本机网络组")
+
+
+def _test_scope(config):
+    # 保留原文档的 -m network 入口；其他 -m / -k 在选定范围内继续筛选。
+    network = config.getoption("network") or config.getoption("markexpr").strip() == "network"
+    if config.getoption("full"):
+        if network:
+            raise pytest.UsageError("--full 与 --network / -m network 不能同时使用")
+        return "full"
+    return "network" if network else "fast"
+
+
+def pytest_configure(config):
+    _test_scope(config)  # 冲突在收集前报错，不能静默少跑。
+
+
+def pytest_collection_modifyitems(config, items):
+    scope = _test_scope(config)
+    if scope == "full":
+        return
+    selected, deselected = [], []
+    for item in items:
+        is_network = item.get_closest_marker("network") is not None
+        (selected if is_network == (scope == "network") else deselected).append(item)
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
+
+
+def pytest_terminal_summary(terminalreporter, config):
+    scope = _test_scope(config)
+    labels = {"fast": "非网络组（默认）", "network": "本机网络组", "full": "全部组"}
+    terminalreporter.write_line(
+        f"测试范围：{labels[scope]}；文件 / -k / -m 仍生效。"
+        "网络组用 --network，完整检查用 --full。"
+    )
 
 
 @pytest.fixture()
@@ -25,6 +65,8 @@ def gateway(tmp_path, monkeypatch, request):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(config, "DATA_DIR", data_dir)
     monkeypatch.setattr(config, "DB_PATH", data_dir / "gateway.db")
+    # 通用用例不启动无关的后台写盘线程；test_learning 独立开启真实采集器。
+    monkeypatch.setenv("MODEL_GATEWAY_LEARNING", "0")
     # 断路器和「进行中」登记表都是进程内的内存状态，测试跑在同一个进程里 —— 不清会串到下一个用例。
     # 按字节估 token 的那把标尺也一样：它是从库里量的，而每个用例一个临时库
     failover.reset()

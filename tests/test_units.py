@@ -253,6 +253,11 @@ def test_system_proxy_change_rebuilds_the_cached_client(monkeypatch):
 
     current = {}
     monkeypatch.setattr(urllib.request, "getproxies", lambda: dict(current))
+    # 验的是 client 缓存失效，不发网络请求，也不必创建 TLS 连接池。
+    monkeypatch.setattr(upstream, "client_args", lambda egress: {
+        "transport": httpx.MockTransport(lambda request: httpx.Response(200)),
+        "trust_env": False,
+    })
 
     async def run():
         await upstream.aclose_client()
@@ -298,7 +303,7 @@ def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
         assert "certificate" in str(ei.value).lower()
 
 
-def test_client_args_verifies_upstream_tls_against_the_system_trust_store():
+def test_client_args_verifies_upstream_tls_against_the_system_trust_store(monkeypatch):
     """上游 TLS 用系统证书库验：卡巴斯基这类杀软 MITM 的根也能过（2026-09-11 实锤）。
 
     httpx 自带的 CA 捆绑包不认杀软装进系统库的根证书，curl/浏览器能通、网关 502。
@@ -306,6 +311,8 @@ def test_client_args_verifies_upstream_tls_against_the_system_trust_store():
     """
     from gateway import upstream as upstream_mod
 
+    # 保留真正的系统 SSLContext 构造；不为无关的回环 mounts 重载证书。
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda: object())
     try:
         import truststore  # noqa: F401
         installed = True

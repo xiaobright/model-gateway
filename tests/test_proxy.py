@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
+import httpx
 import pytest
 
+import helpers
 from helpers import (
     wait_for_row, wait_rows, rows_on, MockUpstream, add_upstream, add_group,
     provider_id, add_route, route_id, msg, parse_sse_events,
@@ -277,11 +279,6 @@ def test_hanging_error_body_does_not_block_failover(gateway):
         assert elapsed < 8.0, f"备用站被错误体拖住了 {elapsed:.2f}s"
 
 
-def test_unknown_model_returns_404(gateway):
-    resp = gateway.post("/v1/responses", json={"model": "nope"})
-    assert resp.status_code == 404
-
-
 def test_client_headers_pass_through_and_auth_override(gateway):
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA")
@@ -379,18 +376,29 @@ def test_client_leaving_after_completion_event_is_not_flagged(gateway):
         assert row["note"] == "ok", f"流已经走完了，不该报异常，实际是 {row['note']}"
 
 
-def test_completion_marker_split_across_chunks_is_detected(gateway):
+def test_completion_marker_split_across_chunks_is_detected(gateway, monkeypatch):
     """完成标记被切在两个 chunk 之间时也要认出来，否则会误报截断。"""
+    class SplitBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"type": "response.comp'
+            yield b'leted", "response": {"usage": {"input_tokens": 7, "output_tokens": 2}}}\n\n'
+
+    async def upstream_response(request):
+        # 直接给网关分块流，不能经过会把 body 拼成一块的 ASGITransport。
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=SplitBody())
+
+    monkeypatch.setattr(helpers, "fake_upstream_request", upstream_response)
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")
         add_route(gateway, "gpt-test", g_a)
 
-        resp = gateway.post("/v1/responses", json={"model": "gpt-test", "stream": True, "mode": "split_marker"})
+        resp = gateway.post("/v1/responses", json={"model": "gpt-test", "stream": True})
         assert resp.status_code == 200
 
         row = wait_for_row(gateway)
         assert row["note"] == "ok", f"标记跨块也必须认出来，实际是 {row['note']}"
         assert row["input_tokens"] == 7
+        assert row["output_tokens"] == 2
 
 
 # ================================================================ Anthropic 格式

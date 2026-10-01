@@ -455,35 +455,55 @@ Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:8317/admin/api/capture-stre
 ## 测试怎么跑
 
 以下命令在项目根目录的 PowerShell 执行，使用已有 `.venv`。没有环境先按[首页](../README.md#开始使用)安装。
-不为整理文档运行整套测试，也不把历史报告的数量写成当前结果。
+先按改动选文件或用例，通过后停止；有新改动、失败或跨模块风险才扩大范围。
+不为整理文档运行整套测试，不因“保险起见”补跑全量，也不把历史报告的数量写成当前结果。
 
-### 日常快速检查
+### 日常按改动检查
 
-不启动真实监听端口、不访问公网：
+例如只改画布坐标，跑对应文件；默认排除需要真实监听端口的 `network` 用例：
 
 ```powershell
 $env:PYTHONUTF8 = '1'
 $env:PYTHONDONTWRITEBYTECODE = '1'
-& '.\.venv\Scripts\python.exe' -m pytest tests -q -p no:cacheprovider -m 'not network' --durations=10
+uv run .venv\Scripts\python.exe -m pytest tests/test_canvas.py -q -p no:cacheprovider --durations=5
 ```
+
+| 改动范围 | 首选检查 |
+| --- | --- |
+| 画布坐标、模型批量添加 | `tests/test_canvas.py` 或 `tests/test_model_batch.py`；界面同时改动时加 Node 测试。 |
+| 路由、模型转发 | `tests/test_routing.py`、`tests/test_forwards.py`，以及改动涉及的 `test_proxy` 用例。 |
+| 重试、冷却 | `tests/test_same_retry.py`、`tests/test_failover.py`；取消等待还需相关 `test_lifecycle` 用例。 |
+| 请求转发、协议事件解析 | `tests/test_proxy.py`、`tests/test_lifecycle.py` 和 `test_units.py` 中对应函数；连接语义另跑下面的网络检查。 |
+| 统计、实时状态 | `tests/test_stats.py` 或 `tests/test_inflight.py`；取消真实流需 `--network`。 |
+| 调度观测、采集器 | `tests/test_learning.py`；改了转发挂接点时加对应转发/生命周期检查。 |
+| 管理接口、数据库迁移 | `tests/test_admin.py` 中对应用例；跨模块数据库结构变动最后做完整检查。 |
+| 出口、TLS、客户端缓存 | `tests/test_egress.py` 和 `test_units.py` 中对应用例；真实代理/TLS 路径加 `--network`。 |
+
+pytest 的文件路径、`::test_name` 和 `-k` 可进一步缩小范围。需要整个非网络组时才省略文件路径；默认组也不是每次小改动的必跑清单。
 
 ### 涉及真实连接的检查
 
 流中切换、客户端断开、代理和 TLS 等，需要本机真实连接及模拟服务：
 
 ```powershell
-& '.\.venv\Scripts\python.exe' -m pytest tests -q -p no:cacheprovider -m network --durations=10
+uv run .venv\Scripts\python.exe -m pytest tests/test_proxy.py tests/test_inflight.py --network -q -p no:cacheprovider --durations=10
 ```
 
 `network` 在这里指本机网络测试，不是去请求真实供应商。
+上例针对流生命周期；出口改动可换成 `tests/test_egress.py tests/test_units.py`。省略文件路径会执行整个网络组。
 
-### 一批代码改完后的完整检查
+### 有明确理由时做完整检查
+
+共享 fixture、测试选择入口、跨模块数据库/转发重构，或用户要求完整验收时，最后执行一次：
 
 ```powershell
-& '.\.venv\Scripts\python.exe' -m pytest tests -q -p no:cacheprovider --durations=15
+uv run .venv\Scripts\python.exe -m pytest --full -q -p no:cacheprovider --durations=15
 ```
 
-快速组和网络组应互不重复，合起来覆盖完整测试。不是每次修改都必须把三条命令各跑一遍。
+默认组和网络组互不重复，合起来覆盖完整测试。已验证完两组就不再追加第三遍全量。
+`--full` 和 `--network` 不能同时使用；原来的 `-m network` 仍兼容。其他 `-m` 条件在所选组内继续筛选，
+`--full` 也不会清除文件路径或 `-k` / `-m`，做完整验收时不要携带这些过滤条件。
+终端会显示所选范围和 deselected 数量；默认运行通过只能报告非网络组通过。
 
 ### 前端检查
 
@@ -513,6 +533,9 @@ git diff --check
 | `web_protocols.test.mjs`、`web_app.test.mjs` | 协议选项、刷新队列、弹窗会话、模型列表重开与统计展示。 |
 
 测试使用临时数据库和模拟上游，不拿真实 `data/` 做演练。为了提速不能删必要断言、隐藏失败用例，或修改正式运行的超时/重试参数。
+通用 `gateway` fixture 关闭采集线程；`test_learning` 自己开启真实采集器验证写盘与转发挂接。
+普通模拟流不做无意义的逐块延时；真实网络流保留原有时序。挂起的模拟上游只在用例断言结束后释放，并检查服务线程确实退出。
+统计样本批量写入，参数检查不额外创建 TLS transport；真实代理和证书仍由网络组覆盖。
 语法检查不等于浏览器验证，模拟转发通过也不等于真实站点具备某项能力；报告时分开写。
 
 ### 编排画布的浏览器检查

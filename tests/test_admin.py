@@ -133,16 +133,10 @@ def test_admin_api_rejects_cross_site_and_foreign_host(gateway):
     )
     assert same_origin.status_code == 200
 
-
-def test_admin_api_rejects_origin_null(gateway):
-    """sandboxed iframe / file:// 页面会带 Origin: null —— 同样按跨站处理。"""
+    # 同一 fixture 检查拒绝路径，详细 Host / Origin 组合另有纯函数覆盖。
     blocked = gateway.get("/admin/api/upstreams", headers={"Origin": "null"})
     assert blocked.status_code == 403
 
-
-def test_admin_api_rejects_another_local_port(gateway):
-    """同 host 异端口是 same-site，Sec-Fetch-Site 不会拦 —— 必须比 Origin 的端口。
-    本机另一个服务（或被入侵的本地应用）提供的页面不能替用户关网关。"""
     base = gateway.base_url
     other = f"{base.scheme}://{base.host}:{(base.port or 80) + 1}"
     blocked = gateway.post(
@@ -150,6 +144,10 @@ def test_admin_api_rejects_another_local_port(gateway):
     )
     assert blocked.status_code == 403
     assert "Origin" in blocked.json()["detail"]
+
+    blocked = gateway.get("/admin/api/upstreams", headers={"Host": ""})
+    assert blocked.status_code == 403
+    assert "Host" in blocked.json()["detail"]
 
 
 def test_proxy_endpoints_reject_cross_site_browsers(gateway):
@@ -173,13 +171,6 @@ def test_proxy_endpoints_reject_cross_site_browsers(gateway):
     # 非浏览器客户端（没有 Origin / Sec-Fetch-*）照常
     plain = gateway.post("/v1/responses", json={"model": "nope"})
     assert plain.status_code == 404
-
-
-def test_missing_host_is_rejected(gateway):
-    """浏览器永远带 Host；没有 Host 的 HTTP/1.1 请求不接受。"""
-    blocked = gateway.get("/admin/api/upstreams", headers={"Host": ""})
-    assert blocked.status_code == 403
-    assert "Host" in blocked.json()["detail"]
 
 
 def test_group_key_is_masked_in_lists_and_revealed_on_demand(gateway):

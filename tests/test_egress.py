@@ -68,7 +68,7 @@ def test_egress_sends_that_site_through_the_proxy(gateway):
         assert len([u for u in px.seen if "/v1/models" in u]) == 1
 
 
-def test_direct_really_turns_the_system_proxy_off():
+def test_direct_really_turns_the_system_proxy_off(monkeypatch):
     """「直连」必须连 trust_env 一起关掉。
 
     httpx 不只看 HTTP_PROXY 这类环境变量，在 Windows 上还会读注册表里的系统代理
@@ -77,6 +77,8 @@ def test_direct_really_turns_the_system_proxy_off():
     """
     from gateway import upstream as upstream_mod
 
+    # 本例检查构造参数；真实代理/TLS 已由 network 用例验证。
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda: object())
     follow = upstream_mod.client_args("")
     direct = upstream_mod.client_args("direct")
     via = upstream_mod.client_args("http://127.0.0.1:7890")

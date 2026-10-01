@@ -1,10 +1,7 @@
-"""端到端测试的脚手架：mock 上游、网关进程的起停、以及各用例共用的那些断言帮手。
+"""模拟上游、服务器起停和公共断言。
 
-真起两个 mock 上游、真起一个网关线程，客户端一律 trust_env=False —— 否则系统代理会把
-回环请求也接走，`connect_failed` 之类的断言会拿到代理返回的 502。
-
-以前这些和一个 2000 行的测试文件堆在一起。拆开之后每个测试文件里只剩断言，找
-「自动降级那条链是怎么验的」不用再翻半个文件。
+普通用例在进程内请求；network 用例才开真实回环端口、模拟流的时间间隔。
+本机测试客户端使用 trust_env=False，避免系统代理接走回环请求。
 """
 
 from __future__ import annotations
@@ -91,7 +88,14 @@ def wait_server_started(server: uvicorn.Server, thread: threading.Thread, timeou
 
 
 def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
-    app = FastAPI()
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        app.state.loop = asyncio.get_running_loop()
+        yield
+
+    app = FastAPI(lifespan=lifespan)
+    # 断言完成后由 MockUpstream 释放挂起的响应，不靠 sleep / join 超时清理。
+    app.state.release = asyncio.Event()
     # sick["status"] 一被设上，两个转发端点就一律回那个状态码 —— 用来演「这个站坏了」。
     # 放在字典里是为了能在运行中翻转（测冷却期满之后自己恢复）
     sick = sick if sick is not None else {"status": None, "missing": set()}
@@ -115,7 +119,7 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                 # expose headers before this wait naturally; the empty
                 # message preserves that distinction in the in-process path.
                 yield b""
-                await asyncio.Event().wait()
+                await app.state.release.wait()
 
             return StreamingResponse(never(), status_code=code, media_type="application/json")
         return JSONResponse({"error": {"message": f"{name} is sick", "code": code}}, status_code=code)
@@ -180,19 +184,15 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
 
             async def gen():
                 for i in range(6):
-                    await asyncio.sleep(0.04)
+                    if not IN_PROCESS_UPSTREAMS:
+                        await asyncio.sleep(0.04)
                     yield f'data: {json.dumps({"upstream": name, "i": i})}\n\n'.encode()
                     if mode == "stalled":
-                        await asyncio.Event().wait()
-                if mode == "split_marker":
-                    # 把完成事件的标记切在两块之间，模拟真实的 TCP 分片
-                    yield b'data: {"type": "response.comp'
-                    yield b'leted", "response": {"usage": {"input_tokens": 7, "output_tokens": 2}}}\n\n'
-                else:
-                    yield b"data: [DONE]\n\n"
+                        await app.state.release.wait()
+                yield b"data: [DONE]\n\n"
                 if mode == "lingering":
                     # 发完完成事件却不收连接，等客户端自己走（有的站就是这样）
-                    await asyncio.sleep(20)
+                    await app.state.release.wait()
 
             return StreamingResponse(gen(), media_type="text/event-stream")
         if body.get("mode") == "json_stall":
@@ -200,7 +200,7 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             # 非 SSE 响应同样生效（真实 socket 才模拟得出来，进程内会被整包缓冲掩盖）
             async def trickle():
                 yield f'{{"upstream": "{name}", "partial": true'.encode()
-                await asyncio.Event().wait()
+                await app.state.release.wait()
 
             return StreamingResponse(trickle(), media_type="application/json")
         if body.get("fail"):
@@ -259,7 +259,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
 
             async def gen():
                 for _ in range(4):
-                    await asyncio.sleep(0.02)
+                    if not IN_PROCESS_UPSTREAMS:
+                        await asyncio.sleep(0.02)
                     chunk = {"choices": [{"index": 0, "delta": {"content": "chunk"}}]}
                     yield f"data: {json.dumps(chunk)}\n\n".encode()
                 if mode == "thinking":
@@ -334,14 +335,14 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                     # 首字很慢：先只给 message_start，模型算一阵才吐第一个字（公益站常见）
                     await asyncio.sleep(float(body.get("first_token_delay") or 0.5))
                 for _ in range(deltas):
-                    await asyncio.sleep(pause)
+                    await asyncio.sleep(pause if not IN_PROCESS_UPSTREAMS else 0)
                     yield sse("content_block_delta", {
                         "type": "content_block_delta", "index": 0,
                         "delta": {"type": "text_delta", "text": DELTA_TEXT},
                     })
                 if mode == "stalled":
                     # 开了流就不再出字节，也不发结束事件：测「发呆超时自动打断」
-                    await asyncio.Event().wait()
+                    await app.state.release.wait()
                 if mode == "thinking":
                     # 思维链：发来的是总结过的，但计费按完整的算
                     yield sse("content_block_delta", {
@@ -518,7 +519,11 @@ class MockUpstream:
             _FAKE_UPSTREAMS.pop(self.port, None)
             return
         self._server.should_exit = True
+        loop = self.app.state.loop
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(self.app.state.release.set)
         self._thread.join(timeout=5)
+        assert not self._thread.is_alive(), f"mock upstream {self.name} did not stop"
 
 
 DEFAULT_GROUP = "默认"
