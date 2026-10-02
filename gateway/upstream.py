@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import ssl
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -18,12 +20,11 @@ from . import config, protocols
 PROXY_TIMEOUT = httpx.Timeout(connect=8.0, read=600.0, write=60.0, pool=600.0)
 PROXY_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 
-# httpx 在 Windows 上会读注册表里的系统代理（Clash 之类），而注册表的 bypass 列表通常是空的，
-# 于是连本机上游都会绕一趟代理。回环地址一律直连。
+# 系统出口中的本机地址一律直连；显式指定代理不受此规则影响。
 LOOPBACK = ("127.0.0.1", "localhost", "[::1]")
 
 # 「出口」的两个特殊值，其余一律当代理 URL（http:// 或 socks5://）
-EGRESS_SYSTEM = ""        # 跟随系统代理：httpx 自己去读环境变量和注册表
+EGRESS_SYSTEM = ""        # Windows 跟随系统开关；其他平台沿用 urllib 的代理来源
 EGRESS_DIRECT = "direct"  # 直连：把系统代理也关掉
 
 MODELS_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
@@ -142,22 +143,63 @@ def system_ssl_context() -> ssl.SSLContext | None:
         return None
 
 
-def loopback_mounts() -> dict[str, httpx.AsyncHTTPTransport]:
-    # 每个 client 要有自己的 transport（transport 自带连接池，会随 client 一起关闭）
-    return {f"all://{host}": httpx.AsyncHTTPTransport() for host in LOOPBACK}
+ProxySnapshot = tuple[tuple[str, str], ...]
 
 
-def client_args(egress: str) -> dict:
+def _system_proxy_signature() -> ProxySnapshot:
+    """一次读取的配置同时用于缓存键与 transport，禁止 httpx 再读取环境。"""
+    proxies = (
+        urllib.request.getproxies_registry()
+        if sys.platform == "win32" else urllib.request.getproxies()
+    )
+    return tuple(sorted(
+        (str(key).lower(), str(value)) for key, value in proxies.items()
+        if str(key).lower() in {"http", "https", "all", "no"}
+    ))
+
+
+def _proxy_patterns(snapshot: ProxySnapshot) -> dict[str, str | None]:
+    """将固定快照转换为 httpx 的公开 mounts 配置，保留 NO_PROXY 语义。"""
+    proxies = dict(snapshot)
+    mounts: dict[str, str | None] = {}
+    for scheme in ("http", "https", "all"):
+        if value := proxies.get(scheme):
+            mounts[f"{scheme}://"] = value if "://" in value else f"http://{value}"
+    for host in proxies.get("no", "").split(","):
+        host = host.strip()
+        if not host:
+            continue
+        if host == "*":
+            return {}
+        if "://" in host:
+            mounts[host] = None
+            continue
+        try:
+            address = ipaddress.ip_address(host.split("/")[0])
+        except ValueError:
+            pattern = host if host.lower() == "localhost" or host.startswith("*") else f"*{host}"
+        else:
+            pattern = f"[{host}]" if address.version == 6 else host
+        mounts[f"all://{pattern}"] = None
+    return mounts
+
+
+def loopback_mounts() -> dict[str, None]:
+    # None 选择 client 自带的直连 transport，复用其证书和连接池参数。
+    return {f"all://{host}": None for host in LOOPBACK}
+
+
+def client_args(egress: str, *, system_proxy: ProxySnapshot | None = None) -> dict:
     """按「出口」拼出建 client 要的那几个参数。
 
     这是整件事唯一的开关：网关自己就是发请求的那个客户端，socket 是它自己开的，
     所以按站换出口不需要任何代理内核 —— 内核的存在意义是替「不知道有代理」的进程
     做拦截。
 
-    注意 `trust_env=False` 才是真的「直连」：httpx 不只看环境变量，在 Windows 上
-    还会读注册表里的系统代理。
+    所有出口均禁用 httpx 隐式读取代理。跟随系统时显式应用固定快照：Windows
+    只跟随注册表开关，不受启动时继承的 HTTP(S)_PROXY 等环境变量覆盖。
 
-    回环 mounts 只在没指定代理时挂：它是用来抵消**隐式**的系统代理的（否则连本机
+    回环 mounts 只在没指定代理时挂：它是用来抵消系统代理的（否则连本机
     上游都要绕一趟 Clash）。明确给某个站指了代理，就按说的走 —— 真实场景里没人会给
     127.0.0.1 的站配代理，而测试要的正是「字节真的从那扇门出去了」。
 
@@ -166,10 +208,12 @@ def client_args(egress: str) -> dict:
     时走的是同一段代码，别在两处各写一份规则。
     """
     egress = (egress or "").strip()
+    if egress == EGRESS_SYSTEM and system_proxy is None:
+        system_proxy = _system_proxy_signature()
     proxy = None if egress in (EGRESS_SYSTEM, EGRESS_DIRECT) else egress
     args: dict = {
         "mounts": {} if proxy else loopback_mounts(),
-        "trust_env": egress == EGRESS_SYSTEM,
+        "trust_env": False,
         "proxy": proxy,
     }
     # 用 Windows 系统证书库验证上游 TLS。httpx 默认用自带的 CA 捆绑包，认不得
@@ -180,6 +224,16 @@ def client_args(egress: str) -> dict:
     ctx = system_ssl_context()
     if ctx is not None:
         args["verify"] = ctx
+    if egress == EGRESS_SYSTEM:
+        patterns = _proxy_patterns(system_proxy or ())
+        patterns.update(loopback_mounts())
+        args["mounts"] = {
+            pattern: httpx.AsyncHTTPTransport(
+                proxy=url, verify=ctx if ctx is not None else True,
+                trust_env=False, limits=PROXY_LIMITS,
+            ) if url else None
+            for pattern, url in patterns.items()
+        }
     if proxy:
         base, frag = split_ca(proxy)
         if frag:
@@ -191,21 +245,69 @@ def client_args(egress: str) -> dict:
 
 _clients: dict[object, httpx.AsyncClient] = {}
 _client_loop: asyncio.AbstractEventLoop | None = None
+_retired_clients: set[_SystemClient] = set()
 
 
-def _system_proxy_signature() -> tuple[tuple[str, str], ...]:
-    """快照 httpx 会读取的系统代理配置，避免开关切换后继续复用旧 client。"""
-    return tuple(sorted(
-        (str(key).lower(), str(value))
-        for key, value in urllib.request.getproxies().items()
-    ))
+class _SystemStream(httpx.AsyncByteStream):
+    def __init__(self, stream: httpx.AsyncByteStream, client: _SystemClient) -> None:
+        self.stream = stream
+        self.client = client
+        self.closed = False
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            await self.stream.aclose()
+        finally:
+            await self.client.release()
+
+
+class _SystemClient(httpx.AsyncClient):
+    """退役只禁止新请求；发送中和已返回响应头的流都计入占用。"""
+
+    retired = False
+    active = 0
+
+    async def send(self, request: httpx.Request, **kwargs) -> httpx.Response:
+        if self.retired:
+            # get_client 返回后、send 真正执行前，另一个请求可能已切换出口。
+            current = await get_client()
+            return await current.send(request, **kwargs)
+        self.active += 1
+        try:
+            response = await super().send(request, **kwargs)
+        except BaseException:
+            await self.release()
+            raise
+        if response.is_closed:
+            await self.release()
+        else:
+            response.stream = _SystemStream(response.stream, self)
+        return response
+
+    async def release(self) -> None:
+        self.active -= 1
+        await self.close_if_idle()
+
+    async def close_if_idle(self) -> None:
+        if self.retired and self.active == 0:
+            try:
+                await self.aclose()
+            finally:
+                _retired_clients.discard(self)
 
 
 async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
     """按「出口」复用 client，省掉每个请求一次 TLS 握手（对远端公益站是几百 ms 的差别）。
 
     同一个出口和同一份系统代理配置复用一个 client。代理是建 client 时定的，没法按请求
-    换；系统代理开关变化后用新的配置签名建新 client。出口最多也就三五种，池子小得可以忽略。
+    换；系统代理开关变化后用同一份快照建新 client，旧 client 待在途响应关闭后回收。
     """
     global _client_loop
     loop = asyncio.get_running_loop()
@@ -216,16 +318,28 @@ async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
         # client 一起清掉（那段连接池就没人关了）
         _client_loop = loop
         await aclose_client()
-    cache_key: object = (
-        (EGRESS_SYSTEM, _system_proxy_signature())
-        if egress == EGRESS_SYSTEM else egress
-    )
+    egress = (egress or "").strip()
+    snapshot = _system_proxy_signature() if egress == EGRESS_SYSTEM else None
+    cache_key: object = (EGRESS_SYSTEM, snapshot) if snapshot is not None else egress
     client = _clients.get(cache_key)
     if client is None or client.is_closed:
-        client = httpx.AsyncClient(
-            timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS, **client_args(egress)
+        client_type = _SystemClient if snapshot is not None else httpx.AsyncClient
+        client = client_type(
+            timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS,
+            **client_args(egress, system_proxy=snapshot)
         )
         _clients[cache_key] = client
+    if snapshot is not None:
+        retired = []
+        for key, old in list(_clients.items()):
+            if key != cache_key and isinstance(old, _SystemClient):
+                del _clients[key]
+                old.retired = True
+                _retired_clients.add(old)
+                retired.append(old)
+        for old in retired:
+            with contextlib.suppress(Exception):
+                await old.close_if_idle()
     return client
 
 
@@ -233,10 +347,12 @@ async def aclose_client() -> None:
     # 先摘快照再关：并发 get_client 在等待期间新建的 client 不能被后到的清理扫掉。
     # 不在这里改 _client_loop —— 谁切换 loop 谁负责记，清理只负责关连接。
     snapshot = list(_clients.items())
+    retired = list(_retired_clients)
+    _retired_clients.clear()
     for key, client in snapshot:
         if _clients.get(key) is client:
             del _clients[key]
-    for _, client in snapshot:
+    for client in [c for _, c in snapshot] + retired:
         if not client.is_closed:
             with contextlib.suppress(Exception):
                 await client.aclose()

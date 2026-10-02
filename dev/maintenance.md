@@ -398,10 +398,10 @@ Anthropic 的输入用量常在流开头，输出用量在结尾。转发统计�
 
 ## 代理和证书
 
-出口属于供应商配置，普通转发和拉取模型列表都使用它。
-连接按出口复用；“跟随系统代理”还会检查系统代理配置变化，避免新请求一直复用旧设置。
+出口属于供应商配置，普通转发、拉取模型列表和出口探测共用同一套解析规则。
+连接按出口复用；“跟随系统代理”在每次上游发送前读取配置，用同一份快照选择并创建连接池，避免缓存键与实际代理不一致。配置变化后，新请求使用新出口；已有响应继续使用原连接，关闭响应后回收旧池，不会因网关切换配置被截断。
 
-- 跟随系统：读取环境变量和 Windows 系统代理。
+- 跟随系统：Windows 读取当前用户注册表中的系统代理开关和地址，关闭后新请求直连，不受 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 等环境变量覆盖。其他平台沿用 `urllib` 的系统/环境代理来源及 `NO_PROXY` 绕过规则。此模式不执行 PAC 脚本。
 - 直连：关闭程序读取系统代理的行为（`trust_env=False`）。
 - 指定代理：支持 HTTP、HTTPS、SOCKS5；SOCKS5 需要额外安装 `socksio` 到项目环境。
 - VPS 预设：由设置项 `egress_vps` 提供；修改预设不会自动改掉供应商已保存的代理地址，需要重新选择。
@@ -555,7 +555,7 @@ uv run .venv\Scripts\python.exe -m pytest tests/test_canvas.py -q -p no:cachepro
 | 统计、实时状态 | `tests/test_stats.py` 或 `tests/test_inflight.py`；取消真实流需 `--network`。 |
 | 调度观测、采集器 | `tests/test_learning.py`；改了转发挂接点时加对应转发/生命周期检查。 |
 | 管理接口、数据库迁移 | `tests/test_admin.py` 中对应用例；跨模块数据库结构变动最后做完整检查。 |
-| 出口、TLS、客户端缓存 | `tests/test_egress.py` 和 `test_units.py` 中对应用例；真实代理/TLS 路径加 `--network`。 |
+| 出口、TLS、客户端缓存 | `tests/test_egress.py`、`tests/test_system_proxy.py` 和 `test_units.py` 中对应用例；真实代理/TLS 路径加 `--network`。 |
 
 pytest 的文件路径、`::test_name` 和 `-k` 可进一步缩小范围。需要整个非网络组时才省略文件路径；默认组也不是每次小改动的必跑清单。
 

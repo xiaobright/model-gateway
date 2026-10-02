@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import urllib.request
 
 import httpx
 import pytest
@@ -252,9 +251,9 @@ def test_system_proxy_change_rebuilds_the_cached_client(monkeypatch):
     from gateway import upstream
 
     current = {}
-    monkeypatch.setattr(urllib.request, "getproxies", lambda: dict(current))
+    monkeypatch.setattr(upstream, "_system_proxy_signature", lambda: tuple(sorted(current.items())))
     # 验的是 client 缓存失效，不发网络请求，也不必创建 TLS 连接池。
-    monkeypatch.setattr(upstream, "client_args", lambda egress: {
+    monkeypatch.setattr(upstream, "client_args", lambda egress, **kwargs: {
         "transport": httpx.MockTransport(lambda request: httpx.Response(200)),
         "trust_env": False,
     })

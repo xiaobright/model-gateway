@@ -78,15 +78,16 @@ def test_direct_really_turns_the_system_proxy_off(monkeypatch):
     from gateway import upstream as upstream_mod
 
     # 本例检查构造参数；真实代理/TLS 已由 network 用例验证。
-    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda: object())
+    monkeypatch.setattr(upstream_mod, "_system_proxy_signature", lambda: ())
     follow = upstream_mod.client_args("")
     direct = upstream_mod.client_args("direct")
     via = upstream_mod.client_args("http://127.0.0.1:7890")
 
-    assert follow["trust_env"] is True and follow["proxy"] is None
+    # 系统代理由网关的固定快照显式配置，httpx 也不能再自行读取一次。
+    assert follow["trust_env"] is False and follow["proxy"] is None
     assert direct["trust_env"] is False and direct["proxy"] is None
     assert via["trust_env"] is False and via["proxy"] == "http://127.0.0.1:7890"
-    # 回环 mounts 是用来抵消**隐式**的系统代理的，所以只在没指定代理时挂
+    # 回环 mounts 用来绕过系统出口的代理，所以只在没指定代理时挂。
     assert follow["mounts"] and direct["mounts"] and not via["mounts"]
 
 
