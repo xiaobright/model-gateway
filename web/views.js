@@ -1,19 +1,18 @@
-/* 四个视图的渲染。约定：
-   - 结构性骨架只建一次，之后只更新数值，这样 count-up / FLIP 才有"上一个值"
-     可以过渡，不会每次轮询都从 0 重新滚一遍
-   - 所有列表更新都走增量：无变化就不碰 DOM，避免动画乱闪 */
+/* 统计、上游、设置及请求视图；路由工作台由 route-view.js 派生。
+   尽量复用节点，无变化不重建；数值变化时才执行短动画。 */
 
 import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft, protocolOn,
   catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTOCOLS,
 } from './util.js';
-import { countUp, createOdometer, initSpotlightAndTilt, enterStagger, slideIn, pulse, reduceMotion, flow } from './motion.js';
+import { enterStagger, slideIn, pulse, reduceMotion, updateNumber } from './motion.js';
+import { renderRouteWorkspace, selectRouteWorkspace } from './route-view.js';
+import { requestResult } from './request-result.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
 
-/* 只建一次的图表与滚轮实例 */
+/* 只建一次的图表实例 */
 let ring = null;
 let chart = null;
-const odometers = {};
 
 const EMPTY = '<div class="empty">暂无数据</div>';
 const modelKey = (name, protocol) => JSON.stringify([name, protocol]);
@@ -37,7 +36,7 @@ function kpiSkeleton() {
       <div class="kpi-spark" data-spark="req"></div>
     </div>
     <div class="kpi">
-      <div class="kpi-label">P95 延迟</div>
+      <div class="kpi-label">P95 请求耗时</div>
       <div class="kpi-value"><span data-num="p95">0</span></div>
       <div class="kpi-note" data-note="p95"></div>
       <div class="kpi-spark" data-spark="p95"></div>
@@ -52,12 +51,6 @@ function kpiSkeleton() {
     </div>`;
   ring = donut(0);
   $('kpis').querySelector('[data-ring]').append(ring.node);
-
-  odometers.live = createOdometer($('kpis').querySelector('[data-num="live"]'));
-  odometers.req = createOdometer($('kpis').querySelector('[data-num="req"]'));
-  odometers.p95 = createOdometer($('kpis').querySelector('[data-num="p95"]'));
-  odometers.hit = createOdometer($('kpis').querySelector('[data-num="hit"]'));
-  initSpotlightAndTilt($('kpis'));
 }
 
 export function renderKpis() {
@@ -71,12 +64,8 @@ export function renderKpis() {
 
   const setNum = (key, value, format) => {
     const str = format ? format(value) : String(value);
-    if (odometers[key]) {
-      odometers[key].set(str);
-    } else {
-      const el = $('kpis').querySelector(`[data-num="${key}"]`);
-      if (el) countUp(el, value, { format });
-    }
+    const el = $('kpis').querySelector(`[data-num="${key}"]`);
+    updateNumber(el, str);
   };
   const setNote = (key, html) => {
     const el = $('kpis').querySelector(`[data-note="${key}"]`);
@@ -232,12 +221,6 @@ export function renderHot() {
 
 /* ================================================================ 模型路由 */
 
-/* 候选挂在**分组**上。供应商只有一个分组时圆片只写供应商名，多个才写「供应商 · 分组」，
-   否则满屏都是「· 默认」。 */
-function multiGroupIds() {
-  return new Set(state.upstreams.filter((u) => (u.groups || []).length > 1).map((u) => u.id));
-}
-
 function cloneButtons(group) {
   if (!group || !group.has_key) return '';
   const targets = PROTOCOLS.filter((p) => p !== group.protocol);
@@ -248,56 +231,15 @@ function cloneButtons(group) {
   ).join(' ');
 }
 
-/* 一个分组下可以挂同一个模型的好几条候选（各指一个不同的上游真名），这时候光写
-   「供应商 · 分组」两个圆片长得一模一样，所以 showRemote 会强制把真名显示出来。 */
-function chipHtml(model, c, showGroup, showRemote, activeRouteId, proto) {
-  const live = c.upstream_enabled && c.group_enabled;
-  const cool = c.cooling_ms > 0;
-  const active = c.route_id === activeRouteId;
-  const cls = ['chip', active ? 'chip-on' : '', live ? '' : 'chip-off',
-    cool ? 'chip-cool' : ''].filter(Boolean).join(' ');
-  const label = showGroup ? `${c.upstream_name} · ${c.group_name}` : c.upstream_name;
-  const { bare, onem } = splitOneM(c.remote_model);
-  const named = bare && (showRemote || bare !== model);
-  const remote = named ? ` <span class="remote">${esc(bare)}</span>` : '';
-  const wide = onem ? ' <span class="tag tag-accent">1M</span>' : '';
-  const off = live ? ''
-    : ` <span class="tag">${c.upstream_enabled ? '分组停用' : '停用'}</span>`;
-  // 冷却 = 它连着失败过，自动降级这段时间内会跳过它（手动点它照样能切过去）。
-  // 断路器按分组记，所以同分组的几条候选会一起显示冷却
-  const cd = cool
-    ? ` <span class="tag tag-warn" title="连续失败 ${c.fails} 次，冷却期内自动降级会跳过它">`
-      + `冷却 ${fmtLeft(c.cooling_ms)}</span>` : '';
-  const full = named ? `${label} · ${bare}` : label;
-  const tip = active ? '当前实际使用的候选' : (c.is_active ? '保存的首选候选' : `切到 ${full}`);
-  // data-proto：同名模型可以在两种接口下各挂一条链，事件处理要靠它分清是哪一行
-  const protoAttr = ` data-proto="${esc(c.protocol || proto || '')}"`;
-  return `<span class="${cls}" data-rid="${c.route_id}">
-    <button type="button" class="chip-label" data-act="switch" data-model="${esc(model)}"${protoAttr}
-            data-rid="${c.route_id}" title="${esc(tip)}">${esc(label)}${remote}${wide}${cd}${off}</button>
-    <span class="chip-tools">
-      <button type="button" class="chip-e" data-act="edit-candidate" data-model="${esc(model)}"${protoAttr}
-              data-rid="${c.route_id}" title="改上游真名 / 1M / 尝试顺序">✎</button>
-      <button type="button" class="chip-x" data-act="del-candidate" data-model="${esc(model)}"${protoAttr}
-              data-rid="${c.route_id}" title="移除这一条候选">✕</button>
-    </span>
-  </span>`;
-}
-
-
-/* 自动降级开关。按接口分开，所以在模型路由卡上跟着当前的接口筛选走：筛了哪个就只显示
-   那个的开关，「全部」时两个都显示 —— 一个开关代表两种接口会让人以为 GPT 侧也在自动换站。
-   实时页那份永远两个都给：那页没有接口筛选。
-   不复用 .checkline：它那条 input[type=checkbox]{width:auto} 选择器权重更高，
-   会把开关压成 0 宽、只剩个滑块糊在文字上。 */
+/* 协议级策略只放在设置页；不随模型筛选改变作用范围。 */
 function failoverSwitches(list) {
   const on = (state.failover && state.failover.enabled) || {};
   const switches = list.map((p) => `<label class="fo-item" title="打不通就按候选顺序换下一个">
       <input type="checkbox" class="switch" ${on[p] ? 'checked' : ''}
              data-act="toggle-failover" data-fo="${p}">
-      <span>${list.length > 1 ? esc(PROTO_LABEL[p] || p) + ' ' : '自动'}降级</span>
+      <span>${esc(PROTO_LABEL[p] || p)} 自动换站</span>
     </label>`).join('');
-  // 发呆超时是全局设置，两个摆放位置（模型路由卡头 / 实时页）都跟着普通开关走
+  // 无内容超时是全局设置，与协议级自动换站分开说明。
   const stall = state.stallTimeout ?? 20;
   return switches + `<label class="fo-item" title="开始出内容后，超过这段时间没有新的正文/推理/工具参数就打断这条请求，让客户端重发；等响应头和等第一个字不计时，也不触发自动降级。0 = 关闭">
       <input type="number" class="stall-input" min="0" max="3600" step="1" value="${stall}"
@@ -306,142 +248,15 @@ function failoverSwitches(list) {
     </label>`;
 }
 
-function failoverBox() {
+export function renderPolicies() {
   const box = $('failover-box');
-  if (box) box.innerHTML = failoverSwitches(state.iface ? [state.iface] : PROTOCOLS.filter(protocolOn));
+  if (!box || box.contains?.(document.activeElement)) return;
+  const html = failoverSwitches(PROTOCOLS.filter(protocolOn));
+  if (box.dataset.rendered !== html) { box.innerHTML = html; box.dataset.rendered = html; }
 }
 
-const EMPTY_BY_IFACE = {
-  anthropic: 'Anthropic 接口下还没有模型。先在「上游站点」给某个站加一个 Anthropic 分组'
-    + '（填 Claude Code 那把 key），再点右上角「新增模型」配置下游路由。',
-  openai: 'Responses 接口下还没有模型。先配置上游分组，再点右上角「新增模型」；只登记上游目录不会对外暴露。',
-  'openai-chat': 'Chat Completions 接口下还没有模型。去「上游站点」展开某个分组，'
-    + '登记模型后，再点右上角「新增模型」配置下游路由。',
-};
-
-export function renderRoutes() {
-  failoverBox();
-  const kw = state.filter.trim().toLowerCase();
-  const iface = state.iface;
-  const byIface = iface ? state.routes.filter((r) => r.protocol === iface) : state.routes;
-  const list = kw ? byIface.filter((r) => r.model_name.toLowerCase().includes(kw)) : byIface;
-  const total = state.routes.length;
-  $('route-count').textContent = (kw || iface)
-    ? `${list.length} / ${total} 条模型路由`
-    : `${total} 条模型路由`;
-
-  if (!total) {
-    $('route-list').innerHTML =
-      '<div class="empty">还没有模型。先在「上游站点」加一个供应商，给它建一个分组（选接口 + 填 key），'
-      + '再点右上角「新增模型」配置下游路由。只登记上游目录不会出现在这里。</div>';
-    $('route-list').dataset.routesHtml = $('route-list').innerHTML;
-    return;
-  }
-  if (!list.length) {
-    $('route-list').innerHTML = `<div class="empty">${
-      kw ? '没有匹配的模型名' : (EMPTY_BY_IFACE[iface] || '这个接口下还没有模型')
-    }</div>`;
-    $('route-list').dataset.routesHtml = $('route-list').innerHTML;
-    return;
-  }
-
-  // 请求次数来自概览统计，用来回答"这个模型到底有没有在用"
-  const hot = new Map(((state.overview && state.overview.models) || [])
-    .map((m) => [modelKey(m.model, m.protocol), m]));
-  const multi = multiGroupIds();
-
-  const host = $('route-list');
-  const html = list.map((g) => {
-    const dead = g.active_route_id === null
-      ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>无可用上游</span>'
-      : g.preferred_route_id !== null && g.preferred_route_id !== g.active_route_id
-        ? ' <span class="tag tag-warn"><span class="dot dot-warn"></span>正在使用备用候选</span>' : '';
-    // 「全部」视图里两种接口混在一起，得标出来谁是谁
-    const ifaceTag = !iface && g.protocol
-      ? ` <span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
-        + ` title="在 ${esc(PROTO_PATH[g.protocol] || '')} 下暴露">${esc(PROTO_LABEL[g.protocol] || '')}</span>` : '';
-    const stat = hot.get(modelKey(g.model_name, g.protocol));
-    const usage = stat
-      ? `<span class="route-usage" title="所选时间窗内本接口的请求数（最多保留 2000 条记录）· P95 ${fmtSec(stat.p95)}">${fmtInt(stat.n)} 次</span>`
-      : '';
-    // 同一个分组下挂了这个模型的好几条候选时，圆片必须把真名写出来才分得清
-    const sibs = new Map();
-    for (const c of g.candidates) sibs.set(c.group_id, (sibs.get(c.group_id) || 0) + 1);
-    const chips = g.candidates.map((c) =>
-      chipHtml(
-        g.model_name, c, multi.has(c.upstream_id), sibs.get(c.group_id) > 1, g.active_route_id,
-        g.protocol,
-      )).join('');
-
-    return `<div class="route" data-model="${esc(g.model_name)}" data-proto="${esc(g.protocol)}">
-      <div class="route-name">${esc(g.model_name)}${ifaceTag}${dead}</div>
-      <div class="route-cands">${chips}</div>
-      <div class="route-side">${usage}</div>
-      <div class="route-actions">
-        <button class="btn btn-ghost btn-sm" data-act="add-candidate" data-model="${esc(g.model_name)}" data-proto="${esc(g.protocol)}">+ 候选</button>
-        <button class="btn btn-danger btn-sm" data-act="del-model" data-model="${esc(g.model_name)}" data-proto="${esc(g.protocol)}">删除</button>
-      </div>
-    </div>`;
-  }).join('');
-  const changed = host.dataset.routesHtml !== html;
-  if (changed) {
-    // 内容没变就不碰 DOM：滚动位置（scroll-y 容器）不该每 15 秒被打回顶部
-    const keep = host.scrollTop;
-    host.innerHTML = html;
-    host.dataset.routesHtml = html;
-    host.scrollTop = keep;
-  }
-  layoutRouteChips(host, changed);
-}
-
-export function planCandidateRows(items, width, gap = 7) {
-  const rows = [[]];
-  let used = 0;
-  for (const [index, item] of items.entries()) {
-    if (rows.at(-1).length && used + item.expanded > width) {
-      rows.push([]);
-      used = 0;
-    }
-    rows.at(-1).push(index);
-    used += item.natural + gap;
-  }
-  return rows;
-}
-
-/* 按悬停展开后的宽度预排整颗候选胶囊。放不下就预先放到下一行，避免悬停时
-   胶囊自身跳行、鼠标移出后又弹回。测量在未悬停状态进行；视图显示和窗口变化时重排。 */
-export function layoutRouteChips(host = $('route-list'), force = false) {
-  if (!host?.querySelectorAll) return;
-  for (const container of host.querySelectorAll('.route-cands')) {
-    const width = container.clientWidth;
-    if (!width) continue; // 隐藏视图等显示后再排
-    if (!force && container.dataset.chipLayoutWidth === String(width)) continue;
-
-    const chips = [...container.querySelectorAll('.chip')];
-    if (!chips.length) continue;
-    const gap = Number.parseFloat(getComputedStyle(container).columnGap) || 7;
-    const sizes = chips.map((chip) => {
-      chip.classList.add('chip-measure-natural');
-      const naturalWidth = chip.getBoundingClientRect().width;
-      chip.classList.remove('chip-measure-natural');
-      chip.classList.add('chip-measure-expanded');
-      const expandedWidth = chip.getBoundingClientRect().width;
-      chip.classList.remove('chip-measure-expanded');
-      return { natural: naturalWidth, expanded: expandedWidth };
-    });
-
-    const lines = planCandidateRows(sizes, width, gap);
-    const fragment = document.createDocumentFragment();
-    for (const indexes of lines) {
-      const line = document.createElement('span');
-      line.className = 'route-cand-line';
-      for (const index of indexes) line.append(chips[index]);
-      fragment.append(line);
-    }
-    container.replaceChildren(fragment);
-    container.dataset.chipLayoutWidth = String(width);
-  }
-}
+export function renderRoutes() { renderPolicies(); renderRouteWorkspace(); }
+export function selectRoute(model, protocol) { selectRouteWorkspace(model, protocol); }
 
 /* ================================================================ 实时请求 */
 
@@ -449,20 +264,19 @@ export function layoutRouteChips(host = $('route-list'), force = false) {
    不为了走字去打服务器。
 
    前两个阶段分开是这页的核心：同样的「12 秒没动静」，还没拿到状态码是站连不上或者
-   干脆没在回话（也可能是系统代理的问题），已经拿到了就是模型在想 —— 处置完全不同。
+   干脆没在回话（也可能是系统代理的问题）；已收到响应头仍不能确定模型正在思考。
    注意 connect 这一档不只是 TCP 握手：httpx 的 send() 要等到响应头才返回，所以
    「上游收了请求但迟迟不回话」也落在这一档里，文案不能写成「正在连接」。 */
 const PHASE = {
-  connect: ['等上游回应', '请求已经发出去了，还没拿到状态码 —— 连不上、或者上游收下了但不回话。connect 超时 8 秒'],
-  wait: ['已回应，等内容', '状态码拿到了，响应体还没开始 —— 模型在想'],
+  connect: ['等上游回应', '尚未收到响应头，可能在连接、排队或等待上游处理。'],
+  wait: ['已回应，等内容', '已收到响应头，但尚未收到内容；不能据此确定模型正在思考。'],
   stream: ['正在返回', '第一块字节已经转给下游了'],
   done: ['已结束', ''],
 };
 
 function callDot(c) {
   if (c.phase !== 'done') return c.phase === 'connect' ? 'warn' : 'good';
-  if (c.note && c.note !== 'ok') return 'crit';
-  return c.status >= 400 ? 'crit' : 'good';
+  return requestResult(c).tone || 'muted';
 }
 
 /** 「供应商 · 分组」，分组叫「默认」时省掉 —— 每行都拖一条没信息量的尾巴不值得 */
@@ -476,7 +290,7 @@ function trailRow(t) {
   return `<div class="trail-row">
       <span class="dim">第 ${t.attempt} 次</span>
       <span>${whereText(t.upstream, t.group_name) || '—'}</span>${name}
-      ${statusTag(t.status)}
+      ${resultTag(t)}
       <span class="grow"></span><span class="dim">${fmtDur(t.ms)}</span>
     </div>`;
 }
@@ -524,7 +338,7 @@ function callHtml(c) {
     ? parts.join('<span class="dim"> · </span>')
     : '<span class="dim">还没定上游</span>';
   const nth = c.attempt > 1
-    ? ` <span class="tag tag-accent" title="前 ${c.attempt - 1} 个候选没打通">第 ${c.attempt} 次</span>` : '';
+    ? ` <span class="tag tag-accent" title="前 ${c.attempt - 1} 次尝试未完成">第 ${c.attempt} 次</span>` : '';
 
   const bits = [
     esc(c.client || 'unknown'),
@@ -537,9 +351,7 @@ function callHtml(c) {
 
   let statePart;
   if (done) {
-    statePart = `${statusTag(c.status)}`
-      + (c.note && c.note !== 'ok' ? ' ' + noteTag(c.note) : '')
-      + downText(c, '收');
+    statePart = resultTag(c) + downText(c, '收');
   } else {
     const [label, why] = PHASE[c.phase] || [c.phase, ''];
     statePart = `<span class="tone-${callDot(c)}-ink" title="${esc(why)}">${esc(label)}</span>`
@@ -558,7 +370,7 @@ function callHtml(c) {
       <span class="call-ms" data-ms>${fmtDur(c.elapsed_ms)}</span>
       ${done ? '' : `<button type="button" class="call-cancel" data-act="cancel-call" data-id="${c.id}"
         title="${c.cancel_requested ? '正在中断' : '中断这条请求'}" aria-label="中断 ${esc(c.model)} 的请求"
-        ${c.cancel_requested ? 'disabled' : ''}>×</button>`}
+        ${c.cancel_requested ? 'disabled' : ''}>${c.cancel_requested ? '正在中断…' : '中断请求'}</button>`}
     </div>
     <div class="call-sub dim">${bits.join(' · ')}</div>
     <div class="call-state">${statePart}</div>
@@ -584,10 +396,19 @@ function paintCalls(host, list) {
     }
     byId.delete(key);
     el.className = 'call' + (c.phase === 'done' ? ' is-done' : '') + (c.meta ? ' is-meta' : '');
-    // 秒数在本地走：记下「这条是什么时候开始的」，tickElapsed 每 200ms 重算一次
+    // 秒数单独更新；只因经过了一秒，不重建整张卡片和中断按钮。
     el.dataset.ticking = c.phase === 'done' ? '0' : '1';
     el.dataset.t0 = String(performance.now() - c.elapsed_ms);
-    el.innerHTML = callHtml(c);
+    const html = callHtml({ ...c, elapsed_ms: 0 });
+    if (el.__html !== html) {
+      const cancelFocused = el.contains(document.activeElement)
+        && document.activeElement?.dataset.act === 'cancel-call';
+      el.innerHTML = html;
+      el.__html = html;
+      if (cancelFocused) el.querySelector('.call-cancel')?.focus({ preventScroll: true });
+    }
+    const elapsed = el.querySelector('[data-ms]');
+    if (elapsed) elapsed.textContent = fmtDur(c.elapsed_ms);
     // 已经在该在的位置就别动它 —— after() 会摘下来重插，进场动画会重播
     const inPlace = prev ? prev.nextElementSibling === el : host.firstElementChild === el;
     if (!inPlace) {
@@ -606,7 +427,6 @@ export function renderInflight(data) {
     ? `${counts.requests} 个进行中${counts.streams ? ` · ${counts.streams} 流式` : ''}`
     : '空闲';
   $('badge-live').textContent = counts.requests ? String(counts.requests) : '';
-  $('live-failover').innerHTML = failoverSwitches(PROTOCOLS.filter(protocolOn));
   renderBreakers(data);
 
   const live = data.calls || [];
@@ -840,26 +660,33 @@ function statusTag(status) {
   return `<span class="${cls}">${kind ? `<span class="dot dot-${kind}"></span>` : ''}${status}</span>`;
 }
 
-const NOTE_LABEL = {
-  truncated: ['warn', '流被截断'],
-  connect_failed: ['crit', '连不上'],
-  upstream_abort: ['crit', '上游断流'],
-  client_abort: ['', '客户端断开'],
-  manual_abort: ['', '手动中断'],
-  stall_timeout: ['warn', '卡住超时'],
-  // 这一次失败被自动降级接住了：客户端没看到它，但钱和时间是真花了，所以照样留痕
-  failed_over: ['warn', '已降级'],
-  // 这一次是「200 但一个字都没有」：网关扣住没发给客户端，正在原站重发（见 truncation.py）
-  hold_retry: ['warn', '截断重发'],
-};
+function resultTag(record) {
+  const result = requestResult(record);
+  return `<span class="request-result"><span class="tag${result.tone ? ' tag-' + result.tone : ''}">${esc(result.label)}</span><small class="dim">${record.status ? 'HTTP ' + esc(record.status) : '无 HTTP 状态'}</small></span>`;
+}
 
-function noteTag(note) {
-  if (!note || note === 'ok') return '<span class="dim">—</span>';
-  const [kind, label] = NOTE_LABEL[note] || ['', note];
-  return `<span class="tag${kind ? ' tag-' + kind : ''}">${esc(label)}</span>`;
+const displayedLogRows = new Map();
+
+export function showRequestDetails(id) {
+  const r = displayedLogRows.get(Number(id));
+  if (!r) return;
+  const value = v => v === null || v === undefined || v === '' ? '—' : esc(v);
+  const fields = [
+    ['时间', r.ts], ['客户端', r.client], ['接口', PROTO_LABEL[r.protocol] || r.protocol],
+    ['请求模型', r.model], ['上游真实模型', r.remote_model || r.model],
+    ['上游 / 分组', [r.upstream, r.group_name].filter(Boolean).join(' · ')],
+    ['本次尝试', r.attempt || 1], ['耗时', fmtDur(r.duration_ms)],
+    ['输入 tokens', r.input_tokens], ['输出 tokens', r.output_tokens], ['缓存 tokens', r.cached_tokens],
+    ['请求 / 响应体积', `${fmtBytes(r.req_bytes)} / ${fmtBytes(r.resp_bytes)}`],
+  ];
+  $('request-detail-body').innerHTML = resultTag(r) + '<dl class="request-facts">'
+    + fields.map(([key, v]) => `<div><dt>${key}</dt><dd>${value(v)}</dd></div>`).join('')
+    + '</dl><p class="detail-note">历史记录按尝试保存。完整的请求内重试经过可在实时页查看；这里不推断缺失的轨迹。</p>';
+  $('request-dialog').showModal();
 }
 
 function logRow(r) {
+  displayedLogRows.set(Number(r.id), r);
   const tokens = r.input_tokens === null
     ? '<span class="dim">—</span>'
     : `${fmtInt(r.input_tokens)} / ${fmtInt(r.output_tokens ?? 0)} / ${fmtInt(r.cached_tokens ?? 0)}`;
@@ -877,17 +704,17 @@ function logRow(r) {
   const upTip = r.group_name ? `${r.upstream} · ${r.group_name}` : r.upstream;
   // 第几次尝试：> 1 就是前面的候选没打通、换到这个站来的
   const nth = r.attempt > 1
-    ? ` <span class="tag tag-accent" title="前 ${r.attempt - 1} 个候选没打通">第 ${r.attempt} 次</span>` : '';
-  return `<tr data-id="${r.id}" data-log-proto="${esc(proto)}">
+    ? ` <span class="tag tag-accent" title="前 ${r.attempt - 1} 次尝试未完成">第 ${r.attempt} 次</span>` : '';
+  return `<tr data-id="${r.id}" data-log-proto="${esc(proto)}" data-log-issue="${requestResult(r).issue}" data-log-search="${esc([r.model, r.remote_model, r.upstream, r.client, r.status, requestResult(r).label].join(" ").toLowerCase())}">
       <td class="dim nowrap" title="${esc(r.ts || '')}">${esc((r.ts || '').slice(5))}</td>
       <td class="truncate" title="${esc(r.client)}">${esc(r.client)}</td>
       <td class="nowrap">${protoCell}</td>
       <td class="mono truncate" title="${esc(modelTip)}">${esc(r.model)}${remote}${r.stream ? ' <span class="tag">流</span>' : ''}</td>
       <td class="truncate" title="${esc(upTip)}">${esc(r.upstream)}${grp}${nth}</td>
-      <td>${statusTag(r.status)}</td>
+      <td>${resultTag(r)}</td>
       <td class="num mono nowrap">${tokens}</td>
       <td class="num dim nowrap" title="上行 ${fmtBytes(r.req_bytes)} · 下行 ${fmtBytes(r.resp_bytes)}">${fmtDur(r.duration_ms)}</td>
-      <td>${noteTag(r.note)}</td>
+      <td><button type="button" class="btn btn-ghost btn-sm" data-act="request-details" data-id="${r.id}" aria-label="查看 ${esc(r.model)} 请求详情">详情</button></td>
     </tr>`;
 }
 
@@ -958,17 +785,24 @@ function insertRows(list, cap) {
    筛选的存在，切档位也不会重建表格、不会重播动画。每次插行之后重跑一遍即可。 */
 export function applyLogFilter() {
   const want = state.proto;
+  const keyword = ($('log-filter')?.value || '').trim().toLowerCase();
+  const issues = $('log-issues')?.checked;
   let shown = 0;
   for (const tr of $('log-body').children) {
     if (!tr.dataset.id) continue;                     // 空状态那一行不参与
-    const hide = Boolean(want) && tr.dataset.logProto !== want;
+    const hide = (Boolean(want) && tr.dataset.logProto !== want)
+      || (keyword && !tr.dataset.logSearch.includes(keyword)) || (issues && tr.dataset.logIssue !== 'true');
     tr.hidden = hide;
     if (!hide) shown += 1;
   }
   const total = lastRows.length;
   $('log-count').textContent = total
-    ? (want ? `${shown} / ${total} 条` : `最近 ${total} 条`)
+    ? ((want || keyword || issues) ? `${shown} / ${total} 条` : `最近 ${total} 条`)
     : '';
+  const empty = $('log-no-match');
+  if (empty) empty.hidden = !total || shown > 0;
+  const visibleIds = new Set([...$('log-body').children].map(el => Number(el.dataset.id)));
+  for (const id of displayedLogRows.keys()) if (!visibleIds.has(id)) displayedLogRows.delete(id);
 }
 
 export function initLogFollow() {
@@ -1026,6 +860,7 @@ export function renderLive() {
   const live = (state.stats && state.stats.live)
     || (state.overview && state.overview.live) || { requests: 0, streams: 0 };
   $('live-count').textContent = String(live.requests);
+  if ($('route-live')) $('route-live').textContent = `${live.requests} 个请求进行中`;
   $('live-sub').textContent = live.streams
     ? `${live.streams} 条流式`
     : (live.requests ? '非流式' : '空闲');
@@ -1038,12 +873,8 @@ export function renderLive() {
 export function updateKpiLive() {
   const live = (state.stats && state.stats.live)
     || (state.overview && state.overview.live) || { requests: 0, streams: 0 };
-  if (odometers.live) {
-    odometers.live.set(String(live.requests));
-  } else {
-    const el = $('kpis').querySelector('[data-num="live"]');
-    if (el) countUp(el, live.requests, { duration: 420, format: (v) => String(Math.round(v)) });
-  }
+  const el = $('kpis').querySelector('[data-num="live"]');
+  if (el && el.textContent !== String(live.requests)) el.textContent = String(live.requests);
   const note = $('kpis').querySelector('[data-note="live"]');
   if (note) {
     note.innerHTML = live.streams
@@ -1058,8 +889,9 @@ export function updateKpiLive() {
 export function afterSwitch(model, fromRid, toRid, proto) {
   const scope = proto ? `[data-proto="${CSS.escape(proto)}"]` : '';
   const row = $('route-list').querySelector(`.route[data-model="${CSS.escape(model)}"]${scope}`);
-  if (!row) return;
-  flow(row.querySelector(`.chip[data-rid="${fromRid}"]`), row.querySelector(`.chip[data-rid="${toRid}"]`));
+  pulse(row, { duration: 260 });
+  const candidate = $('route-detail')?.querySelector(`[data-rid="${CSS.escape(String(toRid))}"]`)?.closest('.candidate');
+  pulse(candidate, { duration: 460 });
 }
 
 /**

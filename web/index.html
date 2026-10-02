@@ -5,14 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Model Gateway 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css?v=9">
-<link rel="stylesheet" href="/static/canvas.css?v=1">
+<link rel="stylesheet" href="/static/style.css?v=11">
+<link rel="stylesheet" href="/static/canvas.css?v=2">
 </head>
 <body>
-<div class="blob blob-1"></div>
-<div class="blob blob-2"></div>
-<div class="blob blob-3"></div>
-<div class="blob blob-4"></div>
+
+<div class="ambient" aria-hidden="true"><i class="ambient-blue"></i><i class="ambient-violet"></i><i class="ambient-peach"></i></div>
 
 <div class="shell">
   <!-- ============ 侧栏：视图导航 ============ -->
@@ -21,29 +19,18 @@
       <div class="brand-mark">M</div>
       <div class="brand-text">
         <h1>Model Gateway</h1>
-        <p>多上游聚合 · 热切换</p>
+        <p>本机模型工作台</p>
       </div>
     </div>
 
     <nav class="nav" id="nav" aria-label="视图导航">
       <span class="nav-marker" id="nav-marker" aria-hidden="true"></span>
-      <button type="button" class="nav-item" data-view="overview" aria-current="page">
-        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">概览</span>
-      </button>
-      <button type="button" class="nav-item" data-view="canvas">
-        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">编排</span>
-      </button>
-      <button type="button" class="nav-item" data-view="live">
-        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">实时</span>
-        <span class="nav-badge" id="badge-live"></span>
-      </button>
-      <button type="button" class="nav-item" data-view="upstreams">
-        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">上游站点</span>
-        <span class="nav-badge" id="badge-upstreams"></span>
-      </button>
-      <button type="button" class="nav-item" data-view="log">
-        <span class="nav-ico" aria-hidden="true"></span><span class="nav-label">转发记录</span>
-      </button>
+      <button type="button" class="nav-item" data-view="routes"><span class="nav-ico" aria-hidden="true">↗</span><span class="nav-label">模型路由</span></button>
+      <button type="button" class="nav-item" data-view="live"><span class="nav-ico" aria-hidden="true">◉</span><span class="nav-label">实时请求</span><span class="nav-badge" id="badge-live"></span></button>
+      <button type="button" class="nav-item" data-view="upstreams"><span class="nav-ico" aria-hidden="true">▦</span><span class="nav-label">上游站点</span><span class="nav-badge" id="badge-upstreams"></span></button>
+      <button type="button" class="nav-item" data-view="log"><span class="nav-ico" aria-hidden="true">≡</span><span class="nav-label">转发记录</span></button>
+      <button type="button" class="nav-item" data-view="overview"><span class="nav-ico" aria-hidden="true">▥</span><span class="nav-label">用量概览</span></button>
+      <button type="button" class="nav-item" data-view="settings"><span class="nav-ico" aria-hidden="true">⚙</span><span class="nav-label">网关设置</span></button>
     </nav>
 
     <button type="button" class="side-live" id="side-live" data-act="go-live"
@@ -59,23 +46,46 @@
       <button class="pill" data-act="copy-endpoint" title="点击复制 Codex / OpenAI 兼容客户端要填的 API 地址">
         <code id="endpoint">…</code>
       </button>
-      <div class="side-proto" id="proto-switches" role="group" aria-label="接口全局开关"></div>
       <div class="foot-row">
         <button class="btn btn-ghost btn-sm" data-act="show-access">下游接入</button>
         <button class="btn btn-ghost btn-icon" data-act="toggle-theme" title="切换深浅色" aria-label="切换深浅色">
           <span id="theme-icon">◐</span>
         </button>
       </div>
+      <button class="motion-toggle" data-act="toggle-motion" id="motion-toggle" title="标准保留环境流动和随动光感；轻量保留短交互动效">动效 · 标准</button>
     </div>
   </aside>
 
   <!-- ============ 主区 ============ -->
   <main class="main" id="main">
 
+    <!-- ---------- 模型路由工作台 ---------- -->
+    <section class="view" data-view="routes">
+      <header class="view-head">
+        <div><span class="eyebrow">MODEL GATEWAY / ROUTING</span><h2>模型路由</h2><p class="view-description">每个模型的下一站，一目了然。</p></div>
+        <span class="grow"></span>
+        <button class="btn btn-ghost" data-act="batch-add">批量添加模型</button>
+        <button class="btn" data-act="new-route">＋ 新增模型</button>
+      </header>
+      <div class="workspace-status"><span id="route-summary">正在读取配置…</span><button class="text-button" id="route-live" data-act="go-live">查看实时请求</button><span class="grow"></span><span id="route-attention"></span></div>
+      <div class="workspace-toolbar">
+        <div class="view-tabs" aria-label="路由视图"><button class="is-active" data-act="go-routes" aria-current="page">路由列表</button><button data-act="go-canvas">编排视图</button></div>
+        <span class="grow"></span><span class="count" id="route-count"></span>
+      </div>
+      <div class="route-filters">
+        <input type="search" class="search" id="route-filter" placeholder="搜索模型名…" aria-label="筛选模型名">
+        <span class="seg" id="seg-iface" role="group" aria-label="按接口筛选"></span>
+      </div>
+      <div class="route-workspace">
+        <section class="route-table" aria-label="模型列表"><div class="route-columns" aria-hidden="true"><span>模型 / 接口</span><span>下次请求起点</span><span>状态 / 候选</span><span>请求数</span></div><div id="route-list"></div></section>
+        <aside id="route-detail" class="route-detail" aria-label="选中模型的路由详情"></aside>
+      </div>
+    </section>
+
     <!-- ---------- 概览 ---------- -->
-    <section class="view" data-view="overview">
+    <section class="view" data-view="overview" hidden>
       <div class="view-head">
-        <h2>概览</h2>
+        <div><span class="eyebrow">流量与用量</span><h2>用量概览</h2></div>
         <span class="grow"></span>
         <span class="seg" id="seg-window" role="group" aria-label="时间窗">
           <button type="button" class="seg-item" data-window="1h">1 小时</button>
@@ -85,29 +95,6 @@
       </div>
 
       <section class="kpis" id="kpis"></section>
-
-      <!-- 模型路由：两种接口同级，用分段选择器换着看 -->
-      <section class="card">
-        <div class="card-head">
-          <h2>模型路由</h2><span class="count" id="route-count"></span>
-          <span class="grow"></span>
-          <span class="seg" id="seg-iface" role="group" aria-label="按接口筛选">
-            <button type="button" class="seg-item is-on" data-iface="">全部</button>
-          </span>
-          <span class="fo-box" id="failover-box"></span>
-          <input type="search" class="search" id="route-filter" placeholder="筛选模型名…" aria-label="筛选模型名">
-          <button class="btn btn-ghost btn-sm" data-act="open-search"
-                  title="Codex 联网搜索（Alpha Search）专用的上游分组">搜索上游</button>
-          <span class="tag tag-accent" id="search-target-tag" hidden></span>
-          <button class="btn btn-ghost btn-sm" data-act="batch-add"
-                  title="填一个模型名，一次问遍所有上游站，勾选要加的分组">批量添加模型</button>
-          <button class="btn btn-sm" data-act="new-route">新增模型</button>
-        </div>
-        <p class="card-hint">点候选圆片即把该模型切到那一条（高亮的是当前生效的，也是自动降级的起点）。
-          同一个分组下可以挂好几条，各指一个不同的上游真名。
-          圆片从左到右就是<b>依次尝试的顺序</b>，在圆片的 ✎ 里调。切换只影响新请求，进行中的流会走完旧上游。</p>
-        <div class="card-body scroll-y" id="route-list"></div>
-      </section>
 
       <section class="card">
         <div class="card-head">
@@ -135,7 +122,7 @@
     <!-- ---------- 编排 ---------- -->
     <section class="view" data-view="canvas" hidden>
       <div class="view-head">
-        <h2>编排</h2><span class="count" id="cv-count"></span>
+        <h2>模型编排</h2><span class="count" id="cv-count"></span>
         <span class="grow"></span>
         <span class="seg" id="cv-seg-iface" role="group" aria-label="按接口筛选"></span>
         <input type="search" class="search" id="cv-filter" placeholder="筛选模型名…" aria-label="筛选模型名">
@@ -143,6 +130,7 @@
         <button class="btn btn-ghost btn-sm" data-act="cv-reset" title="忘掉手动摆的位置，重新自动排列">重排</button>
         <button class="btn btn-sm" data-act="cv-new-model">＋ 下游模型</button>
       </div>
+      <div class="view-tabs"><button data-act="go-routes">路由列表</button><button class="is-active" data-act="go-canvas" aria-current="page">编排视图</button></div>
       <p class="card-hint">点一个下游气泡展开候选链。箭头表示候选顺序，拨盘只改变首选，失败时仍按开关自动降级。
         从上游池拖到气泡可连接候选；拖气泡上的 ↦ 到另一个气泡可设置全部转发。</p>
       <div class="cv-wrap">
@@ -180,13 +168,10 @@
       <div class="view-head">
         <h2>实时请求</h2><span class="count" id="live-total"></span>
         <span class="grow"></span>
-        <span class="fo-box" id="live-failover"></span>
+        <button class="btn btn-ghost btn-sm" data-act="go-settings">换站与超时设置</button>
       </div>
       <section class="card" data-flat>
-        <p class="card-hint">每条请求一张卡：现在打的是哪个上游、卡在连接还是在等模型出字、已经等了多久，
-          以及它前面被哪几个候选拒过 —— 那几次失败客户端看不见，但钱是真花了。结束的请求会再留
-          90 秒，不然降级轨迹只在活着的那几秒里存在，最想看的东西最看不到。
-          <code>count_tokens</code>（Claude Code 用它算上下文占用）也列出来，但不计入「进行中」。</p>
+        <p class="card-hint">查看当前上游、等待阶段与尝试经过。结束的请求保留 90 秒；中断只影响选中的请求。</p>
         <div class="card-body scroll-y">
           <div id="live-list"></div>
           <div class="call-sep" id="recent-sep" hidden></div>
@@ -196,7 +181,7 @@
       <section class="card" data-flat>
         <div class="card-head"><h2>分组健康</h2><span class="count" id="brk-count"></span></div>
         <p class="card-hint">同一个分组连续失败 2 次就冷却 90 秒，再失败翻倍、封顶 10 分钟；冷却期内自动降级
-          跳过它。手动点圆片切过去照样立刻生效，而且会清掉冷却。这些状态只在内存里，重启就清零。</p>
+          跳过它。手动设为首选会立刻生效，并清除冷却。这些状态只在内存里，重启就清零。</p>
         <div class="card-body" id="brk-list"></div>
       </section>
     </section>
@@ -209,9 +194,7 @@
         <button class="btn btn-sm" data-act="new-upstream">添加供应商</button>
       </div>
       <section class="card" data-flat>
-        <p class="card-hint">一个供应商 = 一个站（一个站根地址，<b>不带 /v1</b>）。同一个站的多把 key、
-          以及每种接口（Anthropic Messages / OpenAI Responses / Chat Completions），都是它下面的<b>分组</b>：接口、key、模型列表都在分组上 ——
-          点一行的空白处展开看，或者进「编辑」里改。</p>
+        <p class="card-hint">站点保存地址与连接方式，分组保存接口、密钥和模型目录。展开站点即可管理分组。</p>
         <div class="card-body scroll-x">
           <table class="tbl-upstreams">
             <thead><tr>
@@ -228,26 +211,7 @@
         </div>
       </section>
 
-      <section class="card" data-flat>
-        <div class="card-head"><h2>敏感词绕行</h2><span class="count" id="rewrite-count"></span></div>
-        <div class="card-body">
-          <label class="field">JSON 数组。转发前把请求体里的 <code>from</code> 原样换成 <code>to</code>
-            （<code>to</code> 留空 = 删掉那段）。上游的敏感词审核是黑盒，会误伤固定提示词 ——
-            命中一次就配一条。
-            <textarea id="rewrite-rules" rows="4" spellcheck="false"
-              placeholder='[{"from": "<上游误报的原文>", "to": "<改成什么样子>"}]'></textarea>
-          </label>
-          <div class="field-row" style="margin-top:8px">
-            <span class="dim" id="rewrite-msg" aria-live="polite"></span>
-            <span class="grow"></span>
-            <button type="button" class="btn btn-sm" data-act="save-rewrite">保存规则</button>
-          </div>
-          <span class="dim" style="font-size:12px;margin-top:6px;display:block">
-            <b>会改你的请求内容</b>：替换对请求体里所有字符串生效（messages、system、工具描述都在内），
-            规则要写得足够具体。默认为空 —— 一个字节都不改。
-          </span>
-        </div>
-      </section>
+
     </section>
 
     <!-- ---------- 转发记录 ---------- -->
@@ -265,17 +229,46 @@
         <button class="btn btn-ghost btn-sm" data-act="reload-log">刷新</button>
         <button class="btn btn-danger btn-sm" data-act="clear-log">清空</button>
       </div>
+      <div class="log-filters"><input type="search" class="search" id="log-filter" placeholder="搜索模型、上游、客户端或结果…" aria-label="搜索转发记录"><label class="checkline"><input type="checkbox" id="log-issues">只看异常或中断</label><span class="dim">筛选最近已加载的记录</span></div>
       <section class="card" data-flat>
         <div class="card-body scroll-y scroll-x">
           <table class="tbl-log">
             <thead><tr>
               <th>时间</th><th>客户端</th>
               <th>协议</th><th>模型</th><th>上游</th>
-              <th>状态</th><th class="num">Token 入/出/缓存</th>
-              <th class="num">耗时</th><th>备注</th>
+              <th>结果</th><th class="num">Token 入/出/缓存</th>
+              <th class="num">耗时</th><th>详情</th>
             </tr></thead>
             <tbody id="log-body"></tbody>
           </table>
+          <p class="empty" id="log-no-match" hidden>没有匹配的记录，试试调整筛选条件。</p>
+        </div>
+      </section>
+    </section>
+
+    <section class="view" data-view="settings" hidden>
+      <div class="view-head"><div><span class="eyebrow">网关行为</span><h2>网关设置</h2><p class="view-description">全局策略集中管理，模型和站点配置各自独立。</p></div></div>
+      <div class="cols settings-grid">
+        <section class="card"><div class="card-head"><h2>接口开关</h2><span class="tag">即时生效</span></div><p class="card-hint">关闭接口会隐藏相关配置并拒绝新请求，已有配置保留。</p><div class="side-proto card-body" id="proto-switches" role="group" aria-label="接口全局开关"></div></section>
+        <section class="card"><div class="card-head"><h2>失败与超时</h2><span class="tag">即时生效</span></div><p class="card-hint">失败自动换站按接口设置；无内容超时是全局设置，0 表示关闭。等响应头与首个内容不计时。</p><div class="fo-box policy-fields card-body" id="failover-box"></div></section>
+      </div>
+      <section class="card"><div class="card-head"><h2>联网搜索上游</h2><span class="tag tag-accent" id="search-target-tag" hidden></span><span class="grow"></span><button class="btn btn-ghost btn-sm" data-act="open-search">配置搜索上游</button></div><p class="card-hint">Alpha Search 可以指定独立上游，也可以跟随模型的候选链。</p></section>
+      <section class="card" data-flat>
+        <div class="card-head"><h2>请求文本替换</h2><span class="count" id="rewrite-count"></span></div>
+        <div class="card-body">
+          <label class="field"><span>JSON 数组。转发前将请求里的 <code>from</code> 替换为 <code>to</code>；<code>to</code> 留空则删除匹配内容。</span>
+            <textarea id="rewrite-rules" rows="4" spellcheck="false"
+              placeholder='[{"from": "<上游误报的原文>", "to": "<改成什么样子>"}]'></textarea>
+          </label>
+          <div class="field-row" style="margin-top:8px">
+            <span class="dim" id="rewrite-msg" aria-live="polite"></span>
+            <span class="grow"></span>
+            <button type="button" class="btn btn-sm" data-act="save-rewrite">保存规则</button>
+          </div>
+          <span class="dim" style="font-size:12px;margin-top:6px;display:block">
+            <b>会改你的请求内容</b>：替换对请求体里所有字符串生效（messages、system、工具描述都在内），
+            规则要写得足够具体。默认为空 —— 一个字节都不改。
+          </span>
         </div>
       </section>
     </section>
@@ -397,6 +390,7 @@
       <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
     </div>
     <div class="dlg-body">
+      <div class="form-scope-label"><b>分组信息</b><span class="tag">保存后生效</span></div>
       <div class="grid-2">
         <label class="field">分组名
           <input type="text" id="grp-name" placeholder="如 默认 / luna" autocomplete="off" required>
@@ -422,7 +416,7 @@
 
       <!-- 上游模型目录是即时生效的：勾上=登记，取消=从目录去掉，和上面那些要保存的字段分开 -->
       <div id="grp-import" hidden>
-        <div class="dlg-section divider">这个分组的上游模型 <span class="tag" id="grp-mcount"></span></div>
+        <div class="dlg-section divider">模型目录 · 即时生效 <span class="tag" id="grp-mcount"></span></div>
         <p class="dim" style="font-size:12px;margin:0 0 9px">
           勾上 / 取消<b>立刻生效</b>，不用点保存 —— 这里登记的是这个站能调到的上游模型，
           要不要对下游暴露在「模型路由」里单独做。上面的组名、接口、Key 才要保存。</p>
@@ -445,7 +439,8 @@
     </div>
     <div class="dlg-foot">
       <span class="grow"></span>
-      <button type="submit" class="btn" id="grp-save">保存</button>
+      <span class="dim">此按钮仅保存分组信息</span>
+      <button type="submit" class="btn" id="grp-save">保存分组</button>
     </div>
   </form>
 </dialog>
@@ -604,6 +599,7 @@
 </dialog>
 
 <div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
-<script type="module" src="/static/app.js?v=10"></script>
+<script type="module" src="/static/app.js?v=11"></script>
+<dialog id="request-dialog" class="wide"><div class="dlg-head"><h2>请求详情</h2><span class="grow"></span><button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button></div><div class="dlg-body" id="request-detail-body"></div></dialog>
 </body>
 </html>

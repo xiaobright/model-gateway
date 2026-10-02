@@ -29,7 +29,7 @@ export const state = {
   editingGroup: null, // 正在编辑的分组 id，null = 新建
   editingCand: null,  // 正在改的候选 {model, rid}，null = 新增
   openUpstreams: new Set(),  // 「上游站点」里展开了分组的那几行
-  view: 'overview',
+  view: 'routes',
   // 默认 24 小时：1 小时窗口在空闲时段是空的，一进来看到空图会以为坏了
   window: '24h',
   logIds: new Set(), // 已渲染过的 request_log id，用来做增量 diff

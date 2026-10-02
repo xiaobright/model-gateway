@@ -118,7 +118,21 @@ function autoPlace() {
   bubbles.forEach((row, i) => {
     const key = bubKey(row.model_name, row.protocol);
     if (!pos.has(key)) {
-      pos.set(key, [150 + (i % cols) * 320, 130 + Math.floor(i / cols) * 330]);
+      // 新模型插进排序后，原网格位置可能已经被旧模型占用；保留旧位置，
+      // 从后续空位里选择，避免批量添加后把两个气泡叠在一起。
+      const half = boxHalf(ringRadius(row.candidates.length));
+      let slot = i;
+      let point;
+      do {
+        point = [150 + (slot % cols) * 320, 130 + Math.floor(slot / cols) * 330];
+        slot += 1;
+      } while (bubbles.some(other => {
+        const taken = pos.get(bubKey(other.model_name, other.protocol));
+        if (!taken) return false;
+        const gap = half + boxHalf(ringRadius(other.candidates.length)) + 16;
+        return Math.abs(taken[0] - point[0]) < gap && Math.abs(taken[1] - point[1]) < gap;
+      }));
+      pos.set(key, point);
     }
   });
 
@@ -202,8 +216,7 @@ function zoomAt(clientX, clientY, factor) {
 /** 框住当前筛选可见的气泡；隐藏节点和历史上游坐标不参与适配。 */
 export function fitCanvas() {
   const rect = host.getBoundingClientRect();
-  // 切换视图用的是 View Transition，DOM 变形发生在下一帧的回调里：刚 showView 完就
-  // 量的话会量到 0×0，算出来的缩放会掉到下限、把所有节点叠成一团
+  // 隐藏或尚未布局时不能用零尺寸计算视野。
   if (rect.width < 80 || rect.height < 80) return false;
   const keys = visibleBubbles().map(row => bubKey(row.model_name, row.protocol));
   if (!keys.length) return false;
@@ -221,8 +234,8 @@ export function fitCanvas() {
   ), FIT_MIN, 1.05);
   view = {
     z,
-    x: (rect.width - (x1 - x0) * z) / 2 - x0 * z,
-    y: (rect.height - (y1 - y0) * z) / 2 - y0 * z,
+    x: Math.max(24, (rect.width - (x1 - x0) * z) / 2) - x0 * z,
+    y: Math.max(24, (rect.height - (y1 - y0) * z) / 2) - y0 * z,
   };
   applyView();
   markDirty();
@@ -407,11 +420,11 @@ function emptyHint() {
 }
 
 export function renderCanvas() {
-  if (!host) return;
+  if (!host || state.view !== 'canvas' || document.visibilityState === 'hidden') return;
   // 拖拽中间不重画：15 秒一次的配置轮询要是正好落在这里，会把正在拖的那个端口、
   // 或者正在拨的那根指针重建掉，手势当场跟丢。松手时 onUp 自己会重画一次
   if (drag) return;
-  if (!ready) { ensureLayout().then(renderCanvas); return; }
+  if (!ready) { if (!loading) ensureLayout().then(renderCanvas); return; }
 
   autoPlace();
   const bubbles = visibleBubbles();
@@ -442,11 +455,9 @@ export function renderCanvas() {
   drawWires(bubbles);
   applyView();
   renderChain();
-  // 首次进来框一次视野。量不到尺寸就先不做，下一个 rAF 再试 —— needFit 不清掉，
-  // 所以不会漏；量到了就会自己停
+  // 尺寸暂不可用时由 ResizeObserver 再试，不在隐藏页循环请求动画帧。
   if (needFit && bubbles.length) {
     if (fitCanvas()) needFit = false;
-    else requestAnimationFrame(() => { if (needFit) renderCanvas(); });
   }
 
   $('cv-count').textContent = bubbles.length
@@ -495,7 +506,7 @@ function buildPool() {
 }
 
 export function renderPool() {
-  if (!pool) return;
+  if (!pool || state.view !== 'canvas' || document.visibilityState === 'hidden') return;
   if (drag) return;   // 同上：正拖着上游池里的片子时不要重建池子
   if (!pool.querySelector('.cv-pool-body')) buildPool();
   const input = pool.querySelector('#cv-pool-filter');
@@ -1012,7 +1023,11 @@ export function initCanvas(injected) {
     hideMenu();
   });
   window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') hideMenu(); });
-  new ResizeObserver(() => applyView()).observe(host);
+  new ResizeObserver(() => {
+    if (state.view !== 'canvas') return;
+    if (needFit) renderCanvas();
+    else applyView();
+  }).observe(host);
 }
 
 /* ---------------------------------------------------------------- 对外 */

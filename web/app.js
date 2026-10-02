@@ -13,8 +13,8 @@ import {
   supportsIface, groupsOfIface, splitOneM, withOneM,
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
-import { withViewTransition, moveMarker, reduceMotion, initSpotlightAndTilt, refreshLightTargets } from './motion.js';
 import * as views from './views.js';
+import { initMotion, moveNavMarker, slideIn, toggleMotion } from './motion.js';
 import {
   initCanvas, renderCanvas, renderPool, setCanvasFilter, setCanvasIface,
   saveForward, canvasActions,
@@ -181,10 +181,12 @@ const overviewRefresh = createRefreshQueue(
     if (args.window !== state.window || args.seq < (state.overviewSeq || 0)) return;
     state.overviewSeq = args.seq;
     state.overview = data;
-    views.renderKpis();
-    if (!args.skipSeries) views.renderSeries();
-    views.renderHealth();
-    views.renderHot();
+    if (state.view === 'overview') {
+      views.renderKpis();
+      if (!args.skipSeries) views.renderSeries();
+      views.renderHealth();
+      views.renderHot();
+    }
     views.renderRoutes();
     views.renderUpstreams();
   },
@@ -233,7 +235,7 @@ function refreshInflight(options) {
 
 /* ---------------------------------------------------------------- 视图路由 */
 
-const VIEWS = ['overview', 'canvas', 'live', 'upstreams', 'log'];
+const VIEWS = ['routes', 'canvas', 'live', 'upstreams', 'log', 'overview', 'settings'];
 let currentView = '';
 
 function paintView(name) {
@@ -241,32 +243,30 @@ function paintView(name) {
     sec.hidden = sec.dataset.view !== name;
   }
   for (const btn of document.querySelectorAll('.nav-item')) {
-    const on = btn.dataset.view === name;
+    const on = btn.dataset.view === name || (name === 'canvas' && btn.dataset.view === 'routes');
     btn.classList.toggle('is-active', on);
     if (on) btn.setAttribute('aria-current', 'page');
     else btn.removeAttribute('aria-current');
   }
-  moveMarker($('nav-marker'), document.querySelector(`.nav-item[data-view="${name}"]`));
-  requestAnimationFrame(() => {
-    initSpotlightAndTilt();
-    refreshLightTargets();   // 换视图后哪些卡片可见、在哪，都变了
-    if (name === 'overview') views.layoutRouteChips();
-  });
+  moveNavMarker();
 }
 
 function showView(name) {
   const next = VIEWS.indexOf(name);
   const cur = VIEWS.indexOf(currentView);
   if (next < 0 || next === cur) return;
-  const dir = cur < 0 || next > cur ? 'down' : 'up';
   currentView = name;
   state.view = name;
-  withViewTransition(dir, () => paintView(name));
+  paintView(name);
   history.replaceState(null, '', '#' + name);
-  if (name === 'log') run(null, refreshLog);
+  if (name === 'log' && state.protocolsReady) run(null, refreshLog);
   if (name === 'live') run(null, refreshInflight);
   // 画布的坐标是第一次进来才拉的，别拖慢启动；进来之后每次刷新都会重画
-  if (name === 'canvas') renderCanvas();
+  if (name === 'canvas') { renderCanvas(); renderPool(); }
+  if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
+  if (name === 'routes') views.renderRoutes();
+  if (name === 'settings') views.renderPolicies();
+  slideIn(document.querySelector(`.view[data-view="${name}"]`));
 }
 
 /* ---------------------------------------------------------------- 时间窗 */
@@ -315,56 +315,11 @@ function applyTheme(name) {
   localStorage.setItem('mg-theme', name);
 }
 
-/* 主题切换做成从按钮扩散出去的圆：整页拍成一张快照压在底下，新配色那张用
-   圆形 clip 一点点盖上来。圆心和半径通过 CSS 变量交给 style.css 里的关键帧。
-
-   这里一律用百分比、不用 px。实测在 devicePixelRatio 非 1 的环境（Windows 150%
-   缩放，dpr=1.5）下，写进 view-transition 伪元素 clip-path 的 px 长度会被 dpr
-   缩掉：圆心落在按钮位置的 1/1.5 处、半径也只有需要值的 1/1.5，于是圆扩到七成
-   就到终点，最后一帧剩下的屏幕直接翻色。百分比是相对伪元素参照框解析的，
-   缩放会自然抵消，dpr=1 和 1.5 下都正确。 */
-let themeSeq = 0;
-const VT_VARS = ['--vt-x', '--vt-y', '--vt-r', '--vt-duration'];
-
-function cycleTheme(dataset, el) {
+function cycleTheme() {
   const now = localStorage.getItem('mg-theme') || 'auto';
   const next = THEMES[(THEMES.indexOf(now) + 1) % THEMES.length];
-  if (reduceMotion() || typeof document.startViewTransition !== 'function') {
-    applyTheme(next);
-    return;
-  }
-
-  // 圆心固定取按钮几何中心：比点击坐标更稳，键盘触发（clientX 为 0）时也一样
-  const btn = el || document.querySelector('[data-act="toggle-theme"]');
-  const box = btn ? btn.getBoundingClientRect() : null;
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  const x = box ? box.left + box.width / 2 : vw / 2;
-  const y = box ? box.top + box.height / 2 : vh / 2;
-
-  // 半径要够到四个角里最远的那个
-  const reach = Math.hypot(Math.max(x, vw - x), Math.max(y, vh - y));
-  // circle() 的百分比半径按 √(w²+h²)/√2 解析，换算过去；多给 1% 兜住取整误差
-  const radiusPct = (reach * Math.SQRT2 * 100) / Math.hypot(vw, vh) + 1;
-
-  const root = document.documentElement;
-  const seq = ++themeSeq;
-
-  root.style.setProperty('--vt-x', `${((x / vw) * 100).toFixed(3)}%`);
-  root.style.setProperty('--vt-y', `${((y / vh) * 100).toFixed(3)}%`);
-  root.style.setProperty('--vt-r', `${radiusPct.toFixed(3)}%`);
-  root.style.setProperty('--vt-duration', '560ms');
-  root.dataset.vtTheme = '1';
-
-  const vt = document.startViewTransition(() => {
-    applyTheme(next);
-  });
-
-  vt.finished.catch(() => {}).finally(() => {
-    if (seq !== themeSeq) return;   // 连点时已有新的切换在跑，别擦掉它的圆心
-    delete root.dataset.vtTheme;
-    for (const name of VT_VARS) root.style.removeProperty(name);
-  });
+  applyTheme(next);
+  toast(`外观：${{ auto: '跟随系统', light: '浅色', dark: '深色' }[next]}`);
 }
 
 /* ---------------------------------------------------------------- 端点 */
@@ -854,6 +809,8 @@ async function saveGroup() {
     toast('已保存，接着挑模型', 'ok');
   } else {
     updateGroupEdit(token, movedTo, targetGroup);
+    const owner = state.upstreams.find((x) => x.id === movedTo);
+    $('grp-title').textContent = `编辑分组：${owner ? owner.name : ''} · ${payload.name}`;
     toast(payload.upstream_id ? '已保存并搬到新供应商下' : '已保存', 'ok');
   }
   if (modelsChanged) {
@@ -885,6 +842,7 @@ function renderPicker() {
   const mine = catalogOfGroup(gid);
   const owned = new Set(mine);
   const rest = pulled.filter((m) => !owned.has(m));
+  if (pulled.length) $('grp-pull-status').textContent = `上游列出 ${pulled.length} 个，其中 ${pulled.length - rest.length} 个已登记`;
 
   const head = `<div class="pick-sep">这个分组的上游模型 ${mine.length} 个</div>`;
   const body = mine.length
@@ -1370,7 +1328,7 @@ function batchStatusText(data) {
   const rows = data.groups || [];
   const hit = rows.filter((r) => (r.matches || []).length).length;
   const failed = rows.filter((r) => r.error).length;
-  const parts = [`问了 ${data.scanned} 个上游分组，${hit} 个站有它`];
+  const parts = [`扫描 ${data.scanned} 个上游分组，${hit} 个分组匹配`];
   if (failed) parts.push(`${failed} 个没问到`);
   parts.push(`${(data.ms / 1000).toFixed(1)} 秒`);
   if (data.budget_hit) parts.push('（有站太慢，这一轮没等它）');
@@ -1546,6 +1504,7 @@ const ACTIONS = {
   },
 
   'toggle-theme': cycleTheme,
+  'toggle-motion': () => { toggleMotion(); },
 
   'close-dialog': (_d, el) => el.closest('dialog').close(),
 
@@ -1796,6 +1755,12 @@ const ACTIONS = {
   },
 
   'open-search': openSearch,
+  'select-route': ({ model, proto }) => views.selectRoute(model, proto),
+  'go-routes': () => showView('routes'),
+  'go-canvas': () => showView('canvas'),
+  'go-settings': () => showView('settings'),
+  'go-upstreams': () => showView('upstreams'),
+  'request-details': ({ id }) => views.showRequestDetails(id),
   'new-route': () => openRoute('', null),
   'add-candidate': ({ model, proto }) => openRoute(model, null, proto),
   'edit-candidate': ({ model, rid, proto }) => openRoute(model, Number(rid), proto),
@@ -1848,7 +1813,8 @@ const ACTIONS = {
       throw e;
     }
     views.renderRoutes();
-    toast(`${PROTO_LABEL[fo]} 自动降级已${el.checked ? '开启' : '关闭'}`, 'ok');
+    toast(`${PROTO_LABEL[fo]} 自动换站已${el.checked ? '开启' : '关闭'}`, 'ok');
+    await refreshConfig();
   },
 
   /* 上游发呆超时：全局一个值。卡住时按手动打断处理，让下游重发（0 = 关闭）。
@@ -1888,14 +1854,14 @@ const ACTIONS = {
     const id = Number(rid);
     const group = state.routes.find((r) => r.model_name === model && r.protocol === proto);
     const cand = group && group.candidates.find((c) => c.route_id === id);
-    if (!cand) return;
+    if (!cand || group.forward_to) return;
     if (!cand.upstream_enabled) return toast('这个供应商是停用状态，先在「上游站点」里启用它', 'err');
     if (!cand.group_enabled) return toast('这个分组是停用状态，展开那一行把它打开', 'err');
     const from = group.active_route_id;
     await api('POST', '/admin/api/models/switch', { route_id: id });
     await refreshConfig();
     views.afterSwitch(model, from, id, proto);
-    toast(`${model} → ${candLabel(model, cand)}`, 'ok');
+    toast(`${model} → ${candLabel(model, cand)}；新请求生效`, 'ok');
   },
 
   'del-candidate': async ({ model, rid, proto }) => {
@@ -1905,7 +1871,9 @@ const ACTIONS = {
     const last = group && group.candidates.length === 1;
     const okay = await confirmBox({
       title: last ? '移除最后一个候选' : '移除候选',
-      body: last
+      body: last && group.forward_to
+        ? `<b>${esc(model)}</b> 正在转发到 <b>${esc(group.forward_to)}</b>。移除自己的最后一个候选后，模型转发仍然保留。`
+        : last
         ? `<b>${esc(model)}</b> 只剩这一个候选，移除后它就不再对下游暴露了。`
         : `把 <b>${esc(model)}</b> 的候选 <b>${esc(cand ? candLabel(model, cand) : id)}</b> 去掉？`
           + '<br><br>如果它正好是当前生效的，流量会自动落到剩下的候选之一。',
@@ -2152,14 +2120,19 @@ $('route-filter').addEventListener('input', (ev) => {
 
 $('grp-picker-filter').addEventListener('input', applyPickerFilter);
 
-window.addEventListener('resize', () => {
-  moveMarker($('nav-marker'), document.querySelector(`.nav-item[data-view="${currentView}"]`));
-  views.layoutRouteChips();
-});
+$('log-filter').addEventListener('input', views.applyLogFilter);
+$('log-issues').addEventListener('change', views.applyLogFilter);
 
 window.addEventListener('hashchange', () => {
   const target = location.hash.slice(1);
   if (VIEWS.includes(target) && target !== currentView) showView(target);
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.view === 'canvas') {
+    renderCanvas();
+    renderPool();
+  }
 });
 
 /* ---------------------------------------------------------------- 轮询 */
@@ -2172,8 +2145,7 @@ setInterval(() => {
 }, 3000);
 
 /* 「实时」页只在自己显示时轮询，1 秒一次 —— 那个接口是纯内存的，不碰数据库。
-   秒数不靠轮询走字：本地每 200ms 按「这条什么时候开始的」重算一遍，
-   否则要么一秒跳一格，要么得把轮询压到 200ms 去。 */
+   本地每秒更新耗时数字，不增加网络请求。 */
 setInterval(() => {
   if (ticking() && state.view === 'live') {
     run(null, () => refreshInflight({ allowIntermediate: true }));
@@ -2182,16 +2154,16 @@ setInterval(() => {
 
 setInterval(() => {
   if (state.view === 'live' && document.visibilityState === 'visible') views.tickElapsed();
-}, 200);
+}, 1000);
 
 // 慢轮取统计和记录：数据量大一些，15 秒足够。配置也跟着刷 —— 断路器的冷却剩余
-// 在候选圆片上是要走字的，而且从别处（另一个标签页、手动切换）改过的配置也该跟上
+// 在详情里显示，而且从别处（另一个标签页、手动切换）改过的配置也该跟上
 setInterval(() => {
   if (!ticking()) return;
   run(null, async () => {
     await Promise.all([
-      refreshOverview({ allowIntermediate: true }),
-      refreshLog({ allowIntermediate: true }),
+      ...(['overview', 'routes', 'upstreams'].includes(state.view) ? [refreshOverview({ allowIntermediate: true })] : []),
+      ...(state.view === 'log' ? [refreshLog({ allowIntermediate: true })] : []),
       refreshConfig({ allowIntermediate: true }),
     ]);
   });
@@ -2200,6 +2172,7 @@ setInterval(() => {
 /* ---------------------------------------------------------------- 启动 */
 
 applyTheme(localStorage.getItem('mg-theme') || 'auto');
+initMotion();
 $('endpoint').textContent = `${location.origin}/v1`;
 views.initLogFollow();   // 「自动跟随新记录」的勾选状态变化时补插攒下的行
 // 编排画布：写操作全部通过这三个入口回到主流程，画布自己不碰弹窗和刷新
@@ -2214,18 +2187,12 @@ state.iface = '';
 renderProtocolControls();
 for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
 
-const initial = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
+const initial = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'routes';
 currentView = '';
 showView(initial);
 
 run(null, async () => {
   await refreshProtocols();
   await Promise.all([refreshConfig(), refreshOverview(), refreshStats()]);
-  await refreshLog();
-});
-
-// 侧栏高亮条的初始位置要等布局算完，否则会量到 0
-requestAnimationFrame(() => {
-  moveMarker($('nav-marker'), document.querySelector(`.nav-item[data-view="${currentView}"]`));
-  initSpotlightAndTilt();
+  if (state.view === 'log') await refreshLog();
 });

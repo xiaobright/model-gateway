@@ -28,7 +28,6 @@
   border-radius: 16px;
   background: var(--glass);
   box-shadow: var(--shadow-1);
-  backdrop-filter: blur(20px) saturate(1.4);
   overflow: hidden;
 }
 
@@ -128,7 +127,6 @@
   border: 1px solid var(--edge);
   color: var(--ink);
   box-shadow: var(--shadow-2);
-  backdrop-filter: blur(14px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -211,7 +209,6 @@
   background: var(--glass-2);
   border: 1px solid var(--edge);
   box-shadow: var(--edge-highlight), var(--shadow-1);
-  backdrop-filter: blur(16px) saturate(1.5);
 }
 
 .cv-name {
@@ -390,7 +387,6 @@
   border: 1px solid var(--edge);
   color: var(--ink-2);
   box-shadow: var(--shadow-1);
-  backdrop-filter: blur(12px);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -418,7 +414,6 @@
   border: 1px solid var(--edge);
   background: var(--glass-2);
   box-shadow: var(--edge-highlight), var(--shadow-1);
-  backdrop-filter: blur(14px) saturate(1.4);
   cursor: grab;
   overflow: hidden;
 }
@@ -495,7 +490,6 @@
   border: 1px solid var(--edge);
   background: var(--glass-2);
   box-shadow: var(--shadow-2);
-  backdrop-filter: blur(22px) saturate(1.5);
   display: flex;
   flex-direction: column;
 }
@@ -568,5 +562,8 @@
 .cv-chain-card .btn { padding: 4px 7px; }
 .cv-chain-arrow { color: var(--accent); font-size: 24px; }
 .cv-forward-path { color: var(--accent-ink); overflow-wrap: anywhere; }
-@media (max-width: 700px) { .cv-wrap { grid-template-columns: 150px minmax(0, 1fr); } }
+@media (max-width: 900px) {
+  .cv-wrap { grid-template-columns: minmax(0, 1fr); height: auto; }
+  .cv-host { height: 55vh; min-height: 320px; }
+}
 @media (prefers-reduced-motion: reduce) { .cv-needle { transition: none; } }

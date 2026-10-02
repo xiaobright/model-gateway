@@ -6,6 +6,8 @@ import vm from 'node:vm';
 import * as util from '../web/util.js';
 import * as groupEditor from '../web/group-editor.js';
 import { createRefreshQueue } from '../web/async-state.js';
+import * as canvasModel from '../web/canvas-model.js';
+import { requestResult } from '../web/request-result.js';
 
 // 执行真实 app.js 的处理函数，只替换 DOM/网络和启动轮询的宿主。
 // 不复制被测函数；Promise 由用例控制，关闭/重开等竞态不用真实网络或 sleep。
@@ -27,7 +29,7 @@ function harness(t) {
   ]);
   Object.assign(util.state, {
     upstreams: [], routes: [], stats: null, overview: null, editing: null,
-    editingUp: null, editingGroup: null, editingCand: null, iface: '', filter: '',
+    editingUp: null, editingGroup: null, editingCand: null, iface: '', filter: '', proto: '', logIds: new Set(),
     view: 'overview', protocolEnabled: {}, failover: { enabled: {}, breakers: [] },
   });
   groupEditor.invalidateGroupEdit();
@@ -39,7 +41,8 @@ function harness(t) {
         value: '', textContent: '', innerHTML: '', checked: false, open: false,
         dataset: {}, style: {}, children: [], hidden: false, scrollTop: 0,
         classList: { add: noop, remove: noop, toggle: noop },
-        querySelectorAll: () => [], focus: noop, scrollIntoView: noop,
+        querySelectorAll: () => [], querySelector: () => null, contains: () => false,
+        focus: noop, scrollIntoView: noop,
         showModal() { this.open = true; },
         close() { this.open = false; this.dispatch('close'); },
         addEventListener(type, callback) { listeners.set(type, callback); },
@@ -57,7 +60,8 @@ function harness(t) {
   };
   t.after(() => { globalThis.fetch = oldFetch; groupEditor.invalidateGroupEdit(); });
   const context = vm.createContext({
-    ...util, ...groupEditor, createRefreshQueue, $: element,
+    ...util, ...groupEditor, ...canvasModel, routeKey: canvasModel.modelKey, performance,
+    requestResult, createRefreshQueue, $: element,
     document: {
       addEventListener: noop, querySelectorAll: () => [], visibilityState: 'visible',
       querySelector: () => [...elements.values()].find((e) => e.open),
@@ -71,8 +75,9 @@ function harness(t) {
     setCanvasFilter: noop, setCanvasIface: noop, saveForward: async () => {},
     toast: (...args) => h.toasts.push(args), run: (_el, fn) => fn(), confirmBox: async () => true,
     requestAnimationFrame: (fn) => fn(), setInterval: (fn, ms) => h.timers.push({ fn, ms }),
-    withViewTransition: (_dir, fn) => fn(), moveMarker: noop, reduceMotion: () => true,
-    initSpotlightAndTilt: noop, refreshLightTargets: noop,
+    withViewTransition: (_dir, fn) => fn(), reduceMotion: () => true,
+    moveNavMarker: noop, slideIn: noop, toggleMotion: noop,
+    updateNumber: (el, value) => { if (el) el.textContent = value; },
     refreshForTest: () => {
       const job = deferred();
       h.refreshes.push(job);
@@ -269,18 +274,118 @@ test('加候选只显示已登记模型，不请求上游，并将名称匹配�
   assert.equal(h.element('route-dialog').open, true);
 });
 
-test('整颗展开后放不下时预先移到下一行', (t) => {
+function loadViews(h) {
+  for (const file of ['route-view', 'views']) {
+    h.evaluate(readFileSync(new URL(`../web/${file}.js`, import.meta.url), 'utf8')
+      .replace(/^import [\s\S]*? from '[^']+';\r?\n/gm, '')
+      .replace(/^export /gm, ''));
+  }
+}
+
+test('工作台刷新保留同名模型的协议选择；筛选后重新校验选择', (t) => {
   const h = harness(t);
-  const views = readFileSync(new URL('../web/views.js', import.meta.url), 'utf8')
-    .replace(/^import [\s\S]*? from '[^']+';\r?\n/gm, '')
-    .replace(/^export /gm, '');
-  h.evaluate(views);
-  const rows = JSON.parse(h.evaluate(`JSON.stringify(planCandidateRows([
-    { natural: 40, expanded: 55 },
-    { natural: 35, expanded: 65 },
-    { natural: 30, expanded: 45 },
-  ], 110, 7))`));
-  assert.deepEqual(rows, [[0], [1, 2]]);
+  loadViews(h);
+  util.state.routes = ['openai', 'openai-chat'].map(protocol => ({
+    model_name: 'shared', protocol, candidates: [], active_route_id: null,
+  }));
+  h.evaluate("selectRouteWorkspace('shared', 'openai-chat'); renderRoutes()");
+  assert.match(h.element('route-detail').innerHTML, /<span class="tag">Chat<\/span>/);
+  const before = h.element('route-list').innerHTML;
+  let writes = 0;
+  Object.defineProperty(h.element('route-list'), 'innerHTML', {
+    get: () => before, set: () => { writes++; }, configurable: true,
+  });
+  h.evaluate('renderRoutes()');
+  assert.equal(writes, 0, '数据未变不重建列表');
+  util.state.iface = 'openai';
+  h.evaluate('renderRoutes()');
+  assert.match(h.element('route-detail').innerHTML, /<span class="tag">Responses<\/span>/);
+  util.state.filter = 'missing';
+  h.evaluate('renderRoutes()');
+  assert.match(h.element('route-detail').innerHTML, /选中一个模型/);
+});
+
+test('工作台更新保留键盘焦点和滚动；接口关闭后提示恢复配置', (t) => {
+  const h = harness(t);
+  loadViews(h);
+  util.state.routes = [{ model_name: 'shared', protocol: 'openai', candidates: [] }];
+  h.evaluate('renderRoutes()');
+  const host = h.element('route-list');
+  let focused = 0;
+  const key = JSON.stringify(['shared', 'openai']);
+  host.contains = () => true;
+  host.scrollTop = 48;
+  host.querySelectorAll = () => [{ dataset: { focusKey: key }, focus: () => { focused++; } }];
+  h.evaluate(`document.activeElement = { dataset: { focusKey: ${JSON.stringify(key)} } };`);
+  util.state.overview = { models: [{ model: 'shared', protocol: 'openai', n: 7 }] };
+  h.evaluate('renderRoutes()');
+  assert.equal(focused, 1);
+  assert.equal(host.scrollTop, 48);
+  util.state.protocolEnabled.openai = false;
+  h.evaluate('renderRoutes()');
+  assert.match(host.innerHTML, /当前没有可见模型/);
+  assert.match(host.innerHTML, /data-act="go-settings"/);
+});
+
+test('记录按协议、结果和关键词组合筛选，详情保留已显示尝试的数据', (t) => {
+  const h = harness(t);
+  loadViews(h);
+  const records = [
+    { id: 1, model: 'shared', protocol: 'openai', status: 200, note: 'truncated' },
+    { id: 2, model: 'shared', protocol: 'openai-chat', status: 200, note: 'ok' },
+    { id: 3, model: 'other', protocol: 'openai', status: 503, note: '' },
+  ];
+  h.evaluate(`lastRows = ${JSON.stringify(records)}; lastRows.forEach(logRow);`);
+  const rows = records.map(r => ({ dataset: { id: String(r.id), logProto: r.protocol,
+    logIssue: String(requestResult(r).issue), logSearch: r.model }, hidden: false }));
+  h.element('log-body').children = rows;
+  h.element('log-issues').checked = true;
+  h.element('log-filter').value = 'shared';
+  util.state.proto = 'openai';
+  h.evaluate('applyLogFilter(); showRequestDetails(1)');
+  assert.deepEqual(rows.map(r => Boolean(r.hidden)), [false, true, true]);
+  assert.equal(h.element('log-count').textContent, '1 / 3 条');
+  assert.match(h.element('request-detail-body').innerHTML, /流被截断/);
+  assert.match(h.element('request-detail-body').innerHTML, /HTTP 200/);
+  assert.equal(h.element('request-dialog').open, true);
+  h.element('log-filter').value = 'absent';
+  h.evaluate('applyLogFilter()');
+  assert.equal(h.element('log-no-match').hidden, false);
+});
+
+test('实时卡片只有耗时变化时，不重建内容或中断按钮', (t) => {
+  const h = harness(t);
+  loadViews(h);
+  const host = h.element('live-list'), card = h.element('call-1'), timer = h.element('call-ms');
+  card.dataset.id = '1';
+  card.querySelector = () => timer;
+  host.children = [card];
+  host.firstElementChild = card;
+  let writes = 0;
+  Object.defineProperty(card, 'innerHTML', { set: () => { writes++; } });
+  h.evaluate("paintCalls($('live-list'), [{id:1,phase:'wait',model:'shared',elapsed_ms:1000}])");
+  h.evaluate("paintCalls($('live-list'), [{id:1,phase:'wait',model:'shared',elapsed_ms:2000}])");
+  assert.equal(writes, 1);
+  assert.equal(timer.textContent, '2.0s');
+});
+
+test('慢轮询只为当前页面拉用量或记录，隐藏标签页停止轮询', async (t) => {
+  const h = harness(t);
+  h.evaluate("let pollCalls = []; refreshOverview = async () => pollCalls.push('overview'); refreshLog = async () => pollCalls.push('log');");
+  const slow = h.timers.find(timer => timer.ms === 15000);
+  util.state.view = 'routes';
+  slow.fn();
+  await tick();
+  assert.equal(h.evaluate("pollCalls.join(',')"), 'overview');
+  util.state.view = 'log';
+  slow.fn();
+  await tick();
+  assert.equal(h.evaluate("pollCalls.join(',')"), 'overview,log');
+  const refreshCount = h.refreshes.length;
+  h.evaluate("document.visibilityState = 'hidden'");
+  slow.fn();
+  await tick();
+  assert.equal(h.refreshes.length, refreshCount);
 });
 
 test('旧 close 事件到达时，新分组仍在取 Key 也不能被作废', async (t) => {
@@ -325,10 +430,7 @@ test('3 秒轮询只取 live，实时页不重复轮询 stats', async (t) => {
 
 test('路由次数按协议对应；热榜只裁展示，不裁其他模型的次数', (t) => {
   const h = harness(t);
-  const views = readFileSync(new URL('../web/views.js', import.meta.url), 'utf8')
-    .replace(/^import [\s\S]*? from '[^']+';\r?\n/gm, '')
-    .replace(/^export /gm, '');
-  h.evaluate(views);
+  loadViews(h);
   util.state.overview = { models: [
     { model: 'shared', protocol: 'openai', n: 3, p95: 10, bad: 0 },
     { model: 'shared', protocol: 'openai-chat', n: 1, p95: 10, bad: 0 },
@@ -340,7 +442,7 @@ test('路由次数按协议对应；热榜只裁展示，不裁其他模型的�
     model_name, protocol, candidates: [], active_route_id: null, preferred_route_id: null,
   }));
   h.evaluate('renderRoutes()');
-  const rows = h.element('route-list').innerHTML.split('<div class="route" ').slice(1);
+  const rows = h.element('route-list').innerHTML.split('<button type="button" class="route').slice(1);
   assert.match(rows[0], /class="route-usage"[^>]*>3 次/);
   assert.match(rows[1], /class="route-usage"[^>]*>1 次/);
   assert.match(rows[2], /class="route-usage"[^>]*>1 次/);
