@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -109,7 +110,8 @@ def note_fail(group_id: int, status: int, label: str = "") -> float:
         if st.fails < COOL_AFTER:
             return 0.0
         # 第 COOL_AFTER 次开始冷却，之后每次翻倍
-        span = min(COOL_MAX, COOL_SECONDS * (2 ** (st.fails - COOL_AFTER)))
+        exponent = min(st.fails - COOL_AFTER, max(0, math.ceil(math.log2(COOL_MAX / COOL_SECONDS))))
+        span = min(COOL_MAX, COOL_SECONDS * (2 ** exponent))
         st.until = time.monotonic() + span
         st.cooled += 1
         log(f"  failover: {label or f'g{group_id}'} 连续失败 {st.fails} 次（{status}），冷却 {span:.0f}s")

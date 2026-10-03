@@ -259,6 +259,8 @@ def finish(cap: StreamCapture | None, **extra: Any) -> None:
                 flag_path().unlink()
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                log(f"  capture: 无法删除停止标记: {exc}")
 
 
 # ---------------------------------------------------------------- 请求形状 / 压缩诊断

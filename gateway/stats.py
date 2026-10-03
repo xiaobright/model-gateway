@@ -32,7 +32,7 @@ DEFAULT_WINDOW = "1h"
 # 但它同样不能在统计卡片里被算成成功；日志里的 note 仍保留了责任边界。
 BAD_NOTES = frozenset({
     "connect_failed", "upstream_abort", "truncated", "client_abort", "manual_abort",
-    "stall_timeout",
+    "stall_timeout", "protocol_error",
 })
 
 # ---------------------------------------------------------------- 活跃流

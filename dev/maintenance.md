@@ -26,7 +26,7 @@
 
 | 文件 | 负责什么 |
 | --- | --- |
-| `main.py`、`gateway/server.py` | 启动、端口和退出。 |
+| `main.py`、`gateway/server.py`、`gateway/startup.py` | 启动、端口、启动诊断和退出。 |
 | `gateway/tray.py`、`gateway/autostart.py` | Windows 托盘、单实例检查和开机自启。 |
 | `gateway/proxy.py` | 接收请求，选择候选，转发响应，处理重试、中断和收尾。 |
 | `gateway/protocols.py` | 各接口的名称、鉴权方式、结束事件、用量读取和页面展示信息。 |
@@ -384,6 +384,7 @@ anyrouter 上连着重试 6 次，请求体字节数完全相同（1005868B）�
 | --- | --- |
 | `ok` | 该次转发按记录规则正常收尾。仍需一起看 HTTP 状态码；例如 500 的错误体也可能完整转发。 |
 | `truncated` / 流被截断 | 没有识别到预期结束事件。可能是上游缺事件，也可能是压缩、格式或解析问题。 |
+| `protocol_error` / 上游协议错误 | HTTP 状态可能仍是 200，但上游明确报告 error、failed 或 incomplete。响应原样透传，请求结果与健康统计按失败计；已发出的内容不据此自动重试。 |
 | `upstream_abort` / 上游断流 | 接收上游响应时连接异常中断。 |
 | `client_abort` / 客户端断开 | 正常结束前客户端离开。 |
 | `manual_abort` / 手动中断 | 用户在实时页停止了请求。 |
@@ -509,7 +510,7 @@ Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:8317/admin/api/capture-stre
 - 当前代码的数据库版本号是 8，以 `db.SCHEMA_VERSION` 为准。旧版协议转换留下的兼容字段不代表转换功能仍可用。
 - 需要升级旧库时，程序先通过 SQLite 的备份接口生成 `data/gateway.db.bak-<时间戳>`，自动保留最近 3 份迁移备份。它不是定时备份，也不能代替自己保留的重要备份。
 - 运行中的 SQLite 可能还有 `-wal` 文件，**不要只复制正在使用的 `gateway.db` 就当作完整备份**。使用 SQLite 备份方式，或正常退出后再备份需要的数据。
-- 文本日志 `data/gateway.log` 每份 5MB，轮换为 `.1`、`.2`，共保留三份。启动异常还可能写 `data/crash.log`。
+- 请求文本日志 `data/gateway.log` 每份 5MB，轮换为 `.1`、`.2`，共保留三份。启动诊断 `data/startup.log` 每份 1 MiB，轮换为 `.1`、`.2`，记录启动时间、PID、监听就绪及具体错误堆栈；主线程异常还会写 `data/crash.log`。
 - 数据库、备份、代理配置、证书材料和抓包都按敏感文件对待；尤其不要提交真实 Key 或代理密码。
 
 ## 启动与端口
@@ -527,6 +528,9 @@ Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:8317/admin/api/capture-stre
 - 直接运行 `main.py` 时，可通过 `--port` 指定；未指定时读取 `data/settings.json` 的 `port`。编辑已有设置文件时保留其他内容。
 - **启动脚本会显式传端口**，所以只改 `settings.json` 不会改变双击脚本的默认端口。
 - Windows 托盘模式有单实例检查。虚拟环境的 `pythonw.exe` 出现父子两个进程可能是正常启动方式，不等于开了两套服务。
+- 托盘等待服务线程就绪的上限为 60 秒；线程提前退出或已记录启动错误时立即结束等待。超时会请求停止本次启动，避免迟到启动继续作为正常服务运行；这不是端口占用的证据。
+- 启动失败优先查看 `data/startup.log`。弹窗区分端口被占用、系统拒绝绑定、其他绑定失败、初始化异常、线程异常和等待超时；无控制台的 `pythonw.exe` 也会保留后台线程异常（含 Uvicorn 的 `SystemExit`）。日志无法写入时弹窗会提示检查目录权限。
+- 双击脚本的健康检查绕过代理，并至少留出上述等待窗口；收到非成功 HTTP 状态不会判定为已启动。开机自启快捷方式直接运行托盘入口，不经过 BAT。
 - 优先用托盘「退出」；前台模式用 `Ctrl+C`。管理接口也提供 `POST /admin/api/shutdown`，不要在有重要请求时调用。
 
 ## 测试怎么跑
@@ -547,6 +551,7 @@ uv run .venv\Scripts\python.exe -m pytest tests/test_canvas.py -q -p no:cachepro
 
 | 改动范围 | 首选检查 |
 | --- | --- |
+| 启动等待、错误提示与日志 | `tests/test_startup.py`；再用同文件 `--network` 检查实际端口占用、临时库起停和超时后的迟到收尾。 |
 | 画布坐标、模型批量添加 | `tests/test_canvas.py` 或 `tests/test_model_batch.py`；界面同时改动时加 Node 测试。 |
 | 路由、模型转发 | `tests/test_routing.py`、`tests/test_forwards.py`，以及改动涉及的 `test_proxy` 用例。 |
 | 重试、冷却 | `tests/test_same_retry.py`、`tests/test_failover.py`；取消等待还需相关 `test_lifecycle` 用例。 |
@@ -554,7 +559,8 @@ uv run .venv\Scripts\python.exe -m pytest tests/test_canvas.py -q -p no:cachepro
 | 请求转发、协议事件解析 | `tests/test_proxy.py`、`tests/test_lifecycle.py` 和 `test_units.py` 中对应函数；连接语义另跑下面的网络检查。 |
 | 统计、实时状态 | `tests/test_stats.py` 或 `tests/test_inflight.py`；取消真实流需 `--network`。 |
 | 调度观测、采集器 | `tests/test_learning.py`；改了转发挂接点时加对应转发/生命周期检查。 |
-| 管理接口、数据库迁移 | `tests/test_admin.py` 中对应用例；跨模块数据库结构变动最后做完整检查。 |
+| 管理接口、数据库迁移 | `tests/test_admin.py` 中对应用例；并发校验与批量回滚加 `tests/test_db_consistency.py`。跨模块数据库结构变动最后做完整检查。 |
+| 异常配置、用量数字与冷却上限 | `tests/test_backend_boundaries.py`；涉及转发挂接时加 `test_lifecycle` 的观察失败用例。 |
 | 出口、TLS、客户端缓存 | `tests/test_egress.py`、`tests/test_system_proxy.py` 和 `test_units.py` 中对应用例；真实代理/TLS 路径加 `--network`。 |
 
 pytest 的文件路径、`::test_name` 和 `-k` 可进一步缩小范围。需要整个非网络组时才省略文件路径；默认组也不是每次小改动的必跑清单。
@@ -600,6 +606,7 @@ git diff --check
 
 | 测试文件 | 主要检查 |
 | --- | --- |
+| `test_startup` | 慢启动、线程异常与退出、错误分流、日志写入及上限、托盘失败收尾；网络组验证本机监听行为。 |
 | `test_proxy`、`test_lifecycle` | 转发、模型与请求头、分块、结束判定、中断收尾。 |
 | `test_routing` | 候选选择、停用、同名多接口隔离和配置冲突。 |
 | `test_admin` | 管理接口、保存校验、模型目录、数据库升级。 |

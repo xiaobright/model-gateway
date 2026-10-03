@@ -251,42 +251,9 @@ async def commit(model_name: str, groups: Iterable[BatchGroup]) -> dict[str, obj
     if not name or not wanted:
         return {"model_name": name, "committed": 0, "skipped": [], "protocols": []}
 
-    known = {g.id for g in db.list_groups()}
-    # 一次读全量再算：几十个分组的提交要走几十次读，逐个查会把一次点击拖成秒级
-    have_route = {(row["model_name"], row["group_id"], row["remote_model"]) for row in db.list_routes()}
-    catalogs = {gid: set(names) for gid, names in db.all_group_models().items()}
-
-    plans: list[tuple[db.Group, str]] = []
-    skipped: list[dict[str, object]] = []
-    for group_id, remote in wanted:
-        group = db.get_group(group_id) if group_id in known else None
-        if group is None:
-            skipped.append({"group_id": group_id, "reason": "分组不存在"})
-            continue
-        if not group.enabled:
-            # 扫描时它还是启用的，提交前被关掉了。静默跳过会让人以为「加了但没生效」
-            skipped.append({"group_id": group_id, "reason": "分组已停用"})
-            continue
-        if remote in catalogs.get(group_id, ()) and (name, group_id, remote) in have_route:
-            # 目录里已经登记过（只是没暴露）时不算重复，继续往下把候选补上
-            skipped.append({"group_id": group_id, "reason": "已经加过了"})
-            continue
-        plans.append((group, remote))
-
-    if not plans:
-        return {"model_name": name, "committed": 0, "skipped": skipped, "protocols": []}
-
-    db.add_group_models_many([(group.id, remote) for group, remote in plans])
-    added = 0
-    for group, remote in plans:
-        if db.add_model_route(name, group.id, remote):
-            added += 1
-    # 新候选排在链尾、链上可能原本一条都没有：批量加完之后确认这条链有活跃候选
-    db.reattach_active(name)
-
-    protocols = sorted({group.protocol for group, _ in plans})
+    result = db.add_model_routes_batch(name, wanted)
     log(
-        f"MODEL-ADD {name!r}: {added} candidate(s) over {len(plans)} group(s)"
-        f" [{', '.join(protocols)}]"
+        f"MODEL-ADD {name!r}: {result['committed']} candidate(s)"
+        f" [{', '.join(result['protocols'])}]"
     )
-    return {"model_name": name, "committed": added, "skipped": skipped, "protocols": protocols}
+    return result

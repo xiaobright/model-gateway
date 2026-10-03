@@ -46,6 +46,8 @@ uv pip install --python '.\.venv\Scripts\python.exe' -r requirements.txt
 
 已有 `.venv` 时跳过第一条，不要为了更新依赖重建环境。安装完成后再双击启动文件。
 
+开机时加载较慢，托盘会等待服务线程就绪，最长 60 秒。启动失败时会区分端口占用、系统拒绝绑定、初始化或线程异常与等待超时，并将详情写入 `data/startup.log`（每份 1 MiB，最多三份）。主线程崩溃还会写 `data/crash.log`。
+
 如果启动失败，想直接看报错，可在 PowerShell 里运行：
 
 ```powershell

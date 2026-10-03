@@ -3,6 +3,7 @@
 const NOTES = {
   truncated: ['流被截断', 'warn'], connect_failed: ['连接失败', 'crit'],
   upstream_abort: ['上游断流', 'crit'], client_abort: ['客户端断开', ''],
+  protocol_error: ['上游协议错误', 'crit'],
   manual_abort: ['手动中断', ''], stall_timeout: ['无内容超时', 'warn'],
   failed_over: ['失败后换站', 'warn'], hold_retry: ['截断后重试', 'warn'],
 };

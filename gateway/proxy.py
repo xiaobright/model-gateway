@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
+import anyio
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -138,6 +139,37 @@ class ClientDisconnected(Exception):
 RESPONSE_POLL = 0.05
 
 
+async def _close_response(response: httpx.Response) -> None:
+    # Starlette 的取消作用域中也要让连接归还完成。
+    with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
+        await response.aclose()
+
+
+async def _next_while_connected(request: Request, iterator: AsyncIterator[bytes]) -> bytes:
+    """扣住首块时 relay 尚未接管断开事件，主动检查且不延迟已到达的块。"""
+    task = asyncio.ensure_future(anext(iterator))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=RESPONSE_POLL)
+            if task in done:
+                return task.result()
+            if await request.is_disconnected():
+                raise ClientDisconnected
+    finally:
+        if not task.done():
+            task.cancel()
+        with anyio.CancelScope(shield=True), contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+def _observe_usage(proto: protocols.Protocol, head: bytes, tail: bytes) -> protocols.Usage:
+    try:
+        return proto.extract_usage(head, tail)
+    except Exception as exc:
+        log(f"  usage observe failed: {exc.__class__.__name__}: {exc}")
+        return NO_USAGE
+
+
 async def _send_until_headers(
     request: Request, client: httpx.AsyncClient, prepared: httpx.Request
 ) -> httpx.Response:
@@ -261,7 +293,7 @@ async def _hold_probe(
     decided = False
     while True:
         try:
-            chunk = await inflight.wait_for_upstream(call, anext(iterator))
+            chunk = await inflight.wait_for_upstream(call, _next_while_connected(request, iterator))
         except StopAsyncIteration:
             break
         except httpx.HTTPError as exc:
@@ -742,13 +774,17 @@ async def forward(
                 try:
                     probe = await _hold_probe(request, call, proto, resp, chunks_iter)
                 except ClientDisconnected:
-                    with contextlib.suppress(Exception):
-                        await resp.aclose()
+                    await _close_response(resp)
                     return abort_request("client_abort")
                 except inflight.ManualAbort:
-                    with contextlib.suppress(Exception):
-                        await resp.aclose()
+                    await _close_response(resp)
                     return abort_request("manual_abort")
+                except asyncio.CancelledError:
+                    try:
+                        abort_request("client_abort")
+                    finally:
+                        await _close_response(resp)
+                    raise
                 if (
                     probe.verdict == "bad"
                     and hold_counts.get(route.upstream.id, 0) < int(hold_rules["times"])
@@ -916,11 +952,14 @@ async def forward(
                     # 头填满之前每来一块都试一次：数字可能正好被切成两半，extract_usage
                     # 取最大值，所以多试几次一定会读到完整的那个
                     if b"input_tokens" in head:
-                        got = proto.extract_usage(bytes(head), b"")
+                        got = _observe_usage(proto, bytes(head), b"")
                         inflight.usage(call, tokens_in=proto.context_tokens(got))
                 tail.extend(chunk)
                 if cap is not None:
-                    cap.feed(chunk)
+                    try:
+                        cap.feed(chunk)
+                    except Exception as exc:
+                        log(f"  capture feed failed: {exc}")
                 # 观察器按完整 SSE 帧统计内容和结束事件；它不参与实际转发，解析出错也不能
                 # 影响下面的原始 chunk。
                 if observer is not None:
@@ -982,105 +1021,121 @@ async def forward(
             else:
                 log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
-            if observer is not None:
-                # flush 可能刚补完最后一帧；收尾时取一次，不在每个 chunk 复制诊断清单。
-                text_bytes, thinking = observer.text_bytes, observer.thinking
-                trace.observe_end(
-                    ended=observer.ended, oversized_frames=observer.oversized_frames,
-                    text_bytes=text_bytes,
-                )
-                inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
-                if compaction_capture:
-                    compaction_observations = observer.compaction_items
-                    response_event_types = observer.event_types
-                    response_payload_types = observer.payload_types
-            if cap is not None:
-                capture.finish(
-                    cap,
-                    status=upstream_resp.status_code,
-                    note=note,
-                    sent=sent,
-                    observer_ended=(observer.ended if observer is not None else None),
-                    event_types=(dict(observer.event_types) if observer is not None else {}),
-                    resp_headers=capture.sanitize_headers(upstream_resp.headers),
-                )
-            if json_capped:
-                log(f"  JSON observe skipped: 响应体超过 {MAX_JSON_OBSERVE_BYTES // 1048576}MB，不解析 usage")
-            if json_body and not json_capped:
-                try:
-                    json_payload = json.loads(json_body)
-                    if isinstance(json_payload, dict):
-                        if (json_payload.get("error") is not None
-                                or json_payload.get("status") in ("failed", "incomplete")):
-                            trace.event("protocol_error")
-                        text_bytes, thinking = proto.count_json_content(json_payload)
-                        if compaction_capture:
-                            compaction_observations = protocols.compaction_observations(json_payload)
-                            response_payload_types = capture.response_types(json_payload)
-                except Exception as exc:
-                    trace.event("observation_error")
-                    log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
-                inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
-            if compaction_capture:
-                capture.write_compaction_capture(
-                    request=request,
-                    payload=payload,
-                    route=won,
-                    remote_model=won_remote,
-                    status=upstream_resp.status_code,
-                    stream=stream_flag,
-                    req_bytes=won_bytes,
-                    resp_bytes=sent,
-                    elapsed=time.monotonic() - started,
-                    observations=compaction_observations,
-                    response_event_types=response_event_types,
-                    response_payload_types=response_payload_types,
-                )
-            # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
-            usage = proto.extract_usage(bytes(head), bytes(tail))
-            trace.end_attempt(status=upstream_resp.status_code, note=note, usage=usage)
-            trace.result(upstream_resp.status_code, note)
-            # 先落库（纯同步，即使外层在取消也能跑完），再还连接
-            inflight.finish(
-                call, status=upstream_resp.status_code, note=note, sent=sent,
-                tokens_in=proto.context_tokens(usage), tokens_out=usage[1] or 0,
-            )
-            if record:
-                _record(
-                    request=request, route=won, proto=proto, model=asked,
-                    remote_model=won_remote, status=upstream_resp.status_code,
-                    stream_flag=stream_flag, req_bytes=won_bytes,
-                    resp_bytes=sent, elapsed=time.monotonic() - started,
-                    usage=usage, note=note, attempt=won_attempt,
-                    text_bytes=text_bytes, thinking=thinking,
-                )
-            if won_rules is not None and observer is not None:
-                # 200 截断守卫的记账。只认**流式**响应（observer 就是「上游给的是 SSE」）：
-                # count_tokens、compaction 那些 JSON 响应既不该算坏，也不该把已经攒起来的
-                # 「连着坏」清掉。判据和 relay 记 truncated 的那一处对齐：
-                #   坏 = 2xx + 没有完成事件 + 一个正文字节都没有（公益站那种空响应）
-                #   好 = 真出了正文，或者干净地收了尾
-                # 客户端自己断开、页面手动中断、上游报错都不算数：下一次该不该扣照旧。
-                # 注意「好」里那条 `text_bytes`：出了正文就说明这份请求已经不是
-                # 「站上什么都拿不到」了，扣住它没有任何好处，只有多等一个首字的代价。
-                if (
-                    upstream_resp.status_code < 300
-                    and note in ("truncated", "upstream_abort")
-                    and not text_bytes
-                ):
-                    count = truncation.note_bad(
-                        won.group_id, asked, path,
-                        digest.hexdigest() if digest is not None else "",
+            usage = NO_USAGE
+            try:
+                if observer is not None:
+                    if (observer.protocol_error and upstream_resp.status_code < 300
+                            and note in ("ok", "truncated")):
+                        note = "protocol_error"
+                    # flush 可能刚补完最后一帧；收尾时取一次，不在每个 chunk 复制诊断清单。
+                    text_bytes, thinking = observer.text_bytes, observer.thinking
+                    trace.observe_end(
+                        ended=observer.ended, oversized_frames=observer.oversized_frames,
+                        text_bytes=text_bytes,
                     )
-                    if count == int(won_rules["after"]):
-                        log(
-                            f"  WARN 截断守卫：{won.upstream.name}/{won.group_name} 的 {asked} 连着 "
-                            f"{count} 次 200 空响应（无完成事件、无正文），下次先扣住重发"
+                    inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
+                    if compaction_capture:
+                        compaction_observations = observer.compaction_items
+                        response_event_types = observer.event_types
+                        response_payload_types = observer.payload_types
+                if json_capped:
+                    log(f"  JSON observe skipped: 响应体超过 {MAX_JSON_OBSERVE_BYTES // 1048576}MB，不解析 usage")
+                if json_body and not json_capped:
+                    try:
+                        json_payload = json.loads(json_body)
+                        if isinstance(json_payload, dict):
+                            if (json_payload.get("error") is not None
+                                    or json_payload.get("status") in ("failed", "incomplete")):
+                                trace.event("protocol_error")
+                                if upstream_resp.status_code < 300 and note == "ok":
+                                    note = "protocol_error"
+                            text_bytes, thinking = proto.count_json_content(json_payload)
+                            if compaction_capture:
+                                compaction_observations = protocols.compaction_observations(json_payload)
+                                response_payload_types = capture.response_types(json_payload)
+                    except Exception as exc:
+                        trace.event("observation_error")
+                        log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
+                    inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
+                if cap is not None:
+                    try:
+                        capture.finish(
+                            cap,
+                            status=upstream_resp.status_code,
+                            note=note,
+                            sent=sent,
+                            observer_ended=(observer.ended if observer is not None else None),
+                            event_types=(dict(observer.event_types) if observer is not None else {}),
+                            resp_headers=capture.sanitize_headers(upstream_resp.headers),
                         )
-                elif text_bytes or (note == "ok" and upstream_resp.status_code < 300):
-                    truncation.note_ok(won.group_id, asked, path)
-            with contextlib.suppress(Exception):
-                await upstream_resp.aclose()
+                    except Exception as exc:
+                        log(f"  capture finish failed: {exc}")
+                if compaction_capture:
+                    capture.write_compaction_capture(
+                        request=request,
+                        payload=payload,
+                        route=won,
+                        remote_model=won_remote,
+                        status=upstream_resp.status_code,
+                        stream=stream_flag,
+                        req_bytes=won_bytes,
+                        resp_bytes=sent,
+                        elapsed=time.monotonic() - started,
+                        observations=compaction_observations,
+                        response_event_types=response_event_types,
+                        response_payload_types=response_payload_types,
+                    )
+                # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
+                usage = _observe_usage(proto, bytes(head), bytes(tail))
+                trace.end_attempt(status=upstream_resp.status_code, note=note, usage=usage)
+                trace.result(upstream_resp.status_code, note)
+                # 先落库（纯同步，即使外层在取消也能跑完），再还连接
+                inflight.finish(
+                    call, status=upstream_resp.status_code, note=note, sent=sent,
+                    tokens_in=proto.context_tokens(usage), tokens_out=usage[1] or 0,
+                )
+                if record:
+                    _record(
+                        request=request, route=won, proto=proto, model=asked,
+                        remote_model=won_remote, status=upstream_resp.status_code,
+                        stream_flag=stream_flag, req_bytes=won_bytes,
+                        resp_bytes=sent, elapsed=time.monotonic() - started,
+                        usage=usage, note=note, attempt=won_attempt,
+                        text_bytes=text_bytes, thinking=thinking,
+                    )
+                if won_rules is not None and observer is not None:
+                    # 200 截断守卫的记账。只认**流式**响应（observer 就是「上游给的是 SSE」）：
+                    # count_tokens、compaction 那些 JSON 响应既不该算坏，也不该把已经攒起来的
+                    # 「连着坏」清掉。判据和 relay 记 truncated 的那一处对齐：
+                    #   坏 = 2xx + 没有完成事件 + 一个正文字节都没有（公益站那种空响应）
+                    #   好 = 真出了正文，或者干净地收了尾
+                    # 客户端自己断开、页面手动中断、上游报错都不算数：下一次该不该扣照旧。
+                    # 注意「好」里那条 `text_bytes`：出了正文就说明这份请求已经不是
+                    # 「站上什么都拿不到」了，扣住它没有任何好处，只有多等一个首字的代价。
+                    if (
+                        upstream_resp.status_code < 300
+                        and (note in ("truncated", "upstream_abort")
+                             or note == "protocol_error" and not observer.ended)
+                        and not text_bytes
+                    ):
+                        count = truncation.note_bad(
+                            won.group_id, asked, path,
+                            digest.hexdigest() if digest is not None else "",
+                        )
+                        if count == int(won_rules["after"]):
+                            log(
+                                f"  WARN 截断守卫：{won.upstream.name}/{won.group_name} 的 {asked} 连着 "
+                                f"{count} 次 200 空响应（无完成事件、无正文），下次先扣住重发"
+                            )
+                    elif text_bytes or (note == "ok" and upstream_resp.status_code < 300):
+                        truncation.note_ok(won.group_id, asked, path)
+            finally:
+                # 观察或记录出现意外异常时，核心注销和释放仍然执行。
+                try:
+                    if not call.done_at:
+                        inflight.finish(call, status=upstream_resp.status_code, note=note, sent=sent)
+                finally:
+                    await _close_response(upstream_resp)
 
     drop = RESP_DROP | _connection_tokens(upstream_resp.headers)
     passthrough = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in drop}

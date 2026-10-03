@@ -394,7 +394,8 @@ def _migrate_group_protocols(path) -> None:
             for row in conn.execute("SELECT id, protocols FROM upstreams")
         }
         conn.execute(_GROUPS_REBUILD)
-        for row in conn.execute("SELECT * FROM upstream_groups ORDER BY id").fetchall():
+        original_groups = conn.execute("SELECT * FROM upstream_groups ORDER BY id").fetchall()
+        for row in original_groups:
             protos = marks.get(row["upstream_id"], ("openai",))
             conn.execute(
                 "INSERT INTO upstream_groups_new"
@@ -403,6 +404,9 @@ def _migrate_group_protocols(path) -> None:
                 (row["id"], row["upstream_id"], row["name"], protos[0], row["api_key"],
                  row["enabled"], row["created_at"]),
             )
+        # 先占住全部原 ID，再分配额外协议的 ID，避免覆盖后面的原分组。
+        for row in original_groups:
+            protos = marks.get(row["upstream_id"], ("openai",))
             # 站点标了两种格式：另一种接口也留一个同 key 的空分组，别把填过的信息弄丢
             for extra in protos[1:]:
                 conn.execute(
@@ -629,6 +633,7 @@ def create_upstream(
     """只建供应商本身。分组（key + 接口）由调用方紧接着建 —— 接口得选，猜不出来。"""
     base = normalize_base(base_url)
     with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         _check_base_url(conn, base)
         try:
             cur = conn.execute(
@@ -654,6 +659,7 @@ def update_upstream(
 ) -> bool:
     base = normalize_base(base_url)
     with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         _check_base_url(conn, base, upstream_id)
         try:
             cur = conn.execute(
@@ -745,6 +751,7 @@ def update_group(
     接口一旦有候选就不给改了：候选是「这个模型在这个接口下暴露」的唯一记录，改了接口
     等于悄悄把一批模型换到另一种线格式上。"""
     with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT protocol FROM upstream_groups WHERE id=?", (group_id,)).fetchone()
         if row is None:
             return False
@@ -963,39 +970,66 @@ def add_model_route(model_name: str, group_id: int, remote_model: str) -> int:
     活跃位、顺序都是**链内**（模型名 + 接口）的概念：同一模型名可以在另一种接口下
     另有一条独立链，两边的首选和优先级互不影响。"""
     with _conn() as conn:
-        # 先查后写要串行：并发双击新增同一条候选时，UNIQUE 约束会以 IntegrityError 冒到 500
         conn.execute("BEGIN IMMEDIATE")
-        exists = conn.execute(
-            "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
-            (model_name, group_id, remote_model),
-        ).fetchone()
-        if exists:
-            return 0
-        mine = _group_protocol(conn, group_id)
-        count = conn.execute(
-            "SELECT COUNT(*) AS n FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
-            " WHERE m.model_name=? AND g.protocol=?",
-            (model_name, mine),
-        ).fetchone()["n"]
-        # 新候选排在链尾：自动降级按 priority 从小到大试，刚加的那个不该抢到最前面去
-        nxt = conn.execute(
-            "SELECT COALESCE(MAX(m.priority), -1) + 1 AS p FROM model_routes m"
-            " JOIN upstream_groups g ON g.id = m.group_id"
-            " WHERE m.model_name=? AND g.protocol=?",
-            (model_name, mine),
-        ).fetchone()["p"]
-        # 暴露一个下游模型时顺手把上游真名登记进目录：它必然是这个站的一个上游模型，
-        # 不登记的话上游站点那列会漏掉它
-        conn.execute(
-            "INSERT OR IGNORE INTO group_models(group_id, remote_model) VALUES(?,?)",
-            (group_id, remote_model),
-        )
-        cur = conn.execute(
-            "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
-            " VALUES(?,?,?,?,?)",
-            (model_name, group_id, remote_model, 1 if count == 0 else 0, nxt),
-        )
+        return _add_model_route(conn, model_name, group_id, remote_model)
+
+
+def _add_model_route(conn: sqlite3.Connection, model_name: str, group_id: int, remote_model: str) -> int:
+    """调用方已持有写事务；单条与批量添加共用候选排序和活跃位规则。"""
+    exists = conn.execute(
+        "SELECT 1 FROM model_routes WHERE model_name=? AND group_id=? AND remote_model=?",
+        (model_name, group_id, remote_model),
+    ).fetchone()
+    if exists:
+        return 0
+    mine = _group_protocol(conn, group_id)
+    count = conn.execute(
+        "SELECT COUNT(*) AS n FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+        " WHERE m.model_name=? AND g.protocol=?",
+        (model_name, mine),
+    ).fetchone()["n"]
+    # 新候选排在链尾：自动降级按 priority 从小到大试，刚加的那个不该抢到最前面去
+    nxt = conn.execute(
+        "SELECT COALESCE(MAX(m.priority), -1) + 1 AS p FROM model_routes m"
+        " JOIN upstream_groups g ON g.id = m.group_id"
+        " WHERE m.model_name=? AND g.protocol=?",
+        (model_name, mine),
+    ).fetchone()["p"]
+    # 暴露一个下游模型时顺手把上游真名登记进目录：它必然是这个站的一个上游模型，
+    # 不登记的话上游站点那列会漏掉它
+    conn.execute(
+        "INSERT OR IGNORE INTO group_models(group_id, remote_model) VALUES(?,?)",
+        (group_id, remote_model),
+    )
+    cur = conn.execute(
+        "INSERT INTO model_routes(model_name, group_id, remote_model, is_active, priority)"
+        " VALUES(?,?,?,?,?)",
+        (model_name, group_id, remote_model, 1 if count == 0 else 0, nxt),
+    )
     return int(cur.lastrowid)
+
+
+def add_model_routes_batch(model_name: str, pairs: Iterable[tuple[int, str]]) -> dict[str, object]:
+    """检查当前分组、登记目录和候选在同一事务内完成；异常整批回滚。"""
+    skipped: list[dict[str, object]] = []
+    protocols: set[str] = set()
+    added = 0
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        groups = {row["id"]: row for row in conn.execute("SELECT id, protocol, enabled FROM upstream_groups")}
+        for group_id, remote in pairs:
+            group = groups.get(group_id)
+            if group is None or not group["enabled"]:
+                skipped.append({"group_id": group_id, "reason": "分组不存在" if group is None else "分组已停用"})
+                continue
+            if not _add_model_route(conn, model_name, group_id, remote):
+                skipped.append({"group_id": group_id, "reason": "已经加过了"})
+                continue
+            added += 1
+            protocols.add(group["protocol"])
+        if added:
+            _reattach_active(conn, model_name)
+    return {"model_name": model_name, "committed": added, "skipped": skipped, "protocols": sorted(protocols)}
 
 
 def update_model_route(route_id: int, remote_model: str) -> bool:

@@ -802,7 +802,8 @@ INSERT INTO request_log(client, model, upstream, status, stream, req_bytes, resp
 """
 
 
-def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
+@pytest.mark.parametrize("early_multi_protocol", [False, True])
+def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch, early_multi_protocol):
     """上一版结构：接口标记挂在 upstreams.protocols 上、base_url 填到 /v1。
     迁移要把接口搬到分组上、把 base_url 收成站根，候选和历史记录一条不少。"""
     import sqlite3
@@ -817,6 +818,8 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
 
     old = sqlite3.connect(db_path)
     old.executescript(_PRE_PROTOCOL_SCHEMA)
+    if early_multi_protocol:
+        old.execute("UPDATE upstreams SET protocols='openai,anthropic' WHERE id=1")
     old.commit()
     old.close()
 
@@ -835,7 +838,7 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
 
     by_upstream = {u.id: u.name for u in db.list_upstreams()}
     got = {(by_upstream[g.upstream_id], g.name, g.protocol, g.api_key) for g in db.list_groups()}
-    assert got == {
+    expected = {
         ("gpt-site", "默认", "openai", "sk-aaa"),
         ("gpt-site", "luna", "openai", "sk-luna"),
         ("claude-site", "默认", "anthropic", "sk-bbb"),
@@ -844,6 +847,9 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
         ("both", "默认", "openai", "sk-ccc"),
         ("both", "默认", "anthropic", "sk-ccc"),
     }
+    if early_multi_protocol:
+        expected.update({("gpt-site", "默认", "anthropic", "sk-aaa"), ("gpt-site", "luna", "anthropic", "sk-luna")})
+    assert got == expected
 
     rows = db.list_routes()
     assert {(r["model_name"], r["group_name"], r["remote_model"], r["protocol"]) for r in rows} == {
@@ -864,7 +870,7 @@ def test_migration_moves_the_protocol_mark_onto_groups(tmp_path, monkeypatch):
     assert db.add_model_route("m1", first["group_id"], "remote-1") == 0, "一模一样的还是重复"
 
     db.init_db()   # 幂等
-    assert len(db.list_groups()) == 5
+    assert len(db.list_groups()) == (7 if early_multi_protocol else 5)
     assert len(list(data_dir.glob("gateway.db.bak-*"))) == 1
 
 

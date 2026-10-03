@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 import webbrowser
 
 from gateway import config
+from gateway.startup import StartupError, configure_logging, logger
 
 
 def _port_arg(value: str) -> int:
@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    log_path = configure_logging()
+    logger.info("网关进程启动 executable=%s", sys.executable)
     args = parse_args()
     if args.tray and args.no_tray:
         print("--tray 与 --no-tray 互斥", file=sys.stderr)
@@ -38,18 +40,24 @@ def main() -> int:
     if use_tray:
         from gateway import tray as tray_mod
         from gateway import server as server_mod
-        from gateway.server import start_server_thread
+        from gateway.server import start_server_thread, wait_for_startup
 
         if not tray_mod.acquire_single_instance():
+            logger.info("已有托盘实例，当前进程退出")
             return 0
 
-        server, thread = start_server_thread(args.port)
-        for _ in range(100):
-            if server.started:
-                break
-            time.sleep(0.1)
-        if not server.started:
-            tray_mod.msgbox(f"启动失败：端口 {args.port} 可能被占用，或配置有误")
+        server = thread = None
+        try:
+            server, thread = start_server_thread(args.port)
+            wait_for_startup(server, thread)
+        except StartupError as exc:
+            logger.error("启动未完成 kind=%s: %s", exc.kind, exc)
+            if server is not None:
+                server.should_exit = True
+            if thread is not None:
+                thread.join(timeout=5)
+            detail = f"详情见 {log_path}" if log_path is not None else "启动日志无法写入，请检查 data 目录权限。"
+            tray_mod.msgbox(f"{exc.message(args.port)}\n\n{detail}")
             return 1
 
         if args.open_ui:
@@ -85,6 +93,7 @@ if __name__ == "__main__":
         import traceback
 
         tb = traceback.format_exc()
+        logger.exception("网关主线程异常")
         try:
             config.DATA_DIR.mkdir(parents=True, exist_ok=True)
             (config.DATA_DIR / "crash.log").write_text(tb, encoding="utf-8")

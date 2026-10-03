@@ -53,18 +53,32 @@ _CHAT_THINK = re.compile(rb'"(?:reasoning_content|reasoning)":\s*"((?:[^"\\]|\\.
 _TOOL_DELTA = re.compile(rb'"(?:partial_json|arguments)":\s*"')
 
 
+# 单次请求的计量上限；也避免把超大整数传进 SQLite 或浏览器。
+MAX_USAGE_TOKENS = 10**12
+
+
+def _usage_number(raw: bytes) -> int | None:
+    if len(raw) > 13:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if 0 <= value <= MAX_USAGE_TOKENS else None
+
+
 def _last(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
     """最后一次出现的值：流式 usage 会被多次改写，最后那次才是终值。"""
     for buf in reversed(bufs):
         found = pattern.findall(buf)
         if found:
-            return int(found[-1])
+            return _usage_number(found[-1])
     return None
 
 
 def _largest(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
     """所有出现里最大的那个。用于只报一次终值、但可能被别处写成占位 0/1 的字段。"""
-    values = [int(v) for buf in bufs for v in pattern.findall(buf)]
+    values = [n for buf in bufs for v in pattern.findall(buf) if (n := _usage_number(v)) is not None]
     return max(values) if values else None
 
 
@@ -386,6 +400,7 @@ class SSEObserver:
         self._collect_compaction = collect_compaction
         self._buffer = bytearray()
         self.ended = False
+        self.protocol_error = False
         self.text_bytes = 0
         self.thinking = False
         # 正文/推理/工具参数增量出现过几次。「吐字」之后发呆超时才计时，见 proxy relay
@@ -457,7 +472,7 @@ class SSEObserver:
 
         data_text = data_bytes.decode("utf-8", "ignore").strip()
         payload: object = None
-        if data_text and (self._collect_types or not event or self._on_event is not None):
+        if data_text and data_text not in self.proto.end_data_markers:
             try:
                 payload = json.loads(data_text)
             except (TypeError, ValueError):
@@ -479,6 +494,7 @@ class SSEObserver:
             self._notify("malformed", 0)
         if (kind in {"error", "response.failed", "response.incomplete"}
                 or isinstance(payload, dict) and payload.get("error") is not None):
+            self.protocol_error = True
             self._notify("protocol_error", 0)
         elif (event in self.proto.end_event_types or data_text in self.proto.end_data_markers
               or not event and kind in self.proto.end_event_types):

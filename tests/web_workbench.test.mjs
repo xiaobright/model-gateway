@@ -38,7 +38,7 @@ test('转发按模型及协议解析，并显示最终目标；断链与停用�
 });
 
 test('请求结果优先于 HTTP 200，主动中断与未知结果不画成成功', () => {
-  for (const note of ['truncated', 'hold_retry', 'upstream_abort', 'stall_timeout', 'failed_over']) {
+  for (const note of ['truncated', 'hold_retry', 'upstream_abort', 'stall_timeout', 'failed_over', 'protocol_error']) {
     const result = requestResult({ status: 200, note });
     assert.equal(result.issue, true);
     assert.notEqual(result.tone, 'good');
@@ -51,6 +51,7 @@ test('请求结果优先于 HTTP 200，主动中断与未知结果不画成成�
   assert.equal(requestResult({ status: 503 }).label, '请求失败');
   assert.equal(requestResult({ status: 0 }).label, '未收到响应');
   assert.equal(requestResult({ status: 200, note: 'ok' }).issue, false);
+  assert.equal(requestResult({ status: 200, note: 'protocol_error' }).label, '上游协议错误');
 });
 
 test('隐藏画布不取布局、不生成节点或安排动画帧；打开时只发一个布局请求', async () => {

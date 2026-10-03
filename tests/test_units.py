@@ -302,7 +302,8 @@ def test_ca_pin_trusts_a_self_signed_proxy_and_nothing_else_does():
         assert "certificate" in str(ei.value).lower()
 
 
-def test_client_args_verifies_upstream_tls_against_the_system_trust_store(monkeypatch):
+@pytest.mark.parametrize("system_proxy", [(), (("https", "http://127.0.0.1:7890"),)])
+def test_client_args_verifies_upstream_tls_against_the_system_trust_store(monkeypatch, system_proxy):
     """上游 TLS 用系统证书库验：卡巴斯基这类杀软 MITM 的根也能过（2026-09-11 实锤）。
 
     httpx 自带的 CA 捆绑包不认杀软装进系统库的根证书，curl/浏览器能通、网关 502。
@@ -311,19 +312,28 @@ def test_client_args_verifies_upstream_tls_against_the_system_trust_store(monkey
     from gateway import upstream as upstream_mod
 
     # 保留真正的系统 SSLContext 构造；不为无关的回环 mounts 重载证书。
-    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda: object())
+    transports = []
+    def transport(**kwargs):
+        transports.append(kwargs)
+        return object()
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", transport)
     try:
         import truststore  # noqa: F401
         installed = True
     except ImportError:
         installed = False
 
-    args = upstream_mod.client_args("")
+    args = upstream_mod.client_args("", system_proxy=system_proxy)
     if installed:
         import ssl as _ssl
         assert isinstance(args.get("verify"), _ssl.SSLContext)
     else:
         assert "verify" not in args
+    proxy_transports = [kw for kw in transports if kw.get("proxy")]
+    assert len(proxy_transports) == len(system_proxy)
+    for kwargs in proxy_transports:
+        assert kwargs["verify"] is args.get("verify", True)
+        assert kwargs["trust_env"] is False
 
 
 def test_input_item_census_records_the_role_alongside_the_type():
