@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Gateway · 控制台改版样稿</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234c8dff'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="console-demo.css">
+<script>
+  // 先定主题再渲染，避免深浅色闪一下
+  try { const t = localStorage.getItem('mg-console-demo-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch {}
+</script>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">M</span><span>Model Gateway</span></div>
+    <span class="pill" title="样稿使用内置演示数据，不连接网关"><span class="dot ok"></span>127.0.0.1:8317 · 演示数据</span>
+    <button class="cmdk-btn" data-act="cmdk" aria-label="打开命令面板">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+      <span class="t grow">搜索模型、跳转页面、执行操作…</span><kbd>Ctrl</kbd><kbd>K</kbd>
+    </button>
+    <button class="btn btn-ghost btn-icon" data-act="theme" title="切换深浅色" aria-label="切换深浅色">◐</button>
+    <a class="btn btn-ghost btn-sm" href="../home-styles/home-style-gallery.html" title="查看首页四种备用风格对比">其他备用样稿</a>
+    <a class="btn btn-ghost btn-sm" href="/#routes" title="返回正在使用的管理页（需通过网关地址打开本样稿）">返回正式页面</a>
+  </header>
+
+  <nav class="rail" id="rail" aria-label="页面导航"></nav>
+
+  <main class="content" id="content">
+    <section class="view" data-view="routes" hidden></section>
+    <section class="view" data-view="flow" hidden></section>
+    <section class="view" data-view="live" hidden></section>
+    <section class="view" data-view="log" hidden></section>
+    <section class="view" data-view="upstreams" hidden></section>
+    <section class="view" data-view="settings" hidden></section>
+  </main>
+
+  <footer class="statusbar" id="statusbar"></footer>
+</div>
+
+<aside class="drawer" id="drawer" aria-label="请求详情" aria-hidden="true">
+  <div class="drawer-head"><h2 id="drawer-title">请求详情</h2><span id="drawer-status"></span><button class="x" data-act="close-drawer" aria-label="关闭详情">✕</button></div>
+  <div class="drawer-body" id="drawer-body"></div>
+  <div class="drawer-foot" id="drawer-foot"></div>
+</aside>
+
+<dialog id="cmdk" aria-label="命令面板">
+  <input class="cmdk-input" id="cmdk-input" placeholder="输入模型名、页面或操作…" autocomplete="off" spellcheck="false" aria-controls="cmdk-list">
+  <div class="cmdk-list" id="cmdk-list" role="listbox"></div>
+  <div class="cmdk-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> 选择</span><span><kbd>Enter</kbd> 执行</span><span><kbd>Esc</kbd> 关闭</span></div>
+</dialog>
+
+<dialog id="route-dlg">
+  <form id="route-form" method="dialog">
+    <div class="dlg-head"><h2 id="route-dlg-title">新增模型</h2><button type="button" class="x" data-act="close-dlg" aria-label="关闭">✕</button></div>
+    <div class="dlg-body">
+      <label id="rd-name-wrap">模型名（客户端按这个名字调用）<input type="text" id="rd-name" placeholder="如 my-chat" autocomplete="off"></label>
+      <label id="rd-proto-wrap">在哪种接口下暴露<select id="rd-proto"></select></label>
+      <label>上游分组<select id="rd-group"></select></label>
+      <label>上游那边的真实模型名<input type="text" id="rd-remote" list="rd-remote-list" autocomplete="off"><datalist id="rd-remote-list"></datalist></label>
+      <p class="dim" style="margin:0;font-size:12px">样稿内的改动只保存在当前页面，刷新后恢复。</p>
+    </div>
+    <div class="dlg-foot"><span class="grow"></span><button type="button" class="btn btn-ghost" data-act="close-dlg">取消</button><button type="submit" class="btn" id="rd-save">添加</button></div>
+  </form>
+</dialog>
+
+<dialog id="fwd-dlg">
+  <form id="fwd-form" method="dialog">
+    <div class="dlg-head"><h2 id="fwd-title">整条链交给…</h2><button type="button" class="x" data-act="close-dlg" aria-label="关闭">✕</button></div>
+    <div class="dlg-body">
+      <label>接到哪个下游模型（只能选同一接口）<select id="fwd-target"></select></label>
+      <p class="dim" style="margin:0;font-size:12px">交接后这个模型自己的候选保留但不参与路由，请求按目标的候选链走；绕成圈会被拒绝。</p>
+    </div>
+    <div class="dlg-foot"><button type="button" class="btn btn-danger" id="fwd-clear" data-act="unforward">取消交接</button><span class="grow"></span><button type="button" class="btn btn-ghost" data-act="close-dlg">取消</button><button type="submit" class="btn">交接</button></div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="console-demo.js"></script>
+</body>
+</html>

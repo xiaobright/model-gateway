@@ -3,6 +3,7 @@
 本目录集中保存未启用的首页实验，供以后比较、替换或融合。正式首页继续使用现有版本，运行时不加载这些样稿。
 
 - [四种风格对比](home-style-gallery.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/home-styles/home-style-gallery.html>。顶部可切换单版或并排比较，也可在浏览器内收藏喜欢的风格。
+- [控制台重构样稿](../console-redesign/console-demo.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/console-redesign/console-demo.html>。石墨工作台、流水线候选卡片、三列流量关系图、实时请求瀑布轴与统一排查抽屉。
 - [液态玻璃实验](liquid-glass-lab.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/home-styles/liquid-glass-lab.html>。保留 CSS、均衡、极致三档和测量面板。
 - [液态玻璃性能记录](liquid-glass-benchmark.md)及[原始测量数据](liquid-glass-benchmark.json)：保留实验当时的对照结果与适用边界。
 
