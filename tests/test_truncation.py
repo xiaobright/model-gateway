@@ -402,3 +402,56 @@ def test_hold_retry_roundtrip_via_admin(gateway):
                 json={"name": "siteA", "base_url": a.base_url, "hold_retry": bad},
             )
             assert resp.status_code == 400, f"{bad} 应该被拒：{resp.text}"
+
+
+def test_protocol_error_200_is_held_and_resent_until_good(gateway):
+    """200 下返回协议错误（带完成事件且无正文）：连着坏之后被扣住并在原站重发。"""
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA", "openai")
+        _set_hold(gateway, provider_id(gateway, "siteA"), '{"after":2,"times":3,"delay_ms":0}')
+        add_route(gateway, "gpt-6-astra", g)
+        a.stream_script("protocol_error", "protocol_error", "protocol_error", "good")
+
+        for _ in range(2):
+            resp = gateway.post("/v1/responses", json=BODY)
+            assert resp.status_code == 200
+
+        rows = wait_rows(gateway, 2)
+        assert [(r["status"], r["note"]) for r in rows] == [(200, "protocol_error"), (200, "protocol_error")]
+        assert all(r["resp_bytes"] > 0 and r["resp_text_bytes"] == 0 for r in rows)
+        assert len(_armed(gateway)) == 1 and _armed(gateway)[0]["fails"] == 2
+
+        third = gateway.post("/v1/responses", json=BODY)
+        assert third.status_code == 200
+        assert "[DONE]" in third.text
+
+        rows = wait_rows(gateway, 4)
+        assert [(r["status"], r["note"]) for r in rows] == [
+            (200, "protocol_error"),
+            (200, "protocol_error"),
+            (200, "hold_retry"),
+            (200, "ok"),
+        ]
+        assert _armed(gateway) == []
+
+
+def test_protocol_error_exhausts_times(gateway):
+    """protocol_error 重发次数用完仍是错误：把最后一次原样交下去。"""
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA", "openai")
+        _set_hold(gateway, provider_id(gateway, "siteA"), '{"after":2,"times":2}')
+        add_route(gateway, "gpt-6-astra", g)
+        a.stream_script(*(["protocol_error"] * 8))
+
+        for _ in range(2):
+            gateway.post("/v1/responses", json=BODY)
+        wait_rows(gateway, 2)
+
+        third = gateway.post("/v1/responses", json=BODY)
+        assert third.status_code == 200
+
+        rows = wait_rows(gateway, 5)
+        assert [r["note"] for r in rows] == [
+            "protocol_error", "protocol_error",
+            "hold_retry", "hold_retry", "protocol_error",
+        ]

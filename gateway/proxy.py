@@ -315,12 +315,12 @@ async def _hold_probe(
         inflight.progress(
             call, held.sent, text_bytes=observer.text_bytes, thinking=observer.thinking
         )
-        # 已经有正文/完成事件了：再扣下去只是白白拖慢正常请求
-        if observer.ended or observer.content_events:
+        if seen_error or observer.protocol_error:
+            held.verdict = "bad"
             decided = True
             break
-        if seen_error:
-            held.verdict = "bad"
+        # 已经有正文/完成事件了：再扣下去只是白白拖慢正常请求
+        if observer.content_events or observer.ended:
             decided = True
             break
         if held.sent > truncation.MAX_HOLD_BYTES:
@@ -333,7 +333,9 @@ async def _hold_probe(
         # 上游 EOF 才停下来的：没有完成事件、也没有一个正文字节，就是 200 截断
         with contextlib.suppress(Exception):
             observer.flush()
-        if not observer.ended and not observer.content_events:
+        if seen_error or observer.protocol_error:
+            held.verdict = "bad"
+        elif not observer.ended and not observer.content_events:
             held.verdict = "bad"
     held.text_bytes = observer.text_bytes
     held.digest = hasher.hexdigest()
@@ -1114,8 +1116,7 @@ async def forward(
                     # 「站上什么都拿不到」了，扣住它没有任何好处，只有多等一个首字的代价。
                     if (
                         upstream_resp.status_code < 300
-                        and (note in ("truncated", "upstream_abort")
-                             or note == "protocol_error" and not observer.ended)
+                        and note in ("truncated", "upstream_abort", "protocol_error")
                         and not text_bytes
                     ):
                         count = truncation.note_bad(
@@ -1125,7 +1126,7 @@ async def forward(
                         if count == int(won_rules["after"]):
                             log(
                                 f"  WARN 截断守卫：{won.upstream.name}/{won.group_name} 的 {asked} 连着 "
-                                f"{count} 次 200 空响应（无完成事件、无正文），下次先扣住重发"
+                                f"{count} 次 200 异常响应（无正文，含截断/断流/协议错误），下次先扣住重发"
                             )
                     elif text_bytes or (note == "ok" and upstream_resp.status_code < 300):
                         truncation.note_ok(won.group_id, asked, path)

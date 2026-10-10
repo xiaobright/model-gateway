@@ -196,6 +196,11 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                     for _ in range(4):
                         yield b'data: {"type":"response.in_progress"}\n\n'
                     return
+                # "protocol_error"：200 下返回错误信封并带完成标记，模拟公益站报错
+                if step == "protocol_error":
+                    yield b'event: error\ndata: {"error":{"message":"rate limit exceeded: token limit"}}\n\n'
+                    yield b"data: [DONE]\n\n"
+                    return
                 # "delta" / "delta_cut"：正文增量（观察器按它统计「收到多少正文」）加
                 # 完成事件 / 加一处截断。200 截断拦截「一见到正文就放行」靠的就是它。
                 if step in ("delta", "delta_cut"):

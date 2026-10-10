@@ -183,7 +183,7 @@ def test_protocol_failure_preserves_bytes_but_changes_all_result_views(app, monk
     assert inflight.snapshot()["recent"][0]["note"] == "protocol_error"
     assert inflight.counts()["requests"] == 0
     group = db.list_groups(primary.id)[0]
-    assert truncation.fails(group.id, "m", "/responses") == int(content_type == "text/event-stream" and b"[DONE]" not in raw)
+    assert truncation.fails(group.id, "m", "/responses") == int(content_type == "text/event-stream")
 
 
 @pytest.mark.parametrize("failure", ["flag_permission", "capture_finish", "usage_parser", "huge_usage"])
