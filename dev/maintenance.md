@@ -32,6 +32,7 @@
 | `gateway/protocols.py` | 各接口的名称、鉴权方式、结束事件、用量读取和页面展示信息。 |
 | `gateway/db.py` | 配置和记录的读写、数据库升级、模型候选查询。 |
 | `gateway/model_batch.py` | 「批量添加新模型」：名字相似度打分、并发扫描所有分组、批量登记与挂候选。 |
+| `gateway/model_match.py` | 分组拉模型列表时的下游对应建议：完全/部分匹配分档、已暴露标记；打分复用 model_batch.score。 |
 | `gateway/failover.py` | 重试规则、候选顺序和分组冷却。 |
 | `gateway/truncation.py` | 200 截断拦截：连着拿回空响应就扣住、原站重发。 |
 | `gateway/upstream.py` | 站点地址、鉴权头、出口/TLS、共享连接池和上游模型列表。 |
@@ -553,6 +554,7 @@ uv run .venv\Scripts\python.exe -m pytest tests/test_canvas.py -q -p no:cachepro
 | --- | --- |
 | 启动等待、错误提示与日志 | `tests/test_startup.py`；再用同文件 `--network` 检查实际端口占用、临时库起停和超时后的迟到收尾。 |
 | 画布坐标、模型批量添加 | `tests/test_canvas.py` 或 `tests/test_model_batch.py`；界面同时改动时加 Node 测试。 |
+| 分组拉取模型的下游对应 | `tests/test_model_match.py`；界面同时改动时加 `tests/web_app.test.mjs`。 |
 | 路由、模型转发 | `tests/test_routing.py`、`tests/test_forwards.py`，以及改动涉及的 `test_proxy` 用例。 |
 | 重试、冷却 | `tests/test_same_retry.py`、`tests/test_failover.py`；取消等待还需相关 `test_lifecycle` 用例。 |
 | 200 截断拦截 | `tests/test_truncation.py`；改动扣住/重发的落点时加对应 `test_proxy` 用例。 |
@@ -611,6 +613,7 @@ git diff --check
 | `test_routing` | 候选选择、停用、同名多接口隔离和配置冲突。 |
 | `test_admin` | 管理接口、保存校验、模型目录、数据库升级。 |
 | `test_model_batch` | 批量添加模型：名字相似度分级、扫描不写配置、单站失败与其他站隔离、提交幂等与跨接口各一条链。 |
+| `test_model_match` | 分组拉取模型的下游对应：完全/部分匹配分档与并列时的确定性、plan 接口只读、已暴露标记、纯转发模型不列为目标。 |
 | `test_forwards` | 下游→下游转发：多跳、成环与死链校验、候选保留和恢复。 |
 | `test_canvas` | 编排画布坐标：存取、剪枝、坏输入退化，以及「坐标不影响路由」。 |
 | `test_failover`、`test_same_retry` | 换候选、冷却、同站重试及限制。 |

@@ -257,6 +257,158 @@ test('模型写入后的刷新晚到时，不重画新弹窗', async (t) => {
   assert.equal(h.evaluate('pickerPaints'), paints);
 });
 
+/* -------------------------------------------------- 分组选择器：对应到哪个下游 */
+
+const stubPickLabels = (h, rows) => {
+  const labels = rows.map((r) => ({
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: false, dataset: { name: r.name } }
+      : { value: r.map }),
+  }));
+  h.element('grp-picker').querySelectorAll = (sel) => (sel.includes('label') ? labels : []);
+  return labels;
+};
+
+test('分组选择器：每行带「对应到哪个下游」，默认按档位预选，已暴露的锁着', async (t) => {
+  const h = harness(t);
+  const gid = 61;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: ['gpt-test'] }])];
+  await editGroup(h, gid, 'key-A');
+  h.evaluate(`
+    pulled = ['gpt-test', 'kimi-k2', 'gpt-test-2024', 'locked-one'];
+    pickPlans = new Map([
+      ['gpt-test', { exact: ['gpt-test'], partial: [], exposed_as: [] }],
+      ['kimi-k2', { exact: [], partial: [], exposed_as: [] }],
+      ['gpt-test-2024', { exact: [], partial: ['gpt-test'], exposed_as: [] }],
+      ['locked-one', { exact: [], partial: [], exposed_as: ['my-chat'] }],
+    ]);
+    renderPicker();
+  `);
+  const html = h.element('grp-picker').innerHTML;
+  assert.match(html, /<option value="down:gpt-test" selected>对应到完全匹配：gpt-test<\/option>/,
+    '完全同名默认对应到它');
+  assert.match(html, /<option value="new" selected>新开下游模型：kimi-k2<\/option>/,
+    '下游没有的默认新开');
+  assert.match(html, /<option value="catalog" selected>只留着，不对下游展示<\/option>/,
+    '只沾一部分的默认只留着');
+  assert.match(html, /对应到部分匹配：gpt-test/, '部分匹配也给选项');
+  assert.match(html, /data-name="locked-one"[\s\S]*?disabled/, '已暴露的行是锁着的');
+  assert.match(html, /已暴露给下游：my-chat/);
+});
+
+test('拉取模型列表后，一并问回每个名字对应到哪些下游', async (t) => {
+  const h = harness(t);
+  const gid = 62;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
+  await editGroup(h, gid, 'key-A');
+  const pulling = h.app.actions['pull-models']();
+  const seen = h.requests.length;
+  h.latest().resolve({ models: ['gpt-test'] });     // GET remote-models
+  for (let i = 0; i < 20 && h.requests.length <= seen; i++) await tick();
+  const planJob = h.latest();
+  assert.equal(planJob.path, `/admin/api/groups/${gid}/models/plan`);
+  assert.deepEqual(planJob.body, { model_names: ['gpt-test'] });
+  planJob.resolve({
+    plans: [{ remote_model: 'gpt-test', exact: ['gpt-test'], partial: [], exposed_as: [] }],
+  });
+  await pulling;
+  assert.match(h.element('grp-picker').innerHTML, /对应到完全匹配：gpt-test/);
+});
+
+test('分组选择器：勾上时按选择框对应到下游，发的是建候选', async (t) => {
+  const h = harness(t);
+  const gid = 63;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
+  await editGroup(h, gid, 'key-A');
+  h.evaluate(`
+    pulled = ['kimi-k2'];
+    pickPlans = new Map([['kimi-k2', { exact: [], partial: [], exposed_as: [] }]]);
+    renderPicker();
+  `);
+  const label = {
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: true, dataset: { name: 'kimi-k2' } }
+      : { value: 'new' }),
+  };
+  const adding = h.app.actions['pick-toggle']({ name: 'kimi-k2' }, { checked: true, closest: () => label });
+  const job = h.latest();
+  assert.equal(job.path, '/admin/api/models');
+  assert.deepEqual(job.body, { model_name: 'kimi-k2', group_id: gid, remote_model: 'kimi-k2' });
+  job.resolve({ route_id: 7, model_name: 'kimi-k2', group_id: gid, remote_model: 'kimi-k2', protocol: 'openai' });
+  h.releaseRefreshes();
+  await adding;
+  assert.match(h.toasts.at(-1)[0], /已新建下游模型 kimi-k2/);
+  // 对应过之后那一行锁着，只说明现状
+  assert.match(h.element('grp-picker').innerHTML, /已暴露给下游：kimi-k2/);
+});
+
+test('分组选择器：没勾的行换选择只是记下，勾上的行换选择当场对应', async (t) => {
+  const h = harness(t);
+  const gid = 64;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
+  await editGroup(h, gid, 'key-A');
+  h.evaluate(`
+    pulled = ['gpt-test-2024'];
+    pickPlans = new Map([['gpt-test-2024', { exact: [], partial: ['gpt-test'], exposed_as: [] }]]);
+    renderPicker();
+  `);
+  const unchecked = {
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: false, dataset: { name: 'gpt-test-2024' } }
+      : { value: 'down:gpt-test' }),
+  };
+  const seen = h.requests.length;
+  await h.app.actions['pick-map']({ name: 'gpt-test-2024' },
+    { value: 'down:gpt-test', closest: () => unchecked });
+  assert.equal(h.requests.length, seen, '没勾的行不该发请求');
+  assert.equal(h.evaluate('pickPending.get("gpt-test-2024")'), 'down:gpt-test');
+  // 重画之后待生效的选择还在，不会被默认值冲掉
+  h.evaluate('renderPicker()');
+  assert.match(h.element('grp-picker').innerHTML, /<option value="down:gpt-test" selected>/);
+
+  const checked = {
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: true, dataset: { name: 'gpt-test-2024' } }
+      : { value: 'down:gpt-test' }),
+  };
+  const mapping = h.app.actions['pick-map']({ name: 'gpt-test-2024' },
+    { value: 'down:gpt-test', closest: () => checked });
+  const job = h.latest();
+  assert.equal(job.path, '/admin/api/models');
+  assert.deepEqual(job.body, { model_name: 'gpt-test', group_id: gid, remote_model: 'gpt-test-2024' });
+  job.resolve({ route_id: 9, model_name: 'gpt-test', group_id: gid, remote_model: 'gpt-test-2024', protocol: 'openai' });
+  h.releaseRefreshes();
+  await mapping;
+  assert.match(h.toasts.at(-1)[0], /已把 gpt-test-2024 对应到下游 gpt-test/);
+});
+
+test('全选按每行的选择处理：只留着的批量登记，要对应的逐条建候选', async (t) => {
+  const h = harness(t);
+  const gid = 65;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
+  await editGroup(h, gid, 'key-A');
+  stubPickLabels(h, [
+    { name: 'gpt-test', map: 'down:gpt-test' },
+    { name: 'kimi-k2', map: 'catalog' },
+  ]);
+  const all = h.app.actions['pick-all']();
+  const seen = h.requests.length;
+  assert.equal(h.latest().path, `/admin/api/groups/${gid}/models`);
+  assert.deepEqual(h.latest().body, { model_names: ['kimi-k2'] }, '只留着的一起发');
+  h.latest().resolve({ added: 1 });
+  for (let i = 0; i < 20 && h.requests.length <= seen; i++) await tick();
+  assert.equal(h.latest().path, '/admin/api/models');
+  assert.deepEqual(h.latest().body, { model_name: 'gpt-test', group_id: gid, remote_model: 'gpt-test' });
+  h.latest().resolve({ route_id: 3, model_name: 'gpt-test', group_id: gid, remote_model: 'gpt-test', protocol: 'openai' });
+  h.releaseRefreshes();
+  await all;
+  assert.match(h.toasts.at(-1)[0], /登记 1 个，对应下游 1 条/);
+});
+
 test('加候选只显示已登记模型，不请求上游，并将名称匹配项排前', async (t) => {
   const h = harness(t);
   const gid = 51;

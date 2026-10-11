@@ -743,6 +743,8 @@ async function openGroup(upstreamId, gid) {
   $('grp-move-wrap').hidden = !g;      // 新建时没得搬
 
   pulled = [];
+  pickPlans = new Map();
+  pickPending = new Map();
   $('grp-pull-status').textContent = '';
   $('grp-picker-filter').value = '';
   $('grp-manual').value = '';
@@ -815,6 +817,8 @@ async function saveGroup() {
   }
   if (modelsChanged) {
     pulled = [];
+    pickPlans = new Map();
+    pickPending = new Map();
     $('grp-pull-status').textContent = '';
   }
   renderPicker();
@@ -823,15 +827,66 @@ async function saveGroup() {
 
 /* ---------------------------------------------------------------- 分组里的上游模型
 
-   这一段管的是**上游模型目录**（这个分组能调到的上游真名），不是下游暴露。
-   勾选框的状态就是目录里的登记，勾上/取消当场发请求，没有「导入所选」也没有保存按钮。
-   要不要对外暴露在「模型路由」里单独做 —— 这里只回答「这个站有什么」。 */
+   这一段管两件挨着的事：**上游模型目录**（这个分组能调到的上游真名）和**每个真名
+   对应到哪个下游**。勾选框的状态就是目录里的登记，勾上/取消当场发请求；每行右侧的
+   选择框决定这个真名对应到哪个下游模型 —— 对应到完全匹配或部分匹配的现有模型、
+   新开一个下游模型、或者只留着不暴露。两件事都即时生效，没有「导入所选」也没有保存按钮。
 
-let pulled = [];   // 当前分组弹窗最近一次拉到的模型名；换分组就清空
+   已经挂在下游底下的行（这个分组、这个真名已经是某条链的候选）是锁着的：那条映射
+   已经在别处生效，要改去「模型路由」删候选。对应建议只在后端算一份
+   （gateway/model_match.py），前端不复制匹配规则。 */
+
+let pulled = [];            // 当前分组弹窗最近一次拉到的模型名；换分组就清空
+let pickPlans = new Map();  // 真名 -> {exact, partial, exposed_as}：拉取时问回的对应建议
+// 没勾的行：选择框里选好但还没生效的对应方式。勾上那一刻按它办；不记的话，
+// 别处一次重画就把人预设的选择冲掉了
+let pickPending = new Map();
+
+const MAP_CATALOG = 'catalog';   // 只留着，不对下游展示
+const MAP_NEW = 'new';           // 新开一个下游模型（以上游真名起名）
+const MAP_DOWN = 'down:';        // 对应到某个现有下游模型
+
+/* 这一行选择框当前要办的事。锁着的行（禁用、空值）和没有选择框时都算只留着。 */
+const pickMapOf = (label) => {
+  const value = label.querySelector?.('select[data-act="pick-map"]')?.value || '';
+  return value === MAP_NEW || value.startsWith(MAP_DOWN) ? value : MAP_CATALOG;
+};
+
+/* 默认对应方式：完全同名 → 对应到它；下游没有 → 新开；只沾一部分 → 只留着（自己认）。
+   和批量添加一个路子：「就是它」的默认办，沾边的默认不办。 */
+const defaultPickMap = (name, plan) => {
+  if (plan?.exposed_as?.length) return '';
+  const pending = pickPending.get(name);
+  if (pending) return pending;
+  if (plan?.exact?.length) return MAP_DOWN + plan.exact[0];
+  if (plan?.partial?.length) return MAP_CATALOG;
+  return MAP_NEW;
+};
+
+const pickMapOptions = (name, plan) => {
+  const exposed = plan?.exposed_as?.length ? plan.exposed_as : null;
+  if (exposed) {
+    return `<select class="pick-map" disabled title="改映射去「模型路由」">
+        <option value="">已暴露给下游：${esc(exposed.join('、'))}</option>
+      </select>`;
+  }
+  const want = defaultPickMap(name, plan);
+  const opt = (value, label) =>
+    `<option value="${esc(value)}"${value === want ? ' selected' : ''}>${label}</option>`;
+  return `<select class="pick-map" data-act="pick-map" data-name="${esc(name)}"
+      aria-label="${esc(name)} 对应到哪个下游">${
+    [
+      ...(plan?.exact || []).map((down) => opt(MAP_DOWN + down, `对应到完全匹配：${esc(down)}`)),
+      ...(plan?.partial || []).map((down) => opt(MAP_DOWN + down, `对应到部分匹配：${esc(down)}`)),
+      opt(MAP_NEW, `新开下游模型：${esc(name)}`),
+      opt(MAP_CATALOG, '只留着，不对下游展示'),
+    ].join('')}</select>`;
+};
 
 const pickRow = (name, on) => `<label class="${on ? 'on' : ''}">
     <input type="checkbox" ${on ? 'checked' : ''} data-act="pick-toggle" data-name="${esc(name)}">
     <span>${esc(name)}</span>
+    ${pickMapOptions(name, pickPlans.get(name))}
   </label>`;
 
 function renderPicker() {
@@ -894,6 +949,17 @@ const visibleRows = (checked) =>
   [...$('grp-picker').querySelectorAll('label:not([hidden]) input[data-act="pick-toggle"]')]
     .filter((b) => b.checked === checked).map((b) => b.dataset.name);
 
+/** 可见且还没登记的行，连同它们选择框里选定的对应方式（全选用）。 */
+const visiblePicks = () => {
+  const out = [];
+  for (const label of $('grp-picker').querySelectorAll('label:not([hidden])')) {
+    const box = label.querySelector('input[data-act="pick-toggle"]');
+    if (!box || box.checked) continue;
+    out.push({ name: box.dataset.name, map: pickMapOf(label), label });
+  }
+  return out;
+};
+
 /** 登记上游模型：只写目录，不产生下游候选。 */
 async function addModels(names, token = currentGroupEdit()) {
   if (!names.length) return;
@@ -901,6 +967,60 @@ async function addModels(names, token = currentGroupEdit()) {
   const r = await api('POST', `/admin/api/groups/${token.groupId}/models`, { model_names: names });
   if (!isCurrentGroupEdit(token)) return false;
   toast(names.length === 1 ? `已登记上游模型 ${names[0]}` : `登记了 ${r.added} 个上游模型`, 'ok');
+  return true;
+}
+
+/* 对应建议只在后端算一份（gateway/model_match.py）。问过的名字不重复问；拿不到只是
+   没有「对应到 X」那几个选项，选择框照样能用（新开 / 只留着不受影响）。 */
+async function ensurePickPlans(gid, names) {
+  const fresh = [...new Set(names.map((n) => (n || '').trim()).filter(Boolean))]
+    .filter((n) => !pickPlans.has(n));
+  if (!fresh.length) return;
+  try {
+    const data = await api('POST', `/admin/api/groups/${gid}/models/plan`, { model_names: fresh });
+    for (const p of data.plans || []) pickPlans.set(p.remote_model, p);
+  } catch (e) {
+    toast(`下游对应建议没拿到：${e.message}`, 'err');
+  }
+}
+
+/** 记下「这个真名已经挂到某个下游底下」：那一行接下来是锁着的。 */
+function markExposed(name, target) {
+  const plan = pickPlans.get(name) || { exact: [], partial: [], exposed_as: [] };
+  pickPlans.set(name, { ...plan, exposed_as: [target] });
+  pickPending.delete(name);
+}
+
+/** 反向：从目录里去掉成功之后，那一行重新可以选对应方式。 */
+function markUnexposed(name) {
+  const plan = pickPlans.get(name);
+  if (plan) pickPlans.set(name, { ...plan, exposed_as: [] });
+  pickPending.delete(name);
+}
+
+/** 把这个上游真名对应到一个下游模型：建候选（POST /models 会顺手登记目录）。
+    完全匹配、部分匹配、新开都走它，差别只在目标名字。 */
+async function mapToDownstream(token, name, value) {
+  if (!token || !isCurrentGroupEdit(token) || token.groupId === null) return false;
+  const target = value === MAP_NEW ? name : value.slice(MAP_DOWN.length);
+  if (!target) return false;
+  // 已经挂在哪个下游底下就不必再发：那种行本来是锁着的，能走到这里多是别处刚加过
+  if (pickPlans.get(name)?.exposed_as?.length) return false;
+  const taken = state.routes.some((row) => row.model_name === target
+    && row.candidates.some((c) => c.group_id === token.groupId && c.remote_model === name));
+  if (taken) {
+    markExposed(name, target);
+    toast(`这个站已经挂在「${target}」底下了`, 'ok');
+    return false;
+  }
+  await api('POST', '/admin/api/models', {
+    model_name: target, group_id: token.groupId, remote_model: name,
+  });
+  if (!isCurrentGroupEdit(token)) return false;
+  markExposed(name, target);
+  toast(target === name
+    ? `已新建下游模型 ${name}，这个站挂成它的候选`
+    : `已把 ${name} 对应到下游 ${target}`, 'ok');
   return true;
 }
 
@@ -932,6 +1052,7 @@ async function removeModel(name) {
     'DELETE',
     `/admin/api/groups/${gid}/models?remote_model=${encodeURIComponent(name)}`,
   );
+  markUnexposed(name);
   return isCurrentGroupEdit(token);
 }
 
@@ -1639,8 +1760,11 @@ const ACTIONS = {
       `group:${token.seq}:${gid}`,
       () => isCurrentGroupEdit(token),
       {
-        onSuccess: (models) => {
+        onSuccess: async (models) => {
           pulled = models;
+          // 每个拉回来的名字（连同目录里已有的）对应到哪些下游，一次问回
+          await ensurePickPlans(gid, [...models, ...catalogOfGroup(gid)]);
+          if (!isCurrentGroupEdit(token)) return;
           renderPicker();
           const mine = catalogOfGroup(gid);
           const hit = pulled.filter((m) => mine.includes(m)).length;
@@ -1661,7 +1785,8 @@ const ACTIONS = {
     );
   },
 
-  /* 勾选即生效：勾上=登记上游模型，取消=从目录里去掉。失败就把勾回滚到库里的真相。 */
+  /* 勾选即生效：勾上=登记上游模型，并按这一行选择框选的方式对应到下游（建候选的那
+     两种会顺手登记目录，不用再发一次）；取消=从目录里去掉。失败就把勾回滚到库里的真相。 */
   'pick-toggle': async ({ name }, el) => {
     const token = currentGroupEdit();
     if (!token || !isCurrentGroupEdit(token)) return;
@@ -1669,8 +1794,39 @@ const ACTIONS = {
     const label = el.closest('label');
     label.classList.add('busy');
     try {
-      if (el.checked) await addModels([name]);
-      else await removeModel(name);
+      if (el.checked) {
+        const map = pickMapOf(label);
+        if (map === MAP_CATALOG) await addModels([name]);
+        else await mapToDownstream(token, name, map);
+      } else {
+        await removeModel(name);
+      }
+    } finally {
+      endModelWrites(token, [name]);
+      label.classList.remove('busy');
+      await refreshConfig();
+      if (isCurrentGroupEdit(token)) renderPicker();
+    }
+  },
+
+  /* 换对应方式：已经勾上的行当场办（建候选）；没勾的只是把选择记下来，等勾上那一刻
+     按这个选择一起生效。 */
+  'pick-map': async ({ name }, el) => {
+    const token = currentGroupEdit();
+    if (!token || !isCurrentGroupEdit(token) || token.groupId === null) return;
+    const label = el.closest('label');
+    const box = label.querySelector('input[data-act="pick-toggle"]');
+    if (!box || !box.checked) {
+      pickPending.set(name, el.value);
+      return;
+    }
+    const map = pickMapOf(label);
+    // 只留着：登记在勾上时已经做过了，这里没有别的事可做
+    if (map === MAP_CATALOG) return;
+    if (!beginModelWrites(token, [name])) return toast('这项正在保存，请稍后再试', 'err');
+    label.classList.add('busy');
+    try {
+      await mapToDownstream(token, name, map);
     } finally {
       endModelWrites(token, [name]);
       label.classList.remove('busy');
@@ -1682,15 +1838,35 @@ const ACTIONS = {
   'pick-all': async () => {
     const token = currentGroupEdit();
     if (!token || !isCurrentGroupEdit(token)) return;
-    const names = visibleRows(false);
-    if (!names.length) return toast('没有可加的了', 'ok');
-    if (!beginModelWrites(token, names)) return toast('有模型正在保存，请稍后再试', 'err');
+    const picks = visiblePicks();
+    if (!picks.length) return toast('没有可加的了', 'ok');
+    if (!beginModelWrites(token, picks.map((p) => p.name))) {
+      return toast('有模型正在保存，请稍后再试', 'err');
+    }
+    for (const p of picks) p.label.classList.add('busy');
     try {
-      await addModels(names, token);
+      // 只留着的一批一个请求发完；要对应到下游的一条条办（每条建一条候选），
+      // 单条失败不牵连别的
+      const plain = picks.filter((p) => p.map === MAP_CATALOG).map((p) => p.name);
+      if (plain.length) {
+        await api('POST', `/admin/api/groups/${token.groupId}/models`, { model_names: plain });
+        if (!isCurrentGroupEdit(token)) return;
+      }
+      let mapped = 0;
+      for (const p of picks) {
+        if (p.map === MAP_CATALOG) continue;
+        if (await mapToDownstream(token, p.name, p.map)) mapped += 1;
+      }
       await refreshConfig();
-      if (isCurrentGroupEdit(token)) renderPicker();
+      if (!isCurrentGroupEdit(token)) return;
+      renderPicker();
+      const parts = [];
+      if (plain.length) parts.push(`登记 ${plain.length} 个`);
+      if (mapped) parts.push(`对应下游 ${mapped} 条`);
+      if (parts.length) toast(parts.join('，'), 'ok');
     } finally {
-      endModelWrites(token, names);
+      endModelWrites(token, picks.map((p) => p.name));
+      for (const p of picks) p.label.classList.remove('busy');
     }
   },
 
@@ -1751,7 +1927,10 @@ const ACTIONS = {
       $('grp-manual').value = '';
     }
     await refreshConfig();
-    if (isCurrentGroupEdit(token)) renderPicker();
+    if (!isCurrentGroupEdit(token)) return;
+    // 手填的也问一次对应建议：它的选择框和拉回来的行一个规矩
+    await ensurePickPlans(token.groupId, [name]);
+    renderPicker();
   },
 
   'open-search': openSearch,
@@ -2071,6 +2250,12 @@ $('grp-manual').addEventListener('keydown', (ev) => {
 
 $('grp-picker-filter').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') ev.preventDefault();
+});
+/* 行内的「对应到哪个下游」是 select：document 上那个 change 委派只认 INPUT
+   （勾选类控件），select 的 change 挂在静态容器上等着。 */
+$('grp-picker').addEventListener('change', (ev) => {
+  const sel = ev.target.closest('select[data-act="pick-map"]');
+  if (sel) run(null, () => ACTIONS['pick-map'](sel.dataset, sel));
 });
 
 /* 弹窗关掉后刷一次列表（Esc 关闭也走这里，所以挂在 close 上而不是关闭按钮上）。

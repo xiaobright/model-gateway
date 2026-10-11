@@ -85,7 +85,9 @@ export function pullRemoteModels(gid, requestKey, isCurrent, { onSuccess, onFail
       if (!current) return { stale: true };
       remoteCache.set(id, data.models);
       remoteDead.delete(id);
-      onSuccess?.(data.models);
+      // onSuccess 可能是异步的（拉完还要问下游对应建议）：等它做完再算这次拉取结束，
+      // 否则「拉取中」的状态和选择器的渲染会抢在请求前面
+      await onSuccess?.(data.models);
       return { stale: false, models: data.models };
     } catch (error) {
       if (isCurrent() && (remoteEpoch.get(id) || 0) === epoch) {

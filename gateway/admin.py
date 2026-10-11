@@ -15,6 +15,7 @@ from . import (
     capture, canvas, db, failover, inflight, protocols, proxy as proxy_mod, rewrite, truncation,
 )
 from . import model_batch
+from . import model_match
 from . import stats as stats_mod
 from . import upstream as upstream_mod
 from .reqlog import log
@@ -85,6 +86,14 @@ class RouteEditIn(BaseModel):
 
 class GroupModelsIn(BaseModel):
     """登记上游模型（只进目录，不产生下游候选）。"""
+
+    model_names: tuple[str, ...] = Field(min_length=1)
+
+
+class GroupModelsPlanIn(BaseModel):
+    """拉回来的上游真名列表：问每个名字能对应到哪些下游模型。只读。"""
+
+    model_config = ConfigDict(extra="forbid")
 
     model_names: tuple[str, ...] = Field(min_length=1)
 
@@ -796,6 +805,34 @@ def remove_group_model(
     if routes:
         log(f"CATALOG remove {remote_model!r} from group {group_id}: {routes} downstream route(s) dropped")
     return {"ok": True, "removed": removed, "routes_removed": routes}
+
+
+@router.post("/groups/{group_id}/models/plan")
+def post_group_models_plan(group_id: int, payload: GroupModelsPlanIn) -> dict[str, Any]:
+    """拉回来的上游真名各自能对应到哪些下游模型。只读，给分组弹窗的选择框用。
+
+    完全匹配 = 归一化后同名（或去掉厂商前缀后同名）；部分匹配 = 沾一部分，按像的
+    程度排。已经暴露给下游的（这个分组、这个真名已经是某条链的候选）在 exposed_as
+    里标出来 —— 那种行在界面上是锁着的，改映射去「模型路由」。
+    """
+    _require_group(group_id)
+    names = model_match.downstream_names()
+    exposed = model_match.exposed_as(group_id)
+    plans = []
+    for raw in payload.model_names:
+        remote = raw.strip()
+        if not remote:
+            continue
+        exact, partial = model_match.plan(remote, names)
+        plans.append(
+            {
+                "remote_model": remote,
+                "exact": exact,
+                "partial": partial,
+                "exposed_as": exposed.get(remote, []),
+            }
+        )
+    return {"plans": plans}
 
 
 # ---------------------------------------------------------------- 模型路由
