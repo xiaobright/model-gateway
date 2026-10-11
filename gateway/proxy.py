@@ -402,6 +402,10 @@ async def forward(
         payload = scrubbed
         log(f"POST {endpoint} 敏感词绕行：命中 {rewrite_hits} 处")
 
+    # 请求体里有多少字节是内嵌数据块（图片 base64、Codex 回传的加密推理），不是文本。
+    # 按整包字节估输入 token 时要扣掉它 —— 一张图就能让「多少字节一个 token」整个带偏。
+    req_blob = protocols.blob_bytes(payload)
+
     compaction_capture = capture.compaction_requested(endpoint)
     requested = str(payload.get("model", ""))
     asked, flag = naming.split_model(requested)
@@ -486,12 +490,13 @@ async def forward(
     call = inflight.begin(
         client=_client_label(request.headers.get("user-agent", "")),
         protocol=proto.name, model=asked, stream=stream_flag,
-        req_bytes=len(body), meta=not record,
+        req_bytes=len(body), blob_bytes=req_blob, meta=not record,
     )
     # Separate metadata stream; count_tokens and rejected input stay out of it.
     trace = learning.begin(
         request.scope, protocol=proto.name, endpoint=path, model=asked, stream=stream_flag,
-        req_bytes=len(body), stateful=stateful, can_failover=can_failover, stall_s=stall_s,
+        req_bytes=len(body), blob_bytes=req_blob, stateful=stateful, can_failover=can_failover,
+        stall_s=stall_s,
         candidate_ids=[r.route_id for r in candidates], start_deadline_s=failover.START_DEADLINE,
         client=_client_label(request.headers.get("user-agent", "")),
     ) if record else learning.Trace(None)
@@ -513,7 +518,7 @@ async def forward(
             _record(
                 request=request, route=last_route or route, proto=proto, model=asked,
                 remote_model=remote, status=499, stream_flag=stream_flag,
-                req_bytes=len(sent_body), resp_bytes=0, elapsed=time.monotonic() - began,
+                req_bytes=len(sent_body), req_blob_bytes=req_blob, resp_bytes=0, elapsed=time.monotonic() - began,
                 usage=NO_USAGE, note=note, attempt=attempt,
             )
         return _error(proto, 499, "请求已手动中断" if note == "manual_abort" else "客户端已断开")
@@ -655,7 +660,7 @@ async def forward(
                     _record(
                         request=request, route=route, proto=proto, model=asked,
                         remote_model=remote, status=502, stream_flag=stream_flag,
-                        req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                        req_bytes=len(sent_body), req_blob_bytes=req_blob, resp_bytes=0, elapsed=elapsed,
                         usage=NO_USAGE, note="same_retry", attempt=attempt,
                     )
                 if not await same_retry_pause(delay):
@@ -671,7 +676,7 @@ async def forward(
                 _record(
                     request=request, route=route, proto=proto, model=asked,
                     remote_model=remote, status=502, stream_flag=stream_flag,
-                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    req_bytes=len(sent_body), req_blob_bytes=req_blob, resp_bytes=0, elapsed=elapsed,
                     usage=NO_USAGE, note="connect_failed", attempt=attempt,
                 )
             index = advance()
@@ -725,7 +730,7 @@ async def forward(
                 _record(
                     request=request, route=route, proto=proto, model=asked,
                     remote_model=remote, status=status_for_retry, stream_flag=stream_flag,
-                    req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                    req_bytes=len(sent_body), req_blob_bytes=req_blob, resp_bytes=0, elapsed=elapsed,
                     usage=NO_USAGE, note="same_retry", attempt=attempt,
                 )
             resp = None
@@ -755,7 +760,7 @@ async def forward(
                     _record(
                         request=request, route=route, proto=proto, model=asked,
                         remote_model=remote, status=resp.status_code, stream_flag=stream_flag,
-                        req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                        req_bytes=len(sent_body), req_blob_bytes=req_blob, resp_bytes=0, elapsed=elapsed,
                         usage=NO_USAGE, note="search_failed_over", attempt=attempt,
                     )
                 resp = None
@@ -815,6 +820,7 @@ async def forward(
                             request=request, route=route, proto=proto, model=asked,
                             remote_model=remote, status=resp.status_code,
                             stream_flag=stream_flag, req_bytes=len(sent_body),
+                            req_blob_bytes=req_blob,
                             resp_bytes=probe.sent, elapsed=elapsed, usage=NO_USAGE,
                             note="hold_retry", attempt=attempt,
                         )
@@ -858,7 +864,7 @@ async def forward(
             _record(
                 request=request, route=route, proto=proto, model=asked,
                 remote_model=remote, status=resp.status_code, stream_flag=stream_flag,
-                req_bytes=len(sent_body), resp_bytes=0, elapsed=elapsed,
+                req_bytes=len(sent_body), req_blob_bytes=req_blob, resp_bytes=0, elapsed=elapsed,
                 usage=NO_USAGE, note="failed_over", attempt=attempt,
             )
         resp = None
@@ -906,6 +912,9 @@ async def forward(
         sent = 0
         text_bytes = 0
         thinking = False
+        # 响应里 encrypted_content（GPT 的加密思维链）有多少字节。它计入了 output_tokens
+        # 却不进 text_bytes —— 标出来，免得拿这种记录去定下行标尺。
+        encrypted_bytes = 0
         # 发呆计时只在「开始吐字」之后生效：等响应头、等第一个字可能一两分钟，
         # 那是模型在算，不是卡住。观察器的 content_events 往前走一次就续一次期；
         # 已经发出完成事件的流也不再计时（有的站发完结束事件却不收连接）。
@@ -969,6 +978,7 @@ async def forward(
                         observer.feed(chunk)
                         text_bytes = observer.text_bytes
                         thinking = observer.thinking
+                        encrypted_bytes = observer.encrypted_bytes
                         if stall_s > 0 and observer.content_events > seen_content_events:
                             seen_content_events = observer.content_events
                             content_deadline = time.monotonic() + stall_s
@@ -988,7 +998,10 @@ async def forward(
                         json_capped = True
                 if len(tail) > TAIL_KEEP:
                     del tail[: len(tail) - TAIL_KEEP]
-                inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
+                inflight.progress(
+                    call, sent, text_bytes=text_bytes, thinking=thinking,
+                    encrypted_bytes=encrypted_bytes,
+                )
                 yield chunk
         except inflight.ManualAbort:
             note = "manual_abort"
@@ -1031,11 +1044,15 @@ async def forward(
                         note = "protocol_error"
                     # flush 可能刚补完最后一帧；收尾时取一次，不在每个 chunk 复制诊断清单。
                     text_bytes, thinking = observer.text_bytes, observer.thinking
+                    encrypted_bytes = observer.encrypted_bytes
                     trace.observe_end(
                         ended=observer.ended, oversized_frames=observer.oversized_frames,
                         text_bytes=text_bytes,
                     )
-                    inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
+                    inflight.progress(
+                        call, sent, text_bytes=text_bytes, thinking=thinking,
+                        encrypted_bytes=encrypted_bytes,
+                    )
                     if compaction_capture:
                         compaction_observations = observer.compaction_items
                         response_event_types = observer.event_types
@@ -1052,13 +1069,17 @@ async def forward(
                                 if upstream_resp.status_code < 300 and note == "ok":
                                     note = "protocol_error"
                             text_bytes, thinking = proto.count_json_content(json_payload)
+                            encrypted_bytes = protocols.encrypted_bytes(json_payload)
                             if compaction_capture:
                                 compaction_observations = protocols.compaction_observations(json_payload)
                                 response_payload_types = capture.response_types(json_payload)
                     except Exception as exc:
                         trace.event("observation_error")
                         log(f"  JSON observe failed: {exc.__class__.__name__}: {exc}")
-                    inflight.progress(call, sent, text_bytes=text_bytes, thinking=thinking)
+                    inflight.progress(
+                        call, sent, text_bytes=text_bytes, thinking=thinking,
+                        encrypted_bytes=encrypted_bytes,
+                    )
                 if cap is not None:
                     try:
                         capture.finish(
@@ -1104,6 +1125,7 @@ async def forward(
                         resp_bytes=sent, elapsed=time.monotonic() - started,
                         usage=usage, note=note, attempt=won_attempt,
                         text_bytes=text_bytes, thinking=thinking,
+                        req_blob_bytes=req_blob, encrypted_bytes=encrypted_bytes,
                     )
                 if won_rules is not None and observer is not None:
                     # 200 截断守卫的记账。只认**流式**响应（observer 就是「上游给的是 SSE」）：
@@ -1168,6 +1190,8 @@ def _record(
     attempt: int = 1,
     text_bytes: int = 0,
     thinking: bool = False,
+    req_blob_bytes: int = 0,
+    encrypted_bytes: int = 0,
 ) -> None:
     input_tokens, output_tokens, cached_tokens, cache_creation_tokens = usage
     try:
@@ -1181,9 +1205,11 @@ def _record(
             status=status,
             stream=stream_flag,
             req_bytes=req_bytes,
+            req_blob_bytes=req_blob_bytes,
             resp_bytes=resp_bytes,
             resp_text_bytes=text_bytes,
             thinking=thinking,
+            encrypted_bytes=encrypted_bytes,
             duration_ms=int(elapsed * 1000),
             input_tokens=input_tokens,
             output_tokens=output_tokens,

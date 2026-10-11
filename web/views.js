@@ -305,19 +305,20 @@ function estTok(bytes, dir, proto) {
     + `≈ ${fmtTokens(Math.round(bytes / ratio))} tok</span>`;
 }
 
-/** 上游自己报的数（加粗）优先，没报就按字节估 */
+/** 上游自己报的数（加粗）优先，没报就按字节估。估的时候扣掉内嵌数据块
+    （图片 base64、回传的加密推理）：它们不按文本计费，算进整包字节会把估值顶高。 */
 function upText(c) {
   const real = c.tokens_in
     ? ` · 上下文 <b title="上游自己报的数">${fmtTokens(c.tokens_in)}</b> tok`
-    : estTok(c.req_bytes, 'up', c.protocol);
+    : estTok(c.req_bytes - (c.req_blob_bytes || 0), 'up', c.protocol);
   return `上行 ${fmtBytes(c.req_bytes)}${real}`;
 }
 
 /* 「收 386KB · 计费输出 9.9k tok」。流还在跑的时候只有「收到的内容」这一个口径，
    计费量要等末尾那个 usage —— 有思维链时两者会差不少，所以打个标说清楚为什么。 */
 function downText(c, label) {
-  const think = c.thinking
-    ? ' <span class="tag" title="思维链发下来的是总结过的，但计费按完整的算 —— 所以「收到的」会明显小于「计费的」">思维链</span>'
+  const think = (c.thinking || c.encrypted_bytes)
+    ? ' <span class="tag" title="思维链计入了计费，但发下来的不是完整可读正文（GPT 的是加密回传）—— 所以「收到的」会明显小于「计费的」">思维链</span>'
     : '';
   const real = c.tokens_out
     ? ` · 计费输出 <b title="上游自己报的数">${fmtTokens(c.tokens_out)}</b> tok`

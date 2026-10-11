@@ -211,6 +211,18 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
                     if step == "delta":
                         yield b"data: [DONE]\n\n"
                     return
+                # "encrypted"：正文 + 一段加密回传的思维链（GPT 那种）—— 验证
+                # 「加密思维链不计入正文，但被单独数出来，且不进下行标尺」
+                if step == "encrypted":
+                    yield b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                    yield (
+                        "data: " + json.dumps({
+                            "type": "response.output_item.done",
+                            "item": {"type": "reasoning", "encrypted_content": "Z" * 3000},
+                        }) + "\n\n"
+                    ).encode()
+                    yield b"data: [DONE]\n\n"
+                    return
                 for i in range(6):
                     if not IN_PROCESS_UPSTREAMS:
                         await asyncio.sleep(0.04)

@@ -89,6 +89,78 @@ def test_sse_observer_keeps_an_incomplete_frame_for_the_next_chunk():
     assert observer.text_bytes == len("hello world")
 
 
+def test_blob_bytes_counts_images_and_returned_encrypted_reasoning():
+    """上行估 token 前要扣掉内嵌数据块：图片（三种协议形态）和回传的加密推理。
+
+    它们不按文本计费，混在整包字节里只会让「多少字节一个 token」虚高。
+    """
+    from gateway.protocols import blob_bytes, encrypted_bytes
+
+    responses_str = {"input": [{"type": "input_image", "image_url": "data:image/png;base64," + "A" * 1000}]}
+    responses_obj = {"input": [{"type": "input_image", "image_url": {"url": "data:," + "B" * 500}}]}
+    anthropic = {"messages": [{"content": [{"type": "image", "source": {"type": "base64", "data": "C" * 800}}]}]}
+    chat = {"messages": [{"content": [{"type": "image_url", "image_url": {"url": "data:," + "D" * 300}}]}]}
+    reasoning = {"input": [{"type": "reasoning", "encrypted_content": "E" * 2000}]}
+    plain = {"input": [{"type": "message", "content": [{"type": "input_text", "text": "x" * 9999}]}]}
+
+    assert blob_bytes(responses_str) == len("data:image/png;base64,") + 1000
+    assert blob_bytes(responses_obj) == len("data:,") + 500
+    assert blob_bytes(anthropic) == 800
+    assert blob_bytes(chat) == len("data:,") + 300
+    assert blob_bytes(reasoning) == 2000
+    assert blob_bytes(plain) == 0, "纯文本请求一个字节都不该扣"
+    assert encrypted_bytes(reasoning) == 2000
+    assert encrypted_bytes(responses_str) == 0
+
+
+def test_sse_observer_counts_encrypted_reasoning_apart_from_text():
+    """GPT 的思维链是加密回传的：不进 text_bytes（不是可读正文），却计入了 output_tokens。
+
+    单独数出来，免得拿这种记录去定下行标尺。
+    """
+    from gateway.protocols import OPENAI, SSEObserver
+
+    observer = SSEObserver(OPENAI)
+    observer.feed(b'data: {"type":"response.output_text.delta","delta":"hello world"}\n\n')
+    assert observer.encrypted_bytes == 0 and observer.text_bytes == len("hello world")
+    observer.feed(
+        b'data: {"type":"response.output_item.done","item":{"type":"reasoning",'
+        b'"encrypted_content":"' + b"Z" * 1234 + b'"}}\n\n'
+    )
+    assert observer.encrypted_bytes == 1234
+    assert observer.text_bytes == len("hello world"), "加密内容不是正文，不进 text_bytes"
+    assert not observer.thinking, "encrypted_content 不是 reasoning_summary，不该误标 thinking"
+
+
+def test_anthropic_redacted_thinking_is_flagged_and_counted():
+    """Claude 的加密思维块（redacted_thinking）：计了 token 却不发一个正文字节。
+
+    明文的 "thinking":"…" 正则认不出它（内容在 data 字段里），漏检的话这种记录会
+    伪装成干净样本混进下行标尺 —— 和 GPT 的 encrypted_content 同一类污染。
+    """
+    import json as _json
+
+    from gateway.protocols import ANTHROPIC, SSEObserver, anthropic_content, encrypted_bytes
+
+    data = "R" * 512
+    frame = (
+        "event: content_block_start\ndata: " + _json.dumps({
+            "type": "content_block_start",
+            "content_block": {"type": "redacted_thinking", "data": data},
+        }) + "\n\n"
+    ).encode()
+    size, think = anthropic_content(frame)
+    assert think is True, "加密思维块必须打上思维链标记"
+    assert size == 0, "加密内容不是正文，一个字节都不该计入"
+
+    observer = SSEObserver(ANTHROPIC)
+    observer.feed(frame)
+    assert observer.encrypted_bytes == len(data) and observer.thinking is True
+    observer.feed(b'event: content_block_delta\ndata: {"delta":{"type":"text_delta","text":"hi"}}\n\n')
+    observer.feed(b'event: message_stop\ndata: {}\n\n')
+    assert observer.text_bytes == len("hi") and observer.ended
+
+
 def test_compaction_probe_recognizes_nested_summary_and_cmp_encrypted_items():
     from gateway.protocols import compaction_observations
 

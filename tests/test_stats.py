@@ -136,6 +136,71 @@ def test_token_ratio_is_learned_from_the_log(gateway):
     assert gateway.get("/admin/api/inflight").json()["tokens"]["anthropic"]["down"] == 0.0
 
 
+def test_token_ratio_excludes_embedded_blobs_and_encrypted_reasoning(gateway):
+    """标尺只认口径一致的记录：上行扣内嵌数据块，下行排除加密思维链。
+
+    两类污染都会把比值带偏 —— 图片/加密推理让上行虚高，加密思维链让下行虚低。
+    """
+    from gateway import db, stats as stats_mod
+
+    def logged(protocol: str, req: int, blob: int, texts: list[int], it: int, ot: int,
+               encrypted: int = 0) -> None:
+        with db._conn() as conn:
+            conn.executemany(
+                "INSERT INTO request_log(client, model, upstream, status, stream,"
+                " req_bytes, req_blob_bytes, resp_bytes, resp_text_bytes, encrypted_bytes,"
+                " duration_ms, input_tokens, output_tokens, cached_tokens, note, protocol)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [("c", "m", "siteA", 200, 1, req, blob, text * 20, text, encrypted,
+                  100, it, ot, 0, "ok", protocol) for text in texts],
+            )
+
+    # 上行：请求体 10000 字节里有 6000 是图片/加密推理，只按剩下的 4000 算 -> 4 字节/token
+    logged("openai", req=10_000, blob=6_000, texts=[2000] * 25, it=1000, ot=500)
+    stats_mod.reset()
+    assert stats_mod.token_ratio()["openai"]["up"] == 4.0
+
+    # 下行：带加密思维链的记录不能进标尺。这批比值是 2.0 —— 高于物理下界，只有
+    # encrypted_bytes 标记能排掉它；不排的话 40 条会把中位数从 4 压到 2
+    logged("openai", req=4_000, blob=0, texts=[1000] * 40, it=1000, ot=500, encrypted=180_000)
+    stats_mod.reset()
+    assert stats_mod.token_ratio()["openai"]["down"] == 4.0
+
+    # 物理下界兜底：比值 1.0 低于正文内容的物理下界（必藏着不发字节的隐藏 token），
+    # 哪怕没打 encrypted 标记也不能进标尺 —— 它兜住 encrypted_bytes 采集之前的历史数据
+    logged("openai", req=4_000, blob=0, texts=[500] * 25, it=1000, ot=500, encrypted=0)
+    stats_mod.reset()
+    assert stats_mod.token_ratio()["openai"]["down"] == 4.0
+
+
+def test_embedded_blob_and_encrypted_bytes_reach_the_log(gateway):
+    """内嵌数据块和加密思维链的字节数要一路落到记录里，标尺和前端才有依据可扣。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "gpt-test", g_a)
+
+        image = "data:image/png;base64," + "A" * 4096
+        assert gateway.post("/v1/responses", json={
+            "model": "gpt-test",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "看这张图"},
+                {"type": "input_image", "image_url": image},
+            ]}],
+        }).status_code == 200
+        row = wait_for_row(gateway)
+        assert row["req_blob_bytes"] == len(image)
+        assert row["req_bytes"] > row["req_blob_bytes"], "总字节数里除了图还得有别的"
+
+        # 带加密思维链的流：它不进 resp_text_bytes，但被单独数出来
+        a.stream_script("encrypted")
+        assert gateway.post("/v1/responses", json={
+            "model": "gpt-test", "stream": True, "mode": "script",
+        }).status_code == 200
+        row = wait_rows(gateway, 2)[-1]
+        assert row["encrypted_bytes"] == 3000
+        assert row["resp_text_bytes"] == len("hello"), "加密内容不能被算成正文"
+
+
 def test_overview_totals_health_and_models_respect_the_window(gateway):
     """卡片 / 健康 / 热度都得跟时间线一个口径，否则切 1h 看到的还是全量累计值。"""
     import time

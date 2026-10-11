@@ -91,9 +91,11 @@ CREATE TABLE IF NOT EXISTS request_log(
   status INTEGER NOT NULL,
   stream INTEGER NOT NULL,
   req_bytes INTEGER NOT NULL,
+  req_blob_bytes INTEGER NOT NULL DEFAULT 0,
   resp_bytes INTEGER NOT NULL,
   resp_text_bytes INTEGER NOT NULL DEFAULT 0,
   thinking INTEGER NOT NULL DEFAULT 0,
+  encrypted_bytes INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL,
   input_tokens INTEGER,
   output_tokens INTEGER,
@@ -127,7 +129,9 @@ _since_trim = 0
 #   6 = 上游同站重试规则（retry_rules）
 #   7 = 下游模型转发（model_forwards）：一个下游模型可以把整条链交给另一个下游
 #   8 = 200 截断守卫（hold_retry）：连着拿回同一个没有正文的 200 就先扣住、原站重发
-SCHEMA_VERSION = 8
+#   9 = request_log 记「非文本字节」：上行内嵌数据块（req_blob_bytes）和响应里的
+#       加密思维链（encrypted_bytes）—— 按包大小估 token 的标尺要把它们排除
+SCHEMA_VERSION = 9
 
 # 迁移前留几份备份。迁移是一次性的，但 .bak 从来没人清理过，所以这里顺手裁掉旧的
 BACKUP_KEEP = 3
@@ -495,6 +499,12 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             # Anthropic 的 input_tokens 不含 cache_read / cache_creation，统计时需要保留
             # 这两个分量，才能按协议算出真实上下文和缓存命中率。
             ("cache_creation_tokens", "INTEGER"),
+            # 上行请求体里有多少字节是内嵌数据块（图片 base64、回传的加密推理），不是文本。
+            # 按包大小估输入 token 时要从 req_bytes 里扣掉它。
+            ("req_blob_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            # 响应里 encrypted_content（GPT 的加密思维链）占了多少字节：它计入了
+            # output_tokens 却不进 resp_text_bytes，有它的记录不能拿来定下行标尺。
+            ("encrypted_bytes", "INTEGER NOT NULL DEFAULT 0"),
         ],
     }
     for table, columns in wanted.items():
@@ -1505,16 +1515,20 @@ def insert_request(
     resp_text_bytes: int = 0,
     thinking: bool = False,
     cache_creation_tokens: int | None = None,
+    req_blob_bytes: int = 0,
+    encrypted_bytes: int = 0,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             "INSERT INTO request_log(client, model, remote_model, protocol, upstream, group_name,"
-            " status, stream, req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens,"
-            " cached_tokens, cache_creation_tokens, note, attempt, resp_text_bytes, thinking)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " status, stream, req_bytes, req_blob_bytes, resp_bytes, duration_ms, input_tokens,"
+            " output_tokens, cached_tokens, cache_creation_tokens, note, attempt, resp_text_bytes,"
+            " thinking, encrypted_bytes)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (client, model, remote_model, protocol, upstream, group_name, status, int(stream),
-             req_bytes, resp_bytes, duration_ms, input_tokens, output_tokens, cached_tokens,
-             cache_creation_tokens, note, attempt, resp_text_bytes, int(thinking)),
+             req_bytes, req_blob_bytes, resp_bytes, duration_ms, input_tokens, output_tokens,
+             cached_tokens, cache_creation_tokens, note, attempt, resp_text_bytes,
+             int(thinking), encrypted_bytes),
         )
         # 不必每条都跑一次裁剪 DELETE（PK 范围删很便宜，但也是每次请求多一条语句）。
         # 攒够一批再剪：表最多多留 TRIM_EVERY 行，读取端永远只看最近 2000 行。

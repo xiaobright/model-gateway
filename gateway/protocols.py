@@ -40,6 +40,10 @@ def _string_field(name: str) -> re.Pattern[bytes]:
 
 _ANTHROPIC_TEXT = _string_field("text")
 _ANTHROPIC_THINK = _string_field("thinking")
+# 加密思维块（redacted_thinking）没有 "thinking":"…" 字段，明文正则认不出它 ——
+# 它的内容是加密的 data 字段，计了 token 却一个正文字节都不发，和 GPT 的
+# encrypted_content 是同一类污染，必须单独认出来打上思维链标记。
+_ANTHROPIC_REDACTED = re.compile(rb'"type":\s*"redacted_thinking"')
 # Responses API 的正文、推理摘要、工具参数都走 "delta":"…"（对象形式的 delta 不匹配）
 _OPENAI_TEXT = _string_field("delta")
 _OPENAI_THINK = re.compile(rb"reasoning_summary")
@@ -135,11 +139,12 @@ def anthropic_content(chunk: bytes) -> tuple[int, bool]:
     """这一块里有多少字节是内容，以及里面有没有思维链。
 
     思维链要单独认出来是因为**它是总结过的，而计费按完整的算** —— 有思维链的那些流，
-    「收到多少」和「被计多少 token」根本不是一回事，不能拿来定标尺。正文（`text_delta`）
-    是完整的，所以没有思维链的流就是干净样本。
+    「收到多少字节」和「被计多少 token」根本不是一回事，不能拿来定标尺。正文（`text_delta`）
+    是完整的，所以没有思维链的流就是干净样本。加密思维块（redacted_thinking）更是连
+    字节都不发，一并打标。
     """
     think = _total(_ANTHROPIC_THINK, chunk)
-    return _total(_ANTHROPIC_TEXT, chunk) + think, think > 0
+    return _total(_ANTHROPIC_TEXT, chunk) + think, think > 0 or bool(_ANTHROPIC_REDACTED.search(chunk))
 
 
 def openai_content(chunk: bytes) -> tuple[int, bool]:
@@ -155,6 +160,65 @@ def chat_content(chunk: bytes) -> tuple[int, bool]:
 
 def _text_size(value: object) -> int:
     return len(value.encode("utf-8")) if isinstance(value, str) else 0
+
+
+# 请求体里内嵌的数据块：图片（base64 / data URI）和回传的加密推理状态（Codex 会把上一轮
+# 的 encrypted_content 原样带回）。这些字节不按文本计费 —— 图片按分辨率折算、加密推理是
+# opaque 状态 —— 却和提示词混在同一个请求体长度里。按整包字节估输入 token 时它们是纯噪声：
+# 一张图就能让比值差出几十倍，加密推理回传同理。
+_IMAGE_TYPES = frozenset({"input_image", "image", "image_url"})
+
+
+def _blob_len(value: object) -> int:
+    """一个字段里有多少字节是内嵌数据。字符串按 UTF-8 算；image_url 允许是 {url: ...}。"""
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, dict):
+        return _blob_len(value.get("url"))
+    return 0
+
+
+def _blob_scan(node: object, acc: list[int]) -> None:
+    """一次遍历同时数出 [图片字节, 加密内容字节]，两类都算「非文本」。"""
+    if isinstance(node, dict):
+        if node.get("type") in _IMAGE_TYPES:
+            acc[0] += _blob_len(node.get("image_url")) + _blob_len(node.get("data"))
+            source = node.get("source")
+            if isinstance(source, dict):
+                acc[0] += _blob_len(source.get("data"))
+        encrypted = node.get("encrypted_content")
+        if isinstance(encrypted, str):
+            acc[1] += len(encrypted.encode("utf-8"))
+        # Anthropic 的加密思维块：内容是不透明的 data 字段，同属「计了 token 却不发字节」
+        if node.get("type") == "redacted_thinking":
+            acc[1] += _blob_len(node.get("data"))
+        for value in node.values():
+            _blob_scan(value, acc)
+    elif isinstance(node, list):
+        for value in node:
+            _blob_scan(value, acc)
+
+
+def blob_bytes(payload: object) -> int:
+    """请求体里有多少字节是内嵌数据块（图片 + 回传的加密推理），而不是文本。
+
+    上行估 token 时要从整包字节里扣掉它 —— 这些字节跟文本 token 不是一回事。
+    """
+    acc = [0, 0]
+    _blob_scan(payload, acc)
+    return acc[0] + acc[1]
+
+
+def encrypted_bytes(payload: object) -> int:
+    """一段 payload 里「加密的输出内容」占多少字节。
+
+    响应用它：GPT 的思维链是加密回传的（encrypted_content），Anthropic 有加密思维块
+    （redacted_thinking 的 data 字段）—— 都是 opaque 状态、计入了 output_tokens 却不进
+    resp_text_bytes，有它们的记录不能拿来定下行标尺。
+    """
+    acc = [0, 0]
+    _blob_scan(payload, acc)
+    return acc[1]
 
 
 def anthropic_json_content(payload: dict) -> tuple[int, bool]:
@@ -403,6 +467,9 @@ class SSEObserver:
         self.protocol_error = False
         self.text_bytes = 0
         self.thinking = False
+        # 响应里 encrypted_content（GPT 的加密思维链）占了多少字节。它是 opaque 状态，
+        # 不进 text_bytes，却计入了 output_tokens —— 有它的记录不能拿来定下行标尺。
+        self.encrypted_bytes = 0
         # 正文/推理/工具参数增量出现过几次。「吐字」之后发呆超时才计时，见 proxy relay
         self.content_events = 0
         # 没有事件边界的超大帧：只丢观察缓冲，绝不拖慢或拖垮转发
@@ -480,6 +547,9 @@ class SSEObserver:
         if self._collect_types and isinstance(payload, dict) and isinstance(payload.get("type"), str):
             payload_type = payload["type"]
             self.payload_types[payload_type] = self.payload_types.get(payload_type, 0) + 1
+        # 加密思维链只在携带它的那几帧里数，别为每帧都递归一遍 payload
+        if payload is not None and (b"encrypted_content" in frame or b"redacted_thinking" in frame):
+            self.encrypted_bytes += encrypted_bytes(payload)
         if self._collect_compaction:
             self.compaction_items.extend(compaction_observations(payload, event=event))
 

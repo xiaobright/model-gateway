@@ -245,10 +245,11 @@ class Trace:
 
     @best_effort
     def start(self, *, protocol, endpoint, model, stream, req_bytes, stateful,
-              can_failover, stall_s, candidate_ids, start_deadline_s, client) -> None:
+              can_failover, stall_s, candidate_ids, start_deadline_s, client,
+              blob_bytes=0) -> None:
         self.emit(
             "request_start", protocol=protocol, endpoint=endpoint, model=model[:128],
-            stream=stream, req_bytes=req_bytes, stateful=stateful,
+            stream=stream, req_bytes=req_bytes, blob_bytes=blob_bytes, stateful=stateful,
             client=client if client in {"Codex Desktop", "Codex CLI", "Claude Code"} else "other",
             policy_version=POLICY_VERSION, can_failover=can_failover,
             stall_timeout_s=stall_s, start_deadline_s=start_deadline_s,

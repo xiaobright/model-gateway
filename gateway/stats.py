@@ -277,11 +277,22 @@ def p95_overall(rows: Iterable[dict]) -> int:
 #
 # 两个方向都是估值，不是账单：请求体含 JSON / 工具结构，字节与计费 token
 # 并不一一对应；回复可能只带推理摘要，缺少上游计费的完整内容。
-# 输出标尺只认不带推理的内容字节，排除 SSE / JSON 框架；用量仍以上游报告为准。
+#
+# 两个方向都只拿「口径一致」的记录定标尺：上行扣掉内嵌数据块（图片 base64、
+# Codex 回传的加密推理 —— 它们不按文本计费），下行只认既无思维链、也无加密思维链
+# 的记录，且只数内容字节，排除 SSE / JSON 框架。用量仍以上游报告为准。
 
 RATIO_MIN_ROWS = 20        # 样本少于这个数就用兜底常数，别拿三条记录去定标尺
 RATIO_MAX_SPREAD = 6.0     # p90/p10 超过这个就是「字节数压根预测不了 token」，不给估值
 RATIO_TTL = 60.0           # 学出来的标尺缓存这么久：那个接口 1 秒一刷，不该每次全表扫
+# 正文内容的字节数摊 token 有个物理下界：UTF-8 中文一个 token 摊 3 字节往上，英文 4 字节
+# 上下，再密的代码/JSON 也到不了 1.5 以下。比这还低只有一种解释：output_tokens 里有
+# 「不发字节的隐藏 token」—— 加密回传的思维链。真库上一批 0.02~1.5 的记录就是它，
+# 把下行中位数从 ≈4 拖到 2.55。这个下界兜住三件事：encrypted_bytes 采集上线之前的历史
+# 数据、观察器漏检的边角，和没认出来的新形态（各家闭源模型的隐藏思维链层出不穷，
+# 逐一枚举追不完，物理下界一视同仁）。（方法上仍取中位数：试过最小二乘/截断均值，
+# 上行被大请求以字节数²的权重整个带走，误差翻倍还多。）
+RATIO_MIN_BYTES_PER_TOKEN = 1.5
 
 # 兜底值在协议描述符里登记。上行取自真库两千条记录的中位数；下行是中英混排正文的
 # 经验值，等攒够没有思维链的记录就会被真实测量顶掉。未配置的协议不擅自套用别人的值。
@@ -339,12 +350,19 @@ def token_ratio() -> dict[str, dict[str, float]]:
             continue
         # 门槛甩掉小请求：那种请求里固定开销占大头，摊出来的比值和真正想看的大请求不是一回事
         ctx = context_tokens(row)
-        if ctx > 200 and row["req_bytes"]:
-            up[name].append(row["req_bytes"] / ctx)
-        # 下行只认没有思维链的记录，而且只数内容字节，理由见本节开头
+        # 上行要扣掉内嵌数据块（图片 base64、Codex 回传的加密推理）：它们不按文本计费，
+        # 混在整包字节里只会让比值虚高 —— 一张图就能差出几十倍
+        text_req = row["req_bytes"] - (row.get("req_blob_bytes") or 0)
+        if ctx > 200 and text_req > 0:
+            up[name].append(text_req / ctx)
+        # 下行只认既没有思维链、也没有加密思维链的记录，而且只数内容字节：GPT 的
+        # 加密思维链计入了 output_tokens 却不进 resp_text_bytes，口径不一致的记录会
+        # 把标尺整个压低（正文没几个字、token 却上千的那种就是它）。物理下界再兜一层。
         got_out = row["output_tokens"] or 0
         content = row.get("resp_text_bytes") or 0
-        if got_out > 20 and content and not row.get("thinking"):
+        if (got_out > 20 and content and not row.get("thinking")
+                and not row.get("encrypted_bytes")
+                and content / got_out >= RATIO_MIN_BYTES_PER_TOKEN):
             down[name].append(content / got_out)
 
     result = {

@@ -58,6 +58,9 @@ class Call:
     model: str                      # 下游要的那个名字
     stream: bool
     req_bytes: int
+    # 请求体里有多少字节是内嵌数据块（图片 base64、回传的加密推理），不是文本。
+    # 「≈ N tok」的上行标尺要从 req_bytes 里扣掉它，否则一张图就把它带偏。
+    req_blob_bytes: int = 0
     meta: bool = False              # count_tokens 这类元数据请求，不计入「进行中」
     # 最后一次有进展的时刻。扫幽灵看它，不看 started —— 长流不该因为跑得久被清掉
     progress_at: float = 0.0
@@ -74,6 +77,9 @@ class Call:
     # 思维链发来的是总结、计费按完整的算，所以「收到多少」和「计费多少」是两个数
     text_bytes: int = 0
     thinking: bool = False
+    # 响应里 encrypted_content（GPT 的加密思维链）的字节数。它计入 output_tokens 却不进
+    # text_bytes，所以「收到的」和「计费的」对不上；标出来，界面上好说清为什么。
+    encrypted_bytes: int = 0
     # 上游自己报的 token 数（0 = 还没报）。有真数就不用按字节估了 —— Anthropic 把输入
     # token 放在流开头的 message_start 里，所以它往往在第一块字节里就到手了
     tokens_in: int = 0
@@ -155,6 +161,7 @@ def begin(
     model: str,
     stream: bool,
     req_bytes: int,
+    blob_bytes: int = 0,
     meta: bool = False,
 ) -> Call:
     with _lock:
@@ -162,7 +169,7 @@ def begin(
         now = time.monotonic()
         call = Call(
             id=next(_ids), started=now, progress_at=now, client=client, protocol=protocol,
-            model=model, stream=stream, req_bytes=req_bytes, meta=meta,
+            model=model, stream=stream, req_bytes=req_bytes, req_blob_bytes=blob_bytes, meta=meta,
         )
         _calls[call.id] = call
     return call
@@ -199,6 +206,7 @@ def set_route(
     call.tokens_out = 0
     call.text_bytes = 0
     call.thinking = False
+    call.encrypted_bytes = 0
     _touch(call)
 
 
@@ -225,12 +233,16 @@ def usage(call: Call | None, *, tokens_in: int = 0, tokens_out: int = 0) -> None
     _touch(call)
 
 
-def progress(call: Call | None, sent: int, *, text_bytes: int = 0, thinking: bool = False) -> None:
+def progress(
+    call: Call | None, sent: int, *, text_bytes: int = 0, thinking: bool = False,
+    encrypted_bytes: int = 0,
+) -> None:
     if call is None:
         return
     call.sent = sent
     call.text_bytes = text_bytes
     call.thinking = call.thinking or thinking
+    call.encrypted_bytes = max(call.encrypted_bytes, encrypted_bytes)
     _touch(call)
 
 
@@ -340,9 +352,11 @@ def _as_dict(call: Call) -> dict[str, Any]:
         "phase": call.phase,
         "status": call.status,
         "req_bytes": call.req_bytes,
+        "req_blob_bytes": call.req_blob_bytes,
         "sent": call.sent,
         "text_bytes": call.text_bytes,
         "thinking": call.thinking,
+        "encrypted_bytes": call.encrypted_bytes,
         "tokens_in": call.tokens_in,
         "tokens_out": call.tokens_out,
         "elapsed_ms": call.elapsed_ms,
