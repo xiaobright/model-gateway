@@ -409,6 +409,62 @@ test('全选按每行的选择处理：只留着的批量登记，要对应的�
   assert.match(h.toasts.at(-1)[0], /登记 1 个，对应下游 1 条/);
 });
 
+/* 实测回归：直接在「上游站点」把上游模型加到某个下游底下，再打开分组弹窗（没有点
+   「拉取模型列表」）—— 已暴露的要认出来、锁上，不能再按「新开」建出重复。 */
+test('打开分组弹窗就问回对应建议：已暴露的锁上并显示真实下游名', async (t) => {
+  const h = harness(t);
+  const gid = 66;
+  const remote = 'deepseek-ai/DeepSeek-V4-Flash-0731';
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [remote, 'glm-5.3-flash'] }])];
+  util.state.routes = [
+    { model_name: 'deepseek-v4-flash', protocol: 'openai', candidates: [{ group_id: gid, remote_model: remote }] },
+    { model_name: 'glm-5.3-flash', protocol: 'openai', candidates: [{ group_id: gid, remote_model: 'glm-5.3-flash' }] },
+  ];
+  await editGroup(h, gid, 'key-A');
+  // 打开弹窗就该问建议，不等「拉取模型列表」
+  const planJob = h.latest();
+  assert.equal(planJob.path, `/admin/api/groups/${gid}/models/plan`);
+  assert.deepEqual(planJob.body, { model_names: [remote, 'glm-5.3-flash'] });
+  planJob.resolve({
+    plans: [
+      { remote_model: remote, exact: [], partial: ['deepseek-v4-flash'], exposed_as: ['deepseek-v4-flash'] },
+      { remote_model: 'glm-5.3-flash', exact: ['glm-5.3-flash'], partial: [], exposed_as: ['glm-5.3-flash'] },
+    ],
+  });
+  for (let i = 0; i < 20 && !/已暴露给下游/.test(h.element('grp-picker').innerHTML); i++) await tick();
+  const html = h.element('grp-picker').innerHTML;
+  assert.match(html, /data-name="deepseek-ai\/DeepSeek-V4-Flash-0731"[\s\S]*?已暴露给下游：deepseek-v4-flash/,
+    '带厂商前缀的真名要认出它挂在短名底下');
+  assert.match(html, /data-name="glm-5.3-flash"[\s\S]*?已暴露给下游：glm-5.3-flash/);
+  assert.doesNotMatch(html, /新开下游模型：deepseek-ai/, '已暴露的不该还默认新开');
+});
+
+test('建议没问到也不许建重复：已经挂在别的下游名下的按「新开」点也被拦下', async (t) => {
+  const h = harness(t);
+  const gid = 67;
+  const remote = 'deepseek-ai/DeepSeek-V4-Flash-0731';
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [remote] }])];
+  util.state.routes = [
+    { model_name: 'deepseek-v4-flash', protocol: 'openai', candidates: [{ group_id: gid, remote_model: remote }] },
+  ];
+  await editGroup(h, gid, 'key-A');
+  h.latest().reject(new Error('建议接口炸了'));   // 建议拿不到：行退回「新开」默认
+  await tick();
+  assert.match(h.element('grp-picker').innerHTML, /新开下游模型：deepseek-ai/);
+  const label = {
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: true, dataset: { name: remote } }
+      : { value: 'new' }),
+  };
+  const before = h.requests.length;
+  await h.app.actions['pick-toggle']({ name: remote }, { checked: true, closest: () => label });
+  assert.equal(h.requests.length, before, '不许发建候选的请求');
+  assert.match(h.toasts.at(-1)[0], /已经挂在「deepseek-v4-flash」底下/);
+  // 那一行转为锁着的，显示真实的下游名
+  assert.match(h.element('grp-picker').innerHTML, /已暴露给下游：deepseek-v4-flash/);
+});
+
 test('加候选只显示已登记模型，不请求上游，并将名称匹配项排前', async (t) => {
   const h = harness(t);
   const gid = 51;

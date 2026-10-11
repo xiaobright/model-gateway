@@ -22,6 +22,7 @@ from gateway import model_match
         ("GPT-Test", ["gpt-test"], ["gpt-test"], []),               # 大小写不算差别
         ("deepseek-ai/DeepSeek-V3", ["DeepSeek-V3"], ["DeepSeek-V3"], []),
         ("gpt-test-2024", ["gpt-test"], [], ["gpt-test"]),          # 带日期后缀
+        ("deepseek-ai/DeepSeek-V4-Flash-0731", ["deepseek-v4-flash"], [], ["deepseek-v4-flash"]),
         ("kimi-k2", ["gpt-test"], [], []),                          # 不沾边
         ("gpt-test", ["gpt-test", "gpt-test"], ["gpt-test"], []),   # 同名多接口只列一次
     ],
@@ -86,6 +87,26 @@ def test_plan_marks_the_group_s_own_exposed_models(gateway):
         by_name = {p["remote_model"]: p for p in _plan(gateway, g_a, ["gpt-test", "kimi-k2"])["plans"]}
         assert by_name["gpt-test"]["exposed_as"] == ["gpt-test", "my-chat"]
         assert by_name["kimi-k2"]["exposed_as"] == []
+
+
+def test_plan_recognizes_a_prefixed_remote_under_its_short_downstream_name(gateway):
+    """实测场景：聚合站的真名带厂商前缀和日期后缀，人把它加到了短名底下
+    （deepseek-ai/DeepSeek-V4-Flash-0731 → deepseek-v4-flash）。界面要能认出它
+    已经挂好了，还要指出那个短名是部分匹配的合并目标。"""
+    with MockUpstream("siteA") as a:
+        g_a = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "deepseek-v4-flash", g_a, "deepseek-ai/DeepSeek-V4-Flash-0731")
+        add_route(gateway, "glm-5.3-flash", g_a, "glm-5.3-flash")
+
+        by_name = {
+            p["remote_model"]: p
+            for p in _plan(gateway, g_a, ["deepseek-ai/DeepSeek-V4-Flash-0731", "glm-5.3-flash"])["plans"]
+        }
+        prefixed = by_name["deepseek-ai/DeepSeek-V4-Flash-0731"]
+        assert prefixed["exposed_as"] == ["deepseek-v4-flash"]
+        assert prefixed["exact"] == [] and prefixed["partial"] == ["deepseek-v4-flash"]
+        assert by_name["glm-5.3-flash"]["exposed_as"] == ["glm-5.3-flash"]
+        assert by_name["glm-5.3-flash"]["exact"] == ["glm-5.3-flash"]
 
 
 def test_plan_does_not_offer_forward_only_models(gateway):

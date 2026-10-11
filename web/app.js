@@ -910,6 +910,15 @@ function renderPicker() {
   host.innerHTML = head + body + tail;
   $('grp-mcount').textContent = `${mine.length} 个`;
   applyPickerFilter();
+  // 目录里的行（没拉过列表也会显示）同样要带对应建议：缺建议的名字补问一次，
+  // 回来后重画一次。问过的不重复问，所以不会转圈；建议拿不到只是没有那几个选项，
+  // 行照样能勾、能选「新开 / 只留着」
+  const missing = [...mine, ...rest].filter((n) => !pickPlans.has(n));
+  if (missing.length) {
+    ensurePickPlans(gid, missing).then(() => {
+      if (state.editingGroup === gid && $('group-dialog').open) renderPicker();
+    });
+  }
 }
 
 /** 请求失败或别处改了配置之后，把勾选状态拉回库里的真相，顺序不动（重排会让人点空） */
@@ -984,10 +993,10 @@ async function ensurePickPlans(gid, names) {
   }
 }
 
-/** 记下「这个真名已经挂到某个下游底下」：那一行接下来是锁着的。 */
-function markExposed(name, target) {
+/** 记下「这个真名已经挂在这些下游底下」：那一行接下来是锁着的。 */
+function markExposed(name, targets) {
   const plan = pickPlans.get(name) || { exact: [], partial: [], exposed_as: [] };
-  pickPlans.set(name, { ...plan, exposed_as: [target] });
+  pickPlans.set(name, { ...plan, exposed_as: [...new Set([...targets, ...plan.exposed_as])] });
   pickPending.delete(name);
 }
 
@@ -1004,20 +1013,28 @@ async function mapToDownstream(token, name, value) {
   if (!token || !isCurrentGroupEdit(token) || token.groupId === null) return false;
   const target = value === MAP_NEW ? name : value.slice(MAP_DOWN.length);
   if (!target) return false;
-  // 已经挂在哪个下游底下就不必再发：那种行本来是锁着的，能走到这里多是别处刚加过
+  // 建议里已经标了暴露的（打开弹窗/拉取时问回的）直接不发
   if (pickPlans.get(name)?.exposed_as?.length) return false;
-  const taken = state.routes.some((row) => row.model_name === target
-    && row.candidates.some((c) => c.group_id === token.groupId && c.remote_model === name));
-  if (taken) {
-    markExposed(name, target);
-    toast(`这个站已经挂在「${target}」底下了`, 'ok');
+  // 这个站的这个真名只要已经挂在**任何一个**下游底下就不再发。不认目标名：挂在
+  // 「deepseek-v4-flash」底下的 deepseek-ai/DeepSeek-V4-Flash-0731，按「新开」点
+  // 也不该再建出一个用上游全名命名的下游模型。上一行漏掉的多半是打开弹窗后别处
+  // 刚加过的，这里按当前路由状态兜底
+  const under = [];
+  for (const row of state.routes) {
+    if (row.candidates.some((c) => c.group_id === token.groupId && c.remote_model === name)) {
+      under.push(row.model_name);
+    }
+  }
+  if (under.length) {
+    markExposed(name, under);
+    toast(`这个站已经挂在「${under.join('、')}」底下了`, 'ok');
     return false;
   }
   await api('POST', '/admin/api/models', {
     model_name: target, group_id: token.groupId, remote_model: name,
   });
   if (!isCurrentGroupEdit(token)) return false;
-  markExposed(name, target);
+  markExposed(name, [target]);
   toast(target === name
     ? `已新建下游模型 ${name}，这个站挂成它的候选`
     : `已把 ${name} 对应到下游 ${target}`, 'ok');
