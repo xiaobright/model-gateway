@@ -23,21 +23,26 @@ from . import model_batch
 PARTIAL_LIMIT = 5
 
 
-def downstream_names() -> set[str]:
-    """下游已有的模型名 —— 对应的候选目标。
+def downstream_names(protocol: str) -> set[str]:
+    """这个**接口**下已有的下游模型名 —— 对应的候选目标。
 
     只算**自己有候选**的模型：纯转发模型（整条链交给别人）自己的候选不参与路由，
     对应过去也是睡着的一条，不给这个选项。
+
+    按分组的协议分开算：转发按「模型名 + 接口」选链，同一个模型名在 Responses 和
+    Chat Completions 下各是一条互不可见的链。给 Chat Completions 的分组列 Responses
+    那边的同名模型是扫错了 —— 那边暴露了不等于这边调得到，列成「完全匹配」只会让人
+    以为已经挂好了，勾下去其实是在这边新开一条链。
     """
-    return {row["model_name"] for row in db.list_routes()}
+    return {row["model_name"] for row in db.list_routes() if row["protocol"] == protocol}
 
 
 def plan(remote_model: str, names: Iterable[str]) -> tuple[list[str], list[str]]:
     """这个上游真名能对应到哪些下游模型，返回 (完全匹配, 部分匹配)。
 
     完全匹配按名字字典序；部分匹配按相似度排（同分按名字），只取前 PARTIAL_LIMIT
-    个。同一个名字在多种接口下各有一条链也只出现一次 —— 选对应的是「哪个下游
-    模型」，接口由候选所在的分组决定，这里不掺和。
+    个。``names`` 由调用方按接口筛过（见 ``downstream_names``）—— 选对应的是「这个
+    接口下的哪个下游模型」，别的接口下的同名模型是另一条链，这里不掺和。
     """
     exact: list[str] = []
     partial: list[tuple[float, str]] = []

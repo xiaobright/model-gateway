@@ -32,7 +32,7 @@
 | `gateway/protocols.py` | 各接口的名称、鉴权方式、结束事件、用量读取和页面展示信息。 |
 | `gateway/db.py` | 配置和记录的读写、数据库升级、模型候选查询。 |
 | `gateway/model_batch.py` | 「批量添加新模型」：名字相似度打分、并发扫描所有分组、批量登记与挂候选。 |
-| `gateway/model_match.py` | 分组拉模型列表时的下游对应建议：完全/部分匹配分档、已暴露标记；打分复用 model_batch.score。 |
+| `gateway/model_match.py` | 分组拉模型列表时的下游对应建议：完全/部分匹配分档（只在本接口的下游模型里找）、已暴露标记；打分复用 model_batch.score。 |
 | `gateway/failover.py` | 重试规则、候选顺序和分组冷却。 |
 | `gateway/truncation.py` | 200 截断拦截：连着拿回空响应就扣住、原站重发。 |
 | `gateway/upstream.py` | 站点地址、鉴权头、出口/TLS、共享连接池和上游模型列表。 |
@@ -613,7 +613,7 @@ git diff --check
 | `test_routing` | 候选选择、停用、同名多接口隔离和配置冲突。 |
 | `test_admin` | 管理接口、保存校验、模型目录、数据库升级。 |
 | `test_model_batch` | 批量添加模型：名字相似度分级、扫描不写配置、单站失败与其他站隔离、提交幂等与跨接口各一条链。 |
-| `test_model_match` | 分组拉取模型的下游对应：完全/部分匹配分档与并列时的确定性、plan 接口只读、已暴露标记、纯转发模型不列为目标。 |
+| `test_model_match` | 分组拉取模型的下游对应：完全/部分匹配分档与并列时的确定性、plan 接口只读、已暴露标记、纯转发模型不列为目标、只匹配本接口暴露的下游模型。 |
 | `test_forwards` | 下游→下游转发：多跳、成环与死链校验、候选保留和恢复。 |
 | `test_canvas` | 编排画布坐标：存取、剪枝、坏输入退化，以及「坐标不影响路由」。 |
 | `test_failover`、`test_same_retry` | 换候选、冷却、同站重试及限制。 |

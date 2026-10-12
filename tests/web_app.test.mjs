@@ -336,12 +336,121 @@ test('分组选择器：勾上时按选择框对应到下游，发的是建候�
   const job = h.latest();
   assert.equal(job.path, '/admin/api/models');
   assert.deepEqual(job.body, { model_name: 'kimi-k2', group_id: gid, remote_model: 'kimi-k2' });
+  const seen = h.requests.length;
   job.resolve({ route_id: 7, model_name: 'kimi-k2', group_id: gid, remote_model: 'kimi-k2', protocol: 'openai' });
+  for (let i = 0; i < 20 && h.requests.length <= seen; i++) await tick();
+  // 新开了一个下游模型：同一批的建议整批重问，后面的行才沾得到匹配
+  assert.equal(h.latest().path, `/admin/api/groups/${gid}/models/plan`);
+  assert.deepEqual(h.latest().body, { model_names: ['kimi-k2'] });
+  h.latest().resolve({
+    plans: [{ remote_model: 'kimi-k2', exact: [], partial: [], exposed_as: ['kimi-k2'] }],
+  });
   h.releaseRefreshes();
   await adding;
   assert.match(h.toasts.at(-1)[0], /已新建下游模型 kimi-k2/);
   // 对应过之后那一行锁着，只说明现状
   assert.match(h.element('grp-picker').innerHTML, /已暴露给下游：kimi-k2/);
+});
+
+/* 实测：一批里先新开 mistral-large-4，后面的 mistral-large-4:tool 打开弹窗时还没有
+   它、建议里没有匹配。新开之后要重问建议，那一行才看得到「对应到部分匹配」。 */
+test('新开下游模型后重问建议：同批后面的行沾到部分匹配', async (t) => {
+  const h = harness(t);
+  const gid = 68;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
+  await editGroup(h, gid, 'key-A');
+  h.evaluate(`
+    pulled = ['mistral-large-4', 'mistral-large-4:tool'];
+    pickPlans = new Map([
+      ['mistral-large-4', { exact: [], partial: [], exposed_as: [] }],
+      ['mistral-large-4:tool', { exact: [], partial: [], exposed_as: [] }],
+    ]);
+    renderPicker();
+  `);
+  const label = {
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: true, dataset: { name: 'mistral-large-4' } }
+      : { value: 'new' }),
+  };
+  const adding = h.app.actions['pick-toggle']({ name: 'mistral-large-4' }, { checked: true, closest: () => label });
+  const job = h.latest();
+  assert.deepEqual(job.body, { model_name: 'mistral-large-4', group_id: gid, remote_model: 'mistral-large-4' });
+  const seen = h.requests.length;
+  job.resolve({ route_id: 5, model_name: 'mistral-large-4', group_id: gid, remote_model: 'mistral-large-4', protocol: 'openai' });
+  for (let i = 0; i < 20 && h.requests.length <= seen; i++) await tick();
+  assert.equal(h.latest().path, `/admin/api/groups/${gid}/models/plan`);
+  assert.deepEqual(h.latest().body, { model_names: ['mistral-large-4', 'mistral-large-4:tool'] });
+  h.latest().resolve({
+    plans: [
+      { remote_model: 'mistral-large-4', exact: ['mistral-large-4'], partial: [], exposed_as: ['mistral-large-4'] },
+      { remote_model: 'mistral-large-4:tool', exact: [], partial: ['mistral-large-4'], exposed_as: [] },
+    ],
+  });
+  h.releaseRefreshes();
+  await adding;
+  assert.match(h.element('grp-picker').innerHTML,
+    /data-name="mistral-large-4:tool"[\s\S]*?对应到部分匹配：mistral-large-4/,
+    '后一行现在看得到刚建的下游模型');
+});
+
+/* 实测：同名模型在另一种接口下已经暴露着。那边暴露了不等于这边也有（两条链互不
+   可见），提示要说清是在本接口下暴露，别让人以为新建了一个模型。 */
+test('同名模型只在另一种接口下有过：提示说的是在本接口下暴露', async (t) => {
+  const h = harness(t);
+  const gid = 69;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
+  util.state.routes = [
+    { model_name: 'kimi-k2', protocol: 'anthropic', candidates: [{ group_id: 999, remote_model: 'kimi-k2' }] },
+  ];
+  await editGroup(h, gid, 'key-A');
+  h.evaluate(`
+    pulled = ['kimi-k2'];
+    pickPlans = new Map([['kimi-k2', { exact: [], partial: [], exposed_as: [] }]]);
+    renderPicker();
+  `);
+  const label = {
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: true, dataset: { name: 'kimi-k2' } }
+      : { value: 'new' }),
+  };
+  const adding = h.app.actions['pick-toggle']({ name: 'kimi-k2' }, { checked: true, closest: () => label });
+  const seen = h.requests.length;
+  h.latest().resolve({ route_id: 11, model_name: 'kimi-k2', group_id: gid, remote_model: 'kimi-k2', protocol: 'openai' });
+  for (let i = 0; i < 20 && h.requests.length <= seen; i++) await tick();
+  h.latest().resolve({ plans: [{ remote_model: 'kimi-k2', exact: [], partial: [], exposed_as: ['kimi-k2'] }] });
+  h.releaseRefreshes();
+  await adding;
+  assert.match(h.toasts.at(-1)[0], /已把 kimi-k2 暴露到 Responses 接口（另一种接口下已有同名模型）/);
+});
+
+test('本接口已经有同名下游模型：算对应过去，不说是新接口暴露', async (t) => {
+  const h = harness(t);
+  const gid = 70;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
+  util.state.routes = [
+    { model_name: 'kimi-k2', protocol: 'openai', candidates: [{ group_id: 999, remote_model: 'kimi-k2' }] },
+  ];
+  await editGroup(h, gid, 'key-A');
+  h.evaluate(`
+    pulled = ['kimi-k2'];
+    pickPlans = new Map([['kimi-k2', { exact: ['kimi-k2'], partial: [], exposed_as: [] }]]);
+    renderPicker();
+  `);
+  const label = {
+    classList: { add: noop, remove: noop },
+    querySelector: (s) => (s.startsWith('input')
+      ? { checked: true, dataset: { name: 'kimi-k2' } }
+      : { value: 'down:kimi-k2' }),
+  };
+  const adding = h.app.actions['pick-toggle']({ name: 'kimi-k2' }, { checked: true, closest: () => label });
+  const seen = h.requests.length;
+  h.latest().resolve({ route_id: 12, model_name: 'kimi-k2', group_id: gid, remote_model: 'kimi-k2', protocol: 'openai' });
+  h.releaseRefreshes();
+  await adding;
+  assert.match(h.toasts.at(-1)[0], /已把 kimi-k2 对应到下游 kimi-k2/);
+  assert.equal(h.requests.length, seen, '对应到建议里已有的模型不用重问建议');
 });
 
 test('分组选择器：没勾的行换选择只是记下，勾上的行换选择当场对应', async (t) => {
@@ -391,6 +500,8 @@ test('全选按每行的选择处理：只留着的批量登记，要对应的�
   const gid = 65;
   util.state.upstreams = [provider(1, [{ ...group(gid), models: [] }])];
   await editGroup(h, gid, 'key-A');
+  // 对应到建议里已有的下游模型：不新开链，就不用重问建议
+  h.evaluate(`pickPlans = new Map([['gpt-test', { exact: ['gpt-test'], partial: [], exposed_as: [] }]]);`);
   stubPickLabels(h, [
     { name: 'gpt-test', map: 'down:gpt-test' },
     { name: 'kimi-k2', map: 'catalog' },
@@ -406,6 +517,7 @@ test('全选按每行的选择处理：只留着的批量登记，要对应的�
   h.latest().resolve({ route_id: 3, model_name: 'gpt-test', group_id: gid, remote_model: 'gpt-test', protocol: 'openai' });
   h.releaseRefreshes();
   await all;
+  assert.equal(h.requests.length, seen + 1, '对应到已有模型不该再重问建议');
   assert.match(h.toasts.at(-1)[0], /登记 1 个，对应下游 1 条/);
 });
 

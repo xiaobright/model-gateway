@@ -889,6 +889,12 @@ const pickRow = (name, on) => `<label class="${on ? 'on' : ''}">
     ${pickMapOptions(name, pickPlans.get(name))}
   </label>`;
 
+/** 选择器上全部名字：目录里已登记的 + 拉回来还没登记的。问建议、重问建议都按这份名单。 */
+const pickerNames = (gid) => {
+  const owned = new Set(catalogOfGroup(gid));
+  return [...owned, ...pulled.filter((m) => !owned.has(m))];
+};
+
 function renderPicker() {
   const gid = state.editingGroup;
   const host = $('grp-picker');
@@ -913,7 +919,7 @@ function renderPicker() {
   // 目录里的行（没拉过列表也会显示）同样要带对应建议：缺建议的名字补问一次，
   // 回来后重画一次。问过的不重复问，所以不会转圈；建议拿不到只是没有那几个选项，
   // 行照样能勾、能选「新开 / 只留着」
-  const missing = [...mine, ...rest].filter((n) => !pickPlans.has(n));
+  const missing = pickerNames(gid).filter((n) => !pickPlans.has(n));
   if (missing.length) {
     ensurePickPlans(gid, missing).then(() => {
       if (state.editingGroup === gid && $('group-dialog').open) renderPicker();
@@ -980,17 +986,29 @@ async function addModels(names, token = currentGroupEdit()) {
 }
 
 /* 对应建议只在后端算一份（gateway/model_match.py）。问过的名字不重复问；拿不到只是
-   没有「对应到 X」那几个选项，选择框照样能用（新开 / 只留着不受影响）。 */
-async function ensurePickPlans(gid, names) {
+   没有「对应到 X」那几个选项，选择框照样能用（新开 / 只留着不受影响）。
+   force = 已经问过的也重问；quiet = 问失败不弹提示（重问失败时旧建议还够用，
+   而且一次都不改 pickPlans，别把选择框打成只有「新开」）。 */
+async function ensurePickPlans(gid, names, { force = false, quiet = false } = {}) {
   const fresh = [...new Set(names.map((n) => (n || '').trim()).filter(Boolean))]
-    .filter((n) => !pickPlans.has(n));
+    .filter((n) => force || !pickPlans.has(n));
   if (!fresh.length) return;
   try {
     const data = await api('POST', `/admin/api/groups/${gid}/models/plan`, { model_names: fresh });
     for (const p of data.plans || []) pickPlans.set(p.remote_model, p);
   } catch (e) {
-    toast(`下游对应建议没拿到：${e.message}`, 'err');
+    if (!quiet) toast(`下游对应建议没拿到：${e.message}`, 'err');
   }
+}
+
+/** 新开过一个下游模型之后，把这一批的建议整批重问一遍。
+
+弹窗开着的时候，后面几行可能就此沾上了匹配：先建了 mistral-large-4，后面那个
+mistral-large-4:tool 就有「部分匹配」可对应了 —— 不重问的话它还按打开弹窗时的旧
+建议显示「没有匹配，只能建新的」。已经暴露的行由后端照旧标回来，锁不会掉；整批问失败
+就留着旧建议，少几个选项也比把选择框打成只有「新开」好。 */
+async function refreshPickPlans(gid) {
+  await ensurePickPlans(gid, pickerNames(gid), { force: true, quiet: true });
 }
 
 /** 记下「这个真名已经挂在这些下游底下」：那一行接下来是锁着的。 */
@@ -1030,14 +1048,27 @@ async function mapToDownstream(token, name, value) {
     toast(`这个站已经挂在「${under.join('、')}」底下了`, 'ok');
     return false;
   }
+  // 同名的下游模型可能已经在**别的接口**下暴露着（转发按「模型名 + 接口」选链，两条链
+  // 互不可见）：那不算新开一个模型，只是这个接口下多一条链。本接口已经有就算了合并
+  const proto = groupOf(token.groupId)?.protocol || '';
+  const twins = state.routes.filter((r) => r.model_name === target);
+  const here = twins.some((r) => r.protocol === proto);
   await api('POST', '/admin/api/models', {
     model_name: target, group_id: token.groupId, remote_model: name,
   });
   if (!isCurrentGroupEdit(token)) return false;
   markExposed(name, [target]);
-  toast(target === name
-    ? `已新建下游模型 ${name}，这个站挂成它的候选`
-    : `已把 ${name} 对应到下游 ${target}`, 'ok');
+  let msg;
+  if (target !== name || here) msg = `已把 ${name} 对应到下游 ${target}`;
+  else if (!twins.length) msg = `已新建下游模型 ${name}，这个站挂成它的候选`;
+  else msg = `已把 ${name} 暴露到 ${PROTO_LABEL[proto] || proto || '当前'} 接口（另一种接口下已有同名模型）`;
+  toast(msg, 'ok');
+  // 目标是建议里没有的下游模型 = 这个接口下新开了一条链：同一批里后面的行可能就此
+  // 沾上匹配。建议是打开弹窗时问的那一份，这里整批重问（详见 refreshPickPlans）
+  const known = pickPlans.get(name);
+  if (!(known?.exact || []).includes(target) && !(known?.partial || []).includes(target)) {
+    await refreshPickPlans(token.groupId);
+  }
   return true;
 }
 

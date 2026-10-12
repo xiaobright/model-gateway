@@ -35,6 +35,8 @@ def main() -> None:
     config.SETTINGS_PATH = preview / 'settings.json'
 
     # 覆盖所有 httpx 客户端的 transport，目录拉取/探测/转发都不访问外部站点。
+    # mounts 也要一起清掉：本机开着系统代理时 client_args 会挂上「全走代理」的
+    # mounts，它比默认 transport 先匹配，模拟就被绕过去了（请求真的出网卡）。
     client_type = httpx.AsyncClient
     def mock_response(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith('/models'):
@@ -45,7 +47,7 @@ def main() -> None:
 
     class PreviewClient(client_type):
         def __init__(self, *a, **kw):
-            kw.update(transport=httpx.MockTransport(mock_response), trust_env=False, proxy=None)
+            kw.update(transport=httpx.MockTransport(mock_response), trust_env=False, proxy=None, mounts={})
             super().__init__(*a, **kw)
     httpx.AsyncClient = PreviewClient
 

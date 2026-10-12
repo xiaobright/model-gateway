@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from helpers import MockUpstream, add_route, add_upstream
+from helpers import MockUpstream, add_group, add_route, add_upstream, provider_id
 from gateway import model_match
 
 
@@ -120,6 +120,28 @@ def test_plan_does_not_offer_forward_only_models(gateway):
 
         plan = _plan(gateway, g_a, ["my-chat"])["plans"][0]
         assert plan["exact"] == [] and plan["partial"] == []
+
+
+def test_plan_only_matches_models_exposed_in_the_group_s_own_interface(gateway):
+    """实测：Chat Completions 的分组不该把 Responses 那边的同名模型算成「完全匹配」。
+
+    同名模型在两种接口下是两条互不可见的链（转发按「模型名 + 接口」选链），隔壁
+    接口暴露了不等于这边调得到 —— 列成完全匹配只会让人以为已经挂好了。同一个站
+    同一种接口下另一把 key 挂的候选照旧算匹配。
+    """
+    with MockUpstream("siteA") as a:
+        g_resp = add_upstream(gateway, a, "siteA")                              # openai（Responses）
+        g_chat = add_group(gateway, provider_id(gateway, "siteA"), "openai-chat", api_key="key-siteA")
+        add_route(gateway, "gpt-test", g_resp, "gpt-test")                      # 只在 Responses 下暴露
+        add_route(gateway, "gpt-test", g_resp, "gpt-test-2024")                 # 同接口另一把 key 的候选
+
+        chat = {p["remote_model"]: p for p in _plan(gateway, g_chat, ["gpt-test", "gpt-test-2024"])["plans"]}
+        assert chat["gpt-test"]["exact"] == [] and chat["gpt-test"]["partial"] == []
+        assert chat["gpt-test-2024"]["exact"] == [] and chat["gpt-test-2024"]["partial"] == []
+        # 同接口的另一边照旧算匹配：完全匹配、部分匹配都还有
+        resp = {p["remote_model"]: p for p in _plan(gateway, g_resp, ["gpt-test", "gpt-test-2024"])["plans"]}
+        assert resp["gpt-test"]["exact"] == ["gpt-test"]
+        assert resp["gpt-test-2024"]["partial"] == ["gpt-test"]
 
 
 def test_plan_rejects_bad_payloads(gateway):

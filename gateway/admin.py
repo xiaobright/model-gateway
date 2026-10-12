@@ -812,11 +812,13 @@ def post_group_models_plan(group_id: int, payload: GroupModelsPlanIn) -> dict[st
     """拉回来的上游真名各自能对应到哪些下游模型。只读，给分组弹窗的选择框用。
 
     完全匹配 = 归一化后同名（或去掉厂商前缀后同名）；部分匹配 = 沾一部分，按像的
-    程度排。已经暴露给下游的（这个分组、这个真名已经是某条链的候选）在 exposed_as
-    里标出来 —— 那种行在界面上是锁着的，改映射去「模型路由」。
+    程度排。候选目标只在这个**分组接口**的下游模型里找（同名模型在 Responses 和
+    Chat Completions 下是两条互不可见的链，隔壁接口的不算匹配）。已经暴露给下游的
+    （这个分组、这个真名已经是某条链的候选）在 exposed_as 里标出来 —— 那种行在界面
+    上是锁着的，改映射去「模型路由」。
     """
-    _require_group(group_id)
-    names = model_match.downstream_names()
+    group = _require_group(group_id)
+    names = model_match.downstream_names(group.protocol)
     exposed = model_match.exposed_as(group_id)
     plans = []
     for raw in payload.model_names:
