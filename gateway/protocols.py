@@ -171,35 +171,36 @@ _IMAGE_TYPES = frozenset({"input_image", "image", "image_url"})
 
 def _blob_len(value: object) -> int:
     """一个字段里有多少字节是内嵌数据。字符串按 UTF-8 算；image_url 允许是 {url: ...}。"""
+    while isinstance(value, dict):
+        value = value.get("url")
     if isinstance(value, str):
         return len(value.encode("utf-8"))
-    if isinstance(value, dict):
-        return _blob_len(value.get("url"))
     return 0
 
 
 def _blob_scan(node: object, acc: list[int]) -> None:
     """一次遍历同时数出 [图片字节, 加密内容字节]，两类都算「非文本」。"""
-    if isinstance(node, dict):
-        # type 的值必须是字符串才能查表：客户端发来的畸形结构（list/dict）会让
-        # frozenset 成员检查抛 TypeError，而这里每个请求都要跑，炸一次就是一个 500
-        kind = node.get("type")
-        if isinstance(kind, str) and kind in _IMAGE_TYPES:
-            acc[0] += _blob_len(node.get("image_url")) + _blob_len(node.get("data"))
-            source = node.get("source")
-            if isinstance(source, dict):
-                acc[0] += _blob_len(source.get("data"))
-        encrypted = node.get("encrypted_content")
-        if isinstance(encrypted, str):
-            acc[1] += len(encrypted.encode("utf-8"))
-        # Anthropic 的加密思维块：内容是不透明的 data 字段，同属「计了 token 却不发字节」
-        if kind == "redacted_thinking":
-            acc[1] += _blob_len(node.get("data"))
-        for value in node.values():
-            _blob_scan(value, acc)
-    elif isinstance(node, list):
-        for value in node:
-            _blob_scan(value, acc)
+    # 用显式栈遍历 JSON，避免统计过程受 Python 递归深度限制。
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            # 工具 JSON Schema 的 type 可以是数组；只有字符串才查图片类型表。
+            kind = current.get("type")
+            if isinstance(kind, str) and kind in _IMAGE_TYPES:
+                acc[0] += _blob_len(current.get("image_url")) + _blob_len(current.get("data"))
+                source = current.get("source")
+                if isinstance(source, dict):
+                    acc[0] += _blob_len(source.get("data"))
+            encrypted = current.get("encrypted_content")
+            if isinstance(encrypted, str):
+                acc[1] += len(encrypted.encode("utf-8"))
+            # Anthropic 的加密思维块：内容是不透明的 data 字段，同属「计了 token 却不发字节」
+            if kind == "redacted_thinking":
+                acc[1] += _blob_len(current.get("data"))
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
 
 
 def blob_bytes(payload: object) -> int:

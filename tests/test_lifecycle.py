@@ -186,7 +186,7 @@ def test_protocol_failure_preserves_bytes_but_changes_all_result_views(app, monk
     assert truncation.fails(group.id, "m", "/responses") == int(content_type == "text/event-stream")
 
 
-@pytest.mark.parametrize("failure", ["flag_permission", "capture_finish", "usage_parser", "huge_usage"])
+@pytest.mark.parametrize("failure", ["flag_permission", "capture_finish", "usage_parser", "huge_usage", "blob_scan"])
 def test_observation_failures_do_not_break_response_or_cleanup(app, monkeypatch, failure):
     from pathlib import Path
     from gateway import capture, protocols
@@ -200,6 +200,10 @@ def test_observation_failures_do_not_break_response_or_cleanup(app, monkeypatch,
         def broken_usage(*args):
             raise ValueError("injected usage failure")
         monkeypatch.setattr(type(protocols.OPENAI), "extract_usage", lambda *args: broken_usage())
+    elif failure == "blob_scan":
+        def broken_blob(*args):
+            raise RuntimeError("injected request observation failure")
+        monkeypatch.setattr(protocols, "blob_bytes", broken_blob)
     else:
         monkeypatch.setattr(capture, "_state", {"remaining": 0, "active": 0})
         capture.enable(1)

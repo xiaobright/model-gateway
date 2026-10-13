@@ -313,7 +313,8 @@ async def _hold_probe(
             log(f"  SSE observe failed（扣住期间）: {exc.__class__.__name__}: {exc}")
         inflight.phase(call, inflight.STREAM)
         inflight.progress(
-            call, held.sent, text_bytes=observer.text_bytes, thinking=observer.thinking
+            call, held.sent, text_bytes=observer.text_bytes, thinking=observer.thinking,
+            encrypted_bytes=observer.encrypted_bytes,
         )
         if seen_error or observer.protocol_error:
             held.verdict = "bad"
@@ -393,6 +394,9 @@ async def forward(
         payload = json.loads(body)
         if not isinstance(payload, dict):
             raise ValueError("not a dict")
+    except RecursionError:
+        log(f"POST {endpoint} -> 400 (请求体 JSON 嵌套过深)")
+        return _error(proto, 400, "请求体 JSON 嵌套过深")
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return _error(proto, 400, "请求体不是合法 JSON")
 
@@ -404,7 +408,12 @@ async def forward(
 
     # 请求体里有多少字节是内嵌数据块（图片 base64、Codex 回传的加密推理），不是文本。
     # 按整包字节估输入 token 时要扣掉它 —— 一张图就能让「多少字节一个 token」整个带偏。
-    req_blob = protocols.blob_bytes(payload)
+    try:
+        req_blob = protocols.blob_bytes(payload)
+    except Exception as exc:
+        # 字节估算只是观察：失败留诊断，不能拦截转发或跳过请求记录。
+        log(f"  request blob observe failed: {exc.__class__.__name__}")
+        req_blob = 0
 
     compaction_capture = capture.compaction_requested(endpoint)
     requested = str(payload.get("model", ""))

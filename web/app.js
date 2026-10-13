@@ -744,6 +744,7 @@ async function openGroup(upstreamId, gid) {
 
   pulled = [];
   pickPlans = new Map();
+  pickPlanAttempts = new Map();
   pickPending = new Map();
   $('grp-pull-status').textContent = '';
   $('grp-picker-filter').value = '';
@@ -818,6 +819,7 @@ async function saveGroup() {
   if (modelsChanged) {
     pulled = [];
     pickPlans = new Map();
+    pickPlanAttempts = new Map();
     pickPending = new Map();
     $('grp-pull-status').textContent = '';
   }
@@ -838,6 +840,7 @@ async function saveGroup() {
 
 let pulled = [];            // 当前分组弹窗最近一次拉到的模型名；换分组就清空
 let pickPlans = new Map();  // 真名 -> {exact, partial, exposed_as}：拉取时问回的对应建议
+let pickPlanAttempts = new Map(); // 本会话已问过的名字（含在途和失败），主动拉取才重问
 // 没勾的行：选择框里选好但还没生效的对应方式。勾上那一刻按它办；不记的话，
 // 别处一次重画就把人预设的选择冲掉了
 let pickPending = new Map();
@@ -919,10 +922,14 @@ function renderPicker() {
   // 目录里的行（没拉过列表也会显示）同样要带对应建议：缺建议的名字补问一次，
   // 回来后重画一次。问过的不重复问，所以不会转圈；建议拿不到只是没有那几个选项，
   // 行照样能勾、能选「新开 / 只留着」
-  const missing = pickerNames(gid).filter((n) => !pickPlans.has(n));
+  const token = currentGroupEdit();
+  const plans = pickPlans;
+  const missing = pickerNames(gid).filter((n) => !pickPlans.has(n) && !pickPlanAttempts.has(n));
   if (missing.length) {
-    ensurePickPlans(gid, missing).then(() => {
-      if (state.editingGroup === gid && $('group-dialog').open) renderPicker();
+    ensurePickPlans(gid, missing).then((changed) => {
+      if (changed && isCurrentGroupEdit(token) && plans === pickPlans && $('group-dialog').open) {
+        renderPicker();
+      }
     });
   }
 }
@@ -985,19 +992,36 @@ async function addModels(names, token = currentGroupEdit()) {
   return true;
 }
 
-/* 对应建议只在后端算一份（gateway/model_match.py）。问过的名字不重复问；拿不到只是
-   没有「对应到 X」那几个选项，选择框照样能用（新开 / 只留着不受影响）。
+/* 对应建议只在后端算一份（gateway/model_match.py）。在途/失败的名字不随重画再问；
+   用户主动拉取时重问。拿不到建议时仍能选新开/只留着。
    force = 已经问过的也重问；quiet = 问失败不弹提示（重问失败时旧建议还够用，
    而且一次都不改 pickPlans，别把选择框打成只有「新开」）。 */
 async function ensurePickPlans(gid, names, { force = false, quiet = false } = {}) {
+  const token = currentGroupEdit();
+  if (!isCurrentGroupEdit(token) || token.groupId !== gid) return false;
+  const plans = pickPlans;
+  const attempts = pickPlanAttempts;
+  const current = () => isCurrentGroupEdit(token) && token.groupId === gid && plans === pickPlans;
   const fresh = [...new Set(names.map((n) => (n || '').trim()).filter(Boolean))]
-    .filter((n) => force || !pickPlans.has(n));
-  if (!fresh.length) return;
+    .filter((n) => force || (!plans.has(n) && !attempts.has(n)));
+  if (!fresh.length) return false;
+  const request = {};
+  fresh.forEach((name) => attempts.set(name, request));
   try {
     const data = await api('POST', `/admin/api/groups/${gid}/models/plan`, { model_names: fresh });
-    for (const p of data.plans || []) pickPlans.set(p.remote_model, p);
+    if (!current()) return false;
+    let changed = false;
+    for (const p of data.plans || []) {
+      if (attempts.get(p.remote_model) !== request) continue;
+      plans.set(p.remote_model, p);
+      changed = true;
+    }
+    return changed;
   } catch (e) {
-    if (!quiet) toast(`下游对应建议没拿到：${e.message}`, 'err');
+    if (current() && fresh.some((name) => attempts.get(name) === request)) {
+      if (!quiet) toast(`下游对应建议没拿到：${e.message}`, 'err');
+    }
+    return false;
   }
 }
 
@@ -1811,7 +1835,7 @@ const ACTIONS = {
         onSuccess: async (models) => {
           pulled = models;
           // 每个拉回来的名字（连同目录里已有的）对应到哪些下游，一次问回
-          await ensurePickPlans(gid, [...models, ...catalogOfGroup(gid)]);
+          await ensurePickPlans(gid, [...models, ...catalogOfGroup(gid)], { force: true });
           if (!isCurrentGroupEdit(token)) return;
           renderPicker();
           const mine = catalogOfGroup(gid);
@@ -1977,8 +2001,8 @@ const ACTIONS = {
     await refreshConfig();
     if (!isCurrentGroupEdit(token)) return;
     // 手填的也问一次对应建议：它的选择框和拉回来的行一个规矩
-    await ensurePickPlans(token.groupId, [name]);
-    renderPicker();
+    await ensurePickPlans(token.groupId, [name], { force: true });
+    if (isCurrentGroupEdit(token)) renderPicker();
   },
 
   'open-search': openSearch,

@@ -551,6 +551,46 @@ test('打开分组弹窗就问回对应建议：已暴露的锁上并显示真�
   assert.doesNotMatch(html, /新开下游模型：deepseek-ai/, '已暴露的不该还默认新开');
 });
 
+test('旧分组的对应建议回包不能污染重开的新分组', async (t) => {
+  const h = harness(t);
+  util.state.upstreams = [provider(1, [
+    { ...group(69), models: ['shared'] },
+    { ...group(70), models: ['shared'] },
+  ])];
+  await editGroup(h, 69, 'key-A');
+  const oldPlan = h.latest();
+  await editGroup(h, 70, 'key-B');
+  const newPlan = h.latest();
+  newPlan.resolve({
+    plans: [{ remote_model: 'shared', exact: [], partial: [], exposed_as: [] }],
+  });
+  await tick();
+  assert.deepEqual(h.evaluate('pickPlans.get("shared")'), {
+    remote_model: 'shared', exact: [], partial: [], exposed_as: [],
+  });
+  oldPlan.resolve({
+    plans: [{ remote_model: 'shared', exact: ['wrong-group'], partial: [], exposed_as: [] }],
+  });
+  await tick();
+  assert.deepEqual(h.evaluate('pickPlans.get("shared")'), {
+    remote_model: 'shared', exact: [], partial: [], exposed_as: [],
+  });
+});
+
+test('对应建议失败后重绘不重复请求', async (t) => {
+  const h = harness(t);
+  const gid = 71;
+  util.state.upstreams = [provider(1, [{ ...group(gid), models: ['shared'] }])];
+  await editGroup(h, gid, 'key-A');
+  const first = h.latest();
+  first.reject(new Error('建议接口暂时不可用'));
+  await tick();
+  const before = h.requests.length;
+  h.evaluate('renderPicker()');
+  await tick();
+  assert.equal(h.requests.length, before);
+});
+
 test('建议没问到也不许建重复：已经挂在别的下游名下的按「新开」点也被拦下', async (t) => {
   const h = harness(t);
   const gid = 67;

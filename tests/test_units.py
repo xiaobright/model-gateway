@@ -112,10 +112,19 @@ def test_blob_bytes_counts_images_and_returned_encrypted_reasoning():
     assert encrypted_bytes(reasoning) == 2000
     assert encrypted_bytes(responses_str) == 0
 
-    # 请求体里 type 字段不是字符串（畸形结构/某些客户端的复合 content）不能让遍历炸掉：
-    # 这里每个请求都要跑，炸一次就是一个没有日志的 500
+    # 工具 JSON Schema 的联合类型是合法数组，不能让请求体统计抛 TypeError。
+    assert blob_bytes({"tools": [{"type": "function", "parameters": {
+        "type": "object", "properties": {"query": {"type": ["string", "null"]}},
+    }}]}) == 0
     assert blob_bytes({"messages": [{"content": [{"type": ["text", "image"], "text": "hi"}]}]}) == 0
     assert blob_bytes({"a": {"type": {"nested": 1}}}) == 0
+
+    # 在较低的递归上限下仍准确统计深层结构，而非只保证不抛错。
+    nested = {"type": "input_image", "image_url": "data:,ABC", "encrypted_content": "XYZ"}
+    for _ in range(1200):
+        nested = {"child": [nested]}
+    assert blob_bytes(nested) == len("data:,ABC") + len("XYZ")
+    assert encrypted_bytes(nested) == len("XYZ")
 
 
 def test_sse_observer_counts_encrypted_reasoning_apart_from_text():
