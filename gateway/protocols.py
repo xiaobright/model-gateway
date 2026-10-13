@@ -181,7 +181,10 @@ def _blob_len(value: object) -> int:
 def _blob_scan(node: object, acc: list[int]) -> None:
     """一次遍历同时数出 [图片字节, 加密内容字节]，两类都算「非文本」。"""
     if isinstance(node, dict):
-        if node.get("type") in _IMAGE_TYPES:
+        # type 的值必须是字符串才能查表：客户端发来的畸形结构（list/dict）会让
+        # frozenset 成员检查抛 TypeError，而这里每个请求都要跑，炸一次就是一个 500
+        kind = node.get("type")
+        if isinstance(kind, str) and kind in _IMAGE_TYPES:
             acc[0] += _blob_len(node.get("image_url")) + _blob_len(node.get("data"))
             source = node.get("source")
             if isinstance(source, dict):
@@ -190,7 +193,7 @@ def _blob_scan(node: object, acc: list[int]) -> None:
         if isinstance(encrypted, str):
             acc[1] += len(encrypted.encode("utf-8"))
         # Anthropic 的加密思维块：内容是不透明的 data 字段，同属「计了 token 却不发字节」
-        if node.get("type") == "redacted_thinking":
+        if kind == "redacted_thinking":
             acc[1] += _blob_len(node.get("data"))
         for value in node.values():
             _blob_scan(value, acc)

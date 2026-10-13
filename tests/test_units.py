@@ -112,6 +112,11 @@ def test_blob_bytes_counts_images_and_returned_encrypted_reasoning():
     assert encrypted_bytes(reasoning) == 2000
     assert encrypted_bytes(responses_str) == 0
 
+    # 请求体里 type 字段不是字符串（畸形结构/某些客户端的复合 content）不能让遍历炸掉：
+    # 这里每个请求都要跑，炸一次就是一个没有日志的 500
+    assert blob_bytes({"messages": [{"content": [{"type": ["text", "image"], "text": "hi"}]}]}) == 0
+    assert blob_bytes({"a": {"type": {"nested": 1}}}) == 0
+
 
 def test_sse_observer_counts_encrypted_reasoning_apart_from_text():
     """GPT 的思维链是加密回传的：不进 text_bytes（不是可读正文），却计入了 output_tokens。
