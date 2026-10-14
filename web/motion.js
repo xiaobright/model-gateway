@@ -27,6 +27,11 @@ export function slideIn(el) {
   animate(el, [{ opacity: .35, transform: 'translateY(7px)' }, { opacity: 1, transform: 'none' }]);
 }
 
+/* 只换透明度、不位移：给「内容换了但视口不许动」的场景用（如路由详情切换模型）。 */
+export function fadeIn(el) {
+  animate(el, [{ opacity: .4 }, { opacity: 1 }], { duration: 220 });
+}
+
 export function updateNumber(el, text) {
   if (!el || el.textContent === text) return;
   el.textContent = text;

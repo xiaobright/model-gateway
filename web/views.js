@@ -6,7 +6,7 @@ import {
   catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import { enterStagger, slideIn, pulse, reduceMotion, updateNumber } from './motion.js';
-import { renderRouteWorkspace, selectRouteWorkspace } from './route-view.js';
+import { renderRouteWorkspace, selectRouteWorkspace, initRoutePad as bindRoutePad } from './route-view.js';
 import { requestResult } from './request-result.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
 
@@ -257,6 +257,7 @@ export function renderPolicies() {
 
 export function renderRoutes() { renderPolicies(); renderRouteWorkspace(); }
 export function selectRoute(model, protocol) { selectRouteWorkspace(model, protocol); }
+export function initRoutePad() { bindRoutePad(); }
 
 /* ================================================================ 实时请求 */
 

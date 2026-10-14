@@ -51,7 +51,13 @@ function harness(t) {
     }
     return elements.get(id);
   };
-  const h = { element, requests: [], refreshes: [], timers: [], toasts: [], blockRefresh: false };
+  let motionReduced = true;
+  const vtVars = new Map();
+  const vtRoot = {
+    style: { setProperty: (k, v) => vtVars.set(k, v), removeProperty: (k) => vtVars.delete(k) },
+    dataset: {},
+  };
+  const h = { element, requests: [], refreshes: [], timers: [], toasts: [], blockRefresh: false, vt: { vars: vtVars, root: vtRoot }, setReduceMotion: (v) => { motionReduced = v; } };
   const oldFetch = globalThis.fetch;
   globalThis.fetch = async (path, options) => {
     const job = { ...deferred(), path, method: options.method, body: options.body && JSON.parse(options.body) };
@@ -65,8 +71,10 @@ function harness(t) {
     document: {
       addEventListener: noop, querySelectorAll: () => [], visibilityState: 'visible',
       querySelector: () => [...elements.values()].find((e) => e.open),
+      documentElement: vtRoot,
+      startViewTransition: (fn) => { fn(); return { finished: Promise.resolve() }; },
     },
-    window: { addEventListener: noop }, localStorage: { getItem: () => null, setItem: noop },
+    window: { addEventListener: noop, innerWidth: 1000, innerHeight: 800 }, localStorage: { getItem: () => null, setItem: noop },
     location: { origin: 'http://127.0.0.1', hash: '' }, history: { replaceState: noop },
     views: new Proxy({}, { get: () => noop }),
     // canvas.js 的行为在真实浏览器里验证（dev/check-canvas.mjs），这里只补 app.js
@@ -75,8 +83,8 @@ function harness(t) {
     setCanvasFilter: noop, setCanvasIface: noop, saveForward: async () => {},
     toast: (...args) => h.toasts.push(args), run: (_el, fn) => fn(), confirmBox: async () => true,
     requestAnimationFrame: (fn) => fn(), setInterval: (fn, ms) => h.timers.push({ fn, ms }),
-    withViewTransition: (_dir, fn) => fn(), reduceMotion: () => true,
-    moveNavMarker: noop, slideIn: noop, toggleMotion: noop,
+    withViewTransition: (_dir, fn) => fn(), reduceMotion: () => motionReduced,
+    moveNavMarker: noop, slideIn: noop, fadeIn: noop, toggleMotion: noop,
     updateNumber: (el, value) => { if (el) el.textContent = value; },
     refreshForTest: () => {
       const job = deferred();
@@ -952,4 +960,32 @@ test('弹窗关掉之后，迟到的扫描结果不许写进新会话', async (t
   assert.equal(h.element('batch-picker').innerHTML, '');
   assert.equal(h.element('batch-count').textContent, '');
   assert.equal(h.element('batch-status').textContent, '填个模型名，点「扫描所有上游站」');
+});
+
+test('明暗切换的圆形揭开：圆心取按钮中心，半径按百分比够到最远角', async (t) => {
+  const h = harness(t);
+  h.setReduceMotion(false);
+  // 视口 1000×800，按钮中心 (25, 40)，离它最远的角是右下 (1000, 800)
+  h.app.actions['toggle-theme']({}, { getBoundingClientRect: () => ({ left: 10, top: 20, width: 30, height: 40 }) });
+  assert.equal(h.vt.vars.get('--vt-x'), '2.500%');
+  assert.equal(h.vt.vars.get('--vt-y'), '5.000%');
+  assert.equal(h.vt.vars.get('--vt-duration'), '560ms');
+  assert.equal(h.vt.root.dataset.vtTheme, '1');
+  assert.equal(h.vt.root.dataset.theme, 'light', 'auto 的下一档是 light，且已在过渡回调里应用');
+
+  // circle() 的百分比半径按 √(w²+h²)/√2 解析成 px，换算回来必须真的盖到最远角
+  const radiusPx = parseFloat(h.vt.vars.get('--vt-r')) / 100 * (Math.hypot(1000, 800) / Math.SQRT2);
+  assert.ok(radiusPx >= Math.hypot(1000 - 25, 800 - 40), `半径 ${radiusPx.toFixed(1)}px 盖不到最远角`);
+
+  await tick();
+  assert.equal(h.vt.root.dataset.vtTheme, undefined, '过渡结束后要摘掉 data-vt-theme');
+  assert.equal(h.vt.vars.size, 0, '过渡结束后要清掉圆心半径变量');
+});
+
+test('减少动态时主题切换不走视图过渡，直接换', (t) => {
+  const h = harness(t);
+  h.app.actions['toggle-theme']({}, { getBoundingClientRect: () => ({ left: 0, top: 0, width: 10, height: 10 }) });
+  assert.equal(h.vt.root.dataset.theme, 'light');
+  assert.equal(h.vt.vars.size, 0);
+  assert.equal(h.vt.root.dataset.vtTheme, undefined);
 });

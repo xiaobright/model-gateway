@@ -80,6 +80,8 @@
         <section class="route-table" aria-label="模型列表"><div class="route-columns" aria-hidden="true"><span>模型 / 接口</span><span>下次请求起点</span><span>状态 / 候选</span><span>请求数</span></div><div id="route-list"></div></section>
         <aside id="route-detail" class="route-detail" aria-label="选中模型的路由详情"></aside>
       </div>
+      <!-- 内容变短时兜住文档高度，防止浏览器把用户的滚动位置夹回去；高度由 route-view.js 按需设置 -->
+      <div id="route-pad" aria-hidden="true"></div>
     </section>
 
     <!-- ---------- 概览 ---------- -->

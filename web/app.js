@@ -14,7 +14,7 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import * as views from './views.js';
-import { initMotion, moveNavMarker, slideIn, toggleMotion } from './motion.js';
+import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion } from './motion.js';
 import {
   initCanvas, renderCanvas, renderPool, setCanvasFilter, setCanvasIface,
   saveForward, canvasActions,
@@ -315,11 +315,59 @@ function applyTheme(name) {
   localStorage.setItem('mg-theme', name);
 }
 
-function cycleTheme() {
+/* 明暗切换用一张圆形 clip 从按钮位置揭开整页。圆心和半径通过 CSS 变量交给
+   style.css 里的关键帧。
+
+   这里一律用百分比、不用 px。实测在 devicePixelRatio 非 1 的环境（Windows 150%
+   缩放，dpr=1.5）下，写进 view-transition 伪元素 clip-path 的 px 长度会被 dpr
+   缩掉：圆心落在按钮位置的 1/1.5 处、半径也只有需要值的 1/1.5，于是圆扩到七成
+   就到终点，最后一帧剩下的屏幕直接翻色。百分比是相对伪元素参照框解析的，
+   缩放会自然抵消，dpr=1 和 1.5 下都正确。 */
+let themeSeq = 0;
+const VT_VARS = ['--vt-x', '--vt-y', '--vt-r', '--vt-duration'];
+
+function cycleTheme(dataset, el) {
   const now = localStorage.getItem('mg-theme') || 'auto';
   const next = THEMES[(THEMES.indexOf(now) + 1) % THEMES.length];
-  applyTheme(next);
-  toast(`外观：${{ auto: '跟随系统', light: '浅色', dark: '深色' }[next]}`);
+  const label = { auto: '跟随系统', light: '浅色', dark: '深色' }[next];
+  if (reduceMotion() || typeof document.startViewTransition !== 'function') {
+    applyTheme(next);
+    toast(`外观：${label}`);
+    return;
+  }
+
+  // 圆心固定取按钮几何中心：比点击坐标更稳，键盘触发（clientX 为 0）时也一样
+  const btn = el || document.querySelector('[data-act="toggle-theme"]');
+  const box = btn ? btn.getBoundingClientRect() : null;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const x = box ? box.left + box.width / 2 : vw / 2;
+  const y = box ? box.top + box.height / 2 : vh / 2;
+
+  // 半径要够到四个角里最远的那个
+  const reach = Math.hypot(Math.max(x, vw - x), Math.max(y, vh - y));
+  // circle() 的百分比半径按 √(w²+h²)/√2 解析，换算过去；多给 1% 兜住取整误差
+  const radiusPct = (reach * Math.SQRT2 * 100) / Math.hypot(vw, vh) + 1;
+
+  const root = document.documentElement;
+  const seq = ++themeSeq;
+
+  root.style.setProperty('--vt-x', `${((x / vw) * 100).toFixed(3)}%`);
+  root.style.setProperty('--vt-y', `${((y / vh) * 100).toFixed(3)}%`);
+  root.style.setProperty('--vt-r', `${radiusPct.toFixed(3)}%`);
+  root.style.setProperty('--vt-duration', '560ms');
+  root.dataset.vtTheme = '1';
+
+  const vt = document.startViewTransition(() => {
+    applyTheme(next);
+  });
+
+  vt.finished.catch(() => {}).finally(() => {
+    if (seq !== themeSeq) return;   // 连点时已有新的切换在跑，别擦掉它的圆心
+    delete root.dataset.vtTheme;
+    for (const name of VT_VARS) root.style.removeProperty(name);
+  });
+  toast(`外观：${label}`);
 }
 
 /* ---------------------------------------------------------------- 端点 */
@@ -2430,6 +2478,7 @@ setInterval(() => {
 
 applyTheme(localStorage.getItem('mg-theme') || 'auto');
 initMotion();
+views.initRoutePad();   // 路由视图：内容变短时用留白兜住滚动位置，不把用户夹回去
 $('endpoint').textContent = `${location.origin}/v1`;
 views.initLogFollow();   // 「自动跟随新记录」的勾选状态变化时补插攒下的行
 // 编排画布：写操作全部通过这三个入口回到主流程，画布自己不碰弹窗和刷新

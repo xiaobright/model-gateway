@@ -39,6 +39,39 @@
 }
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"] { color-scheme: dark; }
+
+/* ------------------------------------------------ 主题切换：一个圆揭开整页
+   过渡期间整页作为一张不透明快照捕获，任何元素身上的 view-transition-name
+   都会让它自成一层：卡片底色是半透明玻璃，新旧两层叠在一起会透出旧配色，
+   发灰。所以先把所有名字摘掉，只留 root 一层。以后若给别的元素加
+   view-transition-name，同样记得补这条兜底。 */
+:root[data-vt-theme] * {
+  view-transition-name: none !important;
+}
+:root[data-vt-theme]::view-transition-group(root) {
+  animation-duration: var(--vt-duration, 560ms) !important;
+}
+
+/* 旧图整张压在底下不动，新图靠圆形 clip 一点点盖上来 */
+:root[data-vt-theme]::view-transition-old(root) {
+  animation: none !important;
+  mix-blend-mode: normal;
+}
+
+/* 曲线用「起步稍缓、中段最快、末尾收住」的 in-out：
+   原来的 cubic-bezier(.16,1,.3,1) 三成时间就走完 87% 半径，圆一闪就到位、
+   看不出是从按钮里长出来的，剩下大半程还在原地磨，就成了「扩一半停住」 */
+:root[data-vt-theme]::view-transition-new(root) {
+  animation: vtThemeWipe var(--vt-duration, 560ms) cubic-bezier(.35, 0, .25, 1) forwards !important;
+  mix-blend-mode: normal;
+}
+
+/* 圆心和半径都是百分比（见 app.js）：dpr 非 1 时写 px 会被缩放吃掉，
+   百分比相对伪元素参照框解析，能自然抵消 */
+@keyframes vtThemeWipe {
+  from { clip-path: circle(0% at var(--vt-x, 50%) var(--vt-y, 50%)); }
+  to   { clip-path: circle(var(--vt-r, 150%) at var(--vt-x, 50%) var(--vt-y, 50%)); }
+}
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--page-1); font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; -webkit-font-smoothing: antialiased; }
@@ -58,7 +91,11 @@ button:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px soli
 h1, h2, h3, p { margin-top: 0; }
 h3 { font-size: 14px; }
 .shell { max-width: 1640px; display: grid; grid-template-columns: 202px minmax(0, 1fr); gap: 28px; margin: 0 auto; padding: 24px 24px 48px; }
-.sidebar { position: sticky; top: 24px; align-self: start; min-height: calc(100vh - 48px); padding: 20px 12px 14px; border: 1px solid var(--edge); border-radius: 26px; background: linear-gradient(145deg, var(--sheen), transparent 65%), var(--glass); box-shadow: var(--edge-highlight), var(--shadow-1); display: flex; flex-direction: column; gap: 10px; }
+/* 高度锁在「视口 - 72」：sticky 的约束矩形是所在 grid 行，行底比文档底高出一个
+   shell 下内边距（48）。侧栏若高于 100vh-72，滚到底时会被行底顶着往上走（看起来
+   就是"跟着页面往上飘"）。锁到 100vh-72 后行底再也顶不动；窗口矮到内容更高时在
+   栏内滚动，不截断也不位移。 */
+.sidebar { position: sticky; top: 24px; align-self: start; min-height: calc(100vh - 72px); max-height: calc(100vh - 72px); overflow-x: clip; overflow-y: auto; overscroll-behavior: contain; padding: 20px 12px 14px; border: 1px solid var(--edge); border-radius: 26px; background: linear-gradient(145deg, var(--sheen), transparent 65%), var(--glass); box-shadow: var(--edge-highlight), var(--shadow-1); display: flex; flex-direction: column; gap: 10px; }
 .sidebar, .route-table, .route-detail, .card, .kpi, .cv-host, dialog { backdrop-filter: blur(18px) saturate(135%); }
 .route-table, .route-detail, .card, .kpi { isolation: isolate; overflow: clip; background-image: linear-gradient(135deg, var(--sheen), transparent 50%); box-shadow: var(--edge-highlight), var(--shadow-1); }
 .card, .kpi { position: relative; }
@@ -505,7 +542,7 @@ tbody tr:hover td { background: var(--hover); }
 ::-webkit-scrollbar { width: 7px; height: 7px; }::-webkit-scrollbar-thumb { background: var(--hair-2); border-radius: 8px; }
 @media (max-width: 1250px) { .shell { grid-template-columns: 184px minmax(0, 1fr); gap: 20px; padding: 20px; }.route-workspace { grid-template-columns: minmax(0, 1fr) 330px; }.route-columns, .route { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 90px; padding: 13px; }.route-usage, .route-columns > :last-child { display: none; }.cols { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 1100px) { .route-workspace { grid-template-columns: minmax(0, 1fr); }.route-detail { position: static; }.route-columns, .route { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 110px 55px; }.route-usage, .route-columns > :last-child { display: block; }.kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 760px) { .shell { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 20px; }.sidebar { position: static; min-height: 0; padding: 14px; }.brand { padding-bottom: 8px; }.nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }.nav-item { padding: 7px; gap: 6px; justify-content: center; font-size: 12px; }.nav-label { flex: none; }.nav-ico { font-size: 15px; }.nav-badge { display: none; }.side-live { display: none; }.side-foot { padding-top: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }.side-foot .foot-row { flex: none; }.pill code { font-size: 10px; }.view-head h2 { font-size: 24px; }.view-head { gap: 9px; }.view-head > .grow { display: none; }.view-head > div:first-child { width: 100%; }.main { padding-top: 0; }.route-filters { align-items: stretch; }.route-filters .search, .log-filters .search { max-width: none; }.route-columns, .route { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) 90px; gap: 8px; }.route-usage, .route-columns > :last-child { display: none; }.route strong { font-size: 12px; }.card { padding: 16px; }.workspace-status { gap: 10px; }.workspace-status .grow { display: none; }.route-detail { padding: 17px; }.request-facts { grid-template-columns: minmax(0, 1fr); }.grid-2 { grid-template-columns: minmax(0, 1fr) 90px; }.kpi { padding: 13px; }.kpi-value { font-size: 23px; }.kpi-ring-host { display: none; } }
+@media (max-width: 760px) { .shell { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 20px; }.sidebar { position: static; min-height: 0; max-height: none; overflow: visible; overscroll-behavior: auto; padding: 14px; }.brand { padding-bottom: 8px; }.nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }.nav-item { padding: 7px; gap: 6px; justify-content: center; font-size: 12px; }.nav-label { flex: none; }.nav-ico { font-size: 15px; }.nav-badge { display: none; }.side-live { display: none; }.side-foot { padding-top: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }.side-foot .foot-row { flex: none; }.pill code { font-size: 10px; }.view-head h2 { font-size: 24px; }.view-head { gap: 9px; }.view-head > .grow { display: none; }.view-head > div:first-child { width: 100%; }.main { padding-top: 0; }.route-filters { align-items: stretch; }.route-filters .search, .log-filters .search { max-width: none; }.route-columns, .route { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) 90px; gap: 8px; }.route-usage, .route-columns > :last-child { display: none; }.route strong { font-size: 12px; }.card { padding: 16px; }.workspace-status { gap: 10px; }.workspace-status .grow { display: none; }.route-detail { padding: 17px; }.request-facts { grid-template-columns: minmax(0, 1fr); }.grid-2 { grid-template-columns: minmax(0, 1fr) 90px; }.kpi { padding: 13px; }.kpi-value { font-size: 23px; }.kpi-ring-host { display: none; } }
 @media (max-width: 400px) { .nav-ico { display: none; }.side-foot { flex-wrap: wrap; }.route-columns, .route { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); }.route-state { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; }.route-state small { margin: 0; }.route-columns span:nth-child(3) { display: none; }.health-row { grid-template-columns: minmax(0, 1fr) 45px 40px; }.h-p95,.h-n { display: none; }.bar-row { grid-template-columns: minmax(0, 1fr) 48px 40px; }.bar-note { display: none; } }
 @media (pointer: coarse) { button, .btn, .seg-item { min-height: 36px; }.candidate-actions .btn { min-width: 36px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }

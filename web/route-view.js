@@ -2,7 +2,7 @@
    选中模型按「名字 + 接口」保存，刷新、筛选和删除后重新校验。 */
 import { $, state, esc, fmtInt, fmtSec, fmtLeft, protocolOn, PROTO_LABEL, splitOneM } from './util.js';
 import { modelKey as routeKey, orderedCandidates, forwardPath, usable } from './canvas-model.js';
-import { slideIn } from './motion.js';
+import { fadeIn } from './motion.js';
 
 let selectedRouteKey = null;
 
@@ -37,17 +37,56 @@ function replaceIfChanged(host, html) {
   if (token) [...host.querySelectorAll('[data-focus-key]')].find(el => el.dataset.focusKey === token)?.focus({ preventScroll: true });
 }
 
+/* 页面长度由内容决定，但不允许内容变化把用户的视口收回去：右卡或列表一变短，
+   浏览器布局后会把 scrollTop 夹回可用范围，看起来就是「闪回去」。这里用一块底部
+   留白把文档兜到「当前滚动位置 + 视口」高，同一次任务里补齐，用户看不到中间态；
+   用户往上滑、内容再次变高、或缩到窄屏时，留白按需收回，向下滚不进留白。
+   y 必须在改动 DOM 之前抓：替换之后读到的 scrollY 可能已经被夹过了。 */
+let padHeight = 0, lastY = 0, padFrame = 0;
+
+function setPad(next) {
+  if (next === padHeight) return;
+  padHeight = next;
+  const pad = $('route-pad');
+  if (pad) pad.style.height = next + 'px';
+}
+
+function pinScrollExtent(y = window.scrollY) {
+  if (!window.matchMedia?.('(min-width: 1101px)').matches) return;
+  lastY = y;
+  const natural = document.documentElement.scrollHeight - padHeight;
+  const next = Math.max(0, y + window.innerHeight - natural);
+  setPad(next);
+  if (window.scrollY !== y) window.scrollTo(0, y);   // 布局夹走了就夹回来，此时高度已兜住
+}
+
+export function initRoutePad() {
+  window.addEventListener('scroll', () => {
+    if (!padHeight || padFrame) return;
+    lastY = window.scrollY;
+    padFrame = requestAnimationFrame(() => { padFrame = 0; pinScrollExtent(); });
+  }, { passive: true });
+
+  // 改变窗口高度会改变最大滚动距离：按记住的位置重新兜住，不因为缩放窗口闪回去
+  window.addEventListener('resize', () => {
+    if (!padHeight) return;
+    if (window.matchMedia?.('(min-width: 1101px)').matches) pinScrollExtent(lastY);
+    else setPad(0);
+  });
+}
+
 export function selectRouteWorkspace(model, protocol) {
   const changed = selectedRouteKey !== routeKey(model, protocol);
   selectedRouteKey = routeKey(model, protocol);
   renderRouteWorkspace();
-  if (changed) slideIn($('route-detail'));
+  if (changed) fadeIn($('route-detail'));
   if (window.matchMedia?.('(max-width: 1100px)').matches) $('route-detail')?.scrollIntoView({ block: 'start' });
 }
 
 export function renderRouteWorkspace() {
   const host = $('route-list');
   if (!host) return;
+  const y = window.scrollY;   // 留白钉死用：必须在任何 DOM 改动之前抓
   const all = state.routes.filter(r => protocolOn(r.protocol));
   const kw = state.filter.trim().toLowerCase();
   const list = all.filter(r => (!state.iface || r.protocol === state.iface)
@@ -82,6 +121,7 @@ export function renderRouteWorkspace() {
   const emptyHint = all.length ? '调整搜索词或接口筛选。' : hiddenByProtocol ? '有接口处于关闭状态。已关闭接口的配置仍然保留，可在网关设置中重新启用。' : '先添加上游站点和分组，再创建模型路由。';
   replaceIfChanged(host, html || `<div class="empty"><strong>${emptyTitle}</strong><p>${emptyHint}</p>${all.length ? '' : hiddenByProtocol ? '<button class="btn btn-ghost" data-act="go-settings">管理接口开关</button>' : '<button class="btn btn-ghost" data-act="go-upstreams">添加上游站点</button>'}</div>`);
   renderRouteDetail(list.find(r => routeKey(r.model_name, r.protocol) === selectedRouteKey));
+  pinScrollExtent(y);
 }
 
 function renderRouteDetail(row) {
