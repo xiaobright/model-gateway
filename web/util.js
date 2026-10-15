@@ -2,6 +2,8 @@
    这个模块会被 views/charts/app 都 import，所以只放无副作用的纯逻辑
    和 DOM 小工具，不碰业务状态以外的东西。 */
 
+import { animateToastOut } from './motion.js';
+
 export const $ = (id) => document.getElementById(id);
 
 /* ---------------------------------------------------------------- 共享状态 */
@@ -11,35 +13,22 @@ export const state = {
   routes: [],
   stats: null,      // /admin/api/stats?live_only=true：只轮询内存中的活跃数
   overview: null,   // /admin/api/overview：时间线 + 健康 + 热度
-  // /admin/api/failover：{enabled:{anthropic,openai}, breakers:[{group_id,cooling_ms,...}]}
-  // 开关按接口分开：Claude 侧全是坏得勤的中转站，GPT 侧要花钱的站得手动确认
   failover: { enabled: {}, breakers: [] },
-  // /admin/api/inflight 的 tokens：每种接口每个方向「多少字节摊一个 token」，
-  // 后端从转发记录里量的。0 = 量不出来，「实时」页上那一段就不显示
   tokens: {},
   filter: '',
   iface: '',         // 模型路由按接口筛选：'' | 'anthropic' | 'openai'
   proto: '',         // 转发记录的协议筛选：'' | 'anthropic' | 'openai'
-  // 下面这些是「当前打开的弹窗在编辑谁」。分组目标由 group-editor 会话设置并配序号；
-  // 弹窗关闭时不清旧 id，迟到 close 不能让下一次新建请求打到 null。
   editing: null,      // 供应商弹窗的目标 id；openUpstream(null) = 新建供应商
-  // 分组弹窗单独记自己的供应商：它可以叠在供应商弹窗之上开着，而「搬到别的供应商」
-  // 会改这个值 —— 要是和 editing 共用，一搬就把底下那个弹窗的目标也换掉了
   editingUp: null,
   editingGroup: null, // 正在编辑的分组 id，null = 新建
   editingCand: null,  // 正在改的候选 {model, rid}，null = 新增
   openUpstreams: new Set(),  // 「上游站点」里展开了分组的那几行
   view: 'routes',
-  // 默认 24 小时：1 小时窗口在空闲时段是空的，一进来看到空图会以为坏了
   window: '24h',
   logIds: new Set(), // 已渲染过的 request_log id，用来做增量 diff
   protocolsReady: false,
-  // 接口全局开关（/admin/api/protocol-switches）：停用的接口在界面上像不存在一样。
-  // 空对象 = 全部启用，协议列表还没加载完时别把界面藏空
   protocolEnabled: {},
-  // Codex Alpha Search 的专用上游（/admin/api/standalone-search-target）：{group_id, model}
   searchTarget: null,
-  // 上游发呆超时秒数（/admin/api/stall-timeout）；0 = 关闭，null = 还没加载
   stallTimeout: null,
 };
 
@@ -59,7 +48,6 @@ export function fmtTokens(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e4) {
     const k = n / 1e3;
-    // 999,950 这类四舍五入后是 1000.0K：该进位到 M，不能显示成一百万的千位数
     return k >= 999.95 ? (n / 1e6).toFixed(1) + 'M' : k.toFixed(1) + 'K';
   }
   return String(n);
@@ -143,7 +131,8 @@ export function toast(msg, kind) {
   el.innerHTML = `<span class="dot dot-${kind === 'err' ? 'crit' : 'good'}"></span><span></span>`;
   el.lastElementChild.textContent = msg;
 
-  const kill = () => { el.remove(); dropToasts(); };
+  const removeNow = () => { el.remove(); dropToasts(); };
+  const kill = () => animateToastOut(el, removeNow);
   el.addEventListener('click', kill);
   box.append(el);
   liftToasts();
@@ -175,9 +164,6 @@ export async function run(el, fn) {
   } catch (e) {
     toast(e.message, 'err');
   } finally {
-    // dataset.locked 是给「按钮的可用性由业务状态说了算」的入口留的出口：
-    // 批量添加模型那个按钮在一次点击里会用同一个元素做两件事（先扫描、后提交），
-    // 收尾时无条件启用会让它看着能点、点了却什么也不发生。
     if (el && !wasLocked && !el.dataset.locked) el.disabled = false;
   }
 }
@@ -194,9 +180,6 @@ export const groupOf = (gid) => {
   return up ? (up.groups.find((g) => g.id === gid) || null) : null;
 };
 
-/* 上游模型目录：这个分组登记过、能调到的上游真名（分组序列化时带出来的 `models`）。
-   它和「下游暴露」（state.routes）是两件事：拉一份模型列表只是登记这个站有什么，
-   删掉一条下游映射也不该把「这个站有这个模型」这件事一起忘掉。 */
 export const catalogOfGroup = (gid) => {
   const grp = groupOf(gid);
   return grp ? [...(grp.models || [])] : [];
@@ -210,14 +193,12 @@ export const catalogOfUpstream = (uid) => {
   return [...seen];
 };
 
-/* 下游候选的条数。接口锁和删除确认问的是「暴露了几条」，不是「登记了几个」。 */
 export const routeCountOfGroup = (gid) =>
   state.routes.reduce((n, r) => n + r.candidates.filter((c) => c.group_id === gid).length, 0);
 
 export const routeCountOfUpstream = (uid) =>
   state.routes.reduce((n, r) => n + r.candidates.filter((c) => c.upstream_id === uid).length, 0);
 
-/** 「供应商 · 分组」。只有一个分组时省掉分组名，不然满屏都是「· 默认」 */
 export function groupLabel(gid) {
   const up = upstreamOfGroup(gid);
   if (!up) return `#${gid}`;
@@ -225,16 +206,12 @@ export function groupLabel(gid) {
   return up.groups.length > 1 && grp ? `${up.name} · ${grp.name}` : up.name;
 }
 
-/** 这个供应商在某个接口下的分组。没有就说明它不支持这种接口 */
 export const groupsOfIface = (upstream, iface) =>
   (upstream.groups || []).filter((g) => !iface || g.protocol === iface);
 
-/** 接口是分组的属性，所以「这个供应商支不支持某接口」= 它有没有那种接口的分组 */
 export const supportsIface = (upstream, iface) =>
   !iface || (upstream.supports || []).includes(iface);
 
-/* 接口 = 一条请求走哪种线格式，也就是它打进来的那个路径。列表由后端描述符的只读投影
-   在启动时填入；下面几个映射仍是给现有调用点用的派生值，不再在前端另登记协议 ID。 */
 export let PROTO_INFO = Object.create(null);
 export let PROTOCOLS = [];
 export let PROTO_LABEL = Object.create(null);
@@ -257,7 +234,6 @@ export function setProtocolMetadata(items) {
     const label = item.label.trim();
     info[name] = {
       label,
-      // 接口开关用的一行短名；后端没给就退回完整标签
       short: typeof item.short === 'string' && item.short.trim() ? item.short.trim() : label,
       path: item.path,
       client: item.client,
@@ -274,8 +250,6 @@ export function setProtocolMetadata(items) {
   return names;
 }
 
-/* 1M 上下文是「上游真名」上的一个后缀（`名字[1m]`）：网关转发时摘掉它、换成
-   anthropic-beta 头。这里只管在界面和存储之间来回翻译，规则和 gateway/naming.py 对齐。 */
 const ONE_M_RE = /\[(1m|1000k|1024k|1048k)\]\s*$/i;
 
 export const splitOneM = (remote) => ({

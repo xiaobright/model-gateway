@@ -8,11 +8,13 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTOCOLS, protocolOn,
 } from './util.js';
 import { orderedCandidates, attemptOrder, forwardPath, forwardTargets, moveCandidate } from './canvas-model.js';
+import {
+  enterStagger, slideIn, captureRects, flipElements,
+  animateCanvasCamera, animateBubbleSelect, animateMenuOpen, springAnimate, SPRING,
+} from './motion.js';
 
 /* ---------------------------------------------------------------- 注入 */
 
-/* app.js 注入的回调。画布不认识「弹窗」「刷新」这些事：写操作的入口全部从外面进来，
-   画布只管画和收手势。 */
 const hooks = {
   openRoute: () => {},        // 打开「新增模型 / 加候选 / 改候选」弹窗
   refreshConfig: async () => {},
@@ -25,27 +27,16 @@ const CORE_R = 42;          // 气泡本体半径
 const PORT_R = 12;          // 端口圆片半径
 const PORT_GAP = 8;         // 端口之间留的弧距，挤不下就把环撑大
 const HIT = 6;              // 位移超过这么多像素才算拖动，否则算点击
-/* 缩放下限不能太小：环上的端口是按世界坐标排的，缩到 0.25 时相邻端口在屏幕上会
-   叠到一起，点哪个都点不准（点到的是叠在最上面那个）。0.45 时最挤的环仍有 20px 间距 */
 const Z_MIN = 0.45, Z_MAX = 2.6;
-/* 首次适配保留可读字号，超出部分可平移查看。 */
 const FIT_MIN = 0.62;
-
-/* 针尖要站在环**外面**：和端口同半径的话，端口在 DOM 里排在指针后面、会盖住针尖，
-   拖到的就成了端口，拨盘根本拨不动。往外挪一段就互不相干，
-   正好也是老式轮盘那个指挡的位置。 */
 const KNOB_OUT = 26;
 
-/** 环半径：候选越多圈越大，保证端口之间还有地方站 */
 function ringRadius(n) {
   if (n <= 1) return CORE_R + 28;
   return Math.max(CORE_R + 28, (n * (PORT_R * 2 + PORT_GAP)) / (2 * Math.PI) + CORE_R * 0.55);
 }
 
-/** 气泡外框半边长：要装得下环外那个指挡（R + KNOB_OUT + 半径）再留点标签的余量 */
 const boxHalf = (r) => r + KNOB_OUT + 12;
-
-/** 第 i 个端口的角度（度）。0 在最上面，顺时针递增 —— 对应保存的候选编号。 */
 const portAngle = (i, n) => (i * 360) / n;
 const polar = (r, deg) => {
   const rad = ((deg - 90) * Math.PI) / 180;
@@ -61,6 +52,8 @@ let needFit = false;               // 一次都没摆过：第一次画完要自
 let iface = '';                    // 画布自己的接口筛选，和概览那个互不影响
 let filter = '';
 let selectedKey = null;
+let lastSelectedBubbleKey = null;
+let lastChainKey = null;
 let pos = new Map();               // 节点键 -> [x, y]
 let nodeEls = new Map();           // 节点键 -> 元素（复用：轮询不重建，悬停和拖拽才不会断）
 let rotState = new Map();          // 气泡键 -> 已经转过的角度（只增不减，指针才永远向前转）
@@ -68,7 +61,6 @@ let drag = null;
 let saveTimer = 0;
 let view = { x: 0, y: 0, z: 1 };
 
-/* 键的格式写在这儿，和后端 gateway/canvas.py 一一对应。改一处必须改两处。 */
 const BUBBLE_PREFIX = 'm|';
 const bubKey = (model, proto) => `${BUBBLE_PREFIX}${model}|${proto}`;
 
@@ -77,7 +69,6 @@ function bubbleOf(key) {
   return null;
 }
 
-/** 候选按 priority 排。后端已经排好了，这里只是不依赖它地再保证一次 —— 环上位置就是顺序 */
 const orderedCands = orderedCandidates;
 
 function groupLabelOf(gid) {
@@ -93,13 +84,11 @@ function candLabel(cand) {
   return bare && bare !== cand.upstream_name ? `${base} · ${bare}` : base;
 }
 
-/** 候选能不能用：站和分组都启用着。停用的照样画，只是灰掉 —— 配置还在，不该从画布上消失 */
 const candUsable = (c) => Boolean(c.upstream_enabled && c.group_enabled);
 const coolingLeft = (c) => Math.max(0, c.cooling_ms || 0);
 
 /* ---------------------------------------------------------------- 数据派生 */
 
-/** 要画的下游气泡：接口没被停用、且过了名字筛选 */
 const visibleBubbles = () => state.routes.filter((row) =>
   protocolOn(row.protocol)
   && (!iface || row.protocol === iface)
@@ -107,10 +96,6 @@ const visibleBubbles = () => state.routes.filter((row) =>
 
 /* ---------------------------------------------------------------- 位置 */
 
-/** 还没摆过的节点给个可预测的位置：气泡按网格排列。
-
-    间距按「首次打开能一眼看清」定的：气泡间距 320×330。
-    排得太散的话首次适配会缩到 0.5 以下，字就糊了。 */
 function autoPlace() {
   const bubbles = [...visibleBubbles()].sort((a, b) =>
     a.protocol.localeCompare(b.protocol) || a.model_name.localeCompare(b.model_name));
@@ -118,8 +103,6 @@ function autoPlace() {
   bubbles.forEach((row, i) => {
     const key = bubKey(row.model_name, row.protocol);
     if (!pos.has(key)) {
-      // 新模型插进排序后，原网格位置可能已经被旧模型占用；保留旧位置，
-      // 从后续空位里选择，避免批量添加后把两个气泡叠在一起。
       const half = boxHalf(ringRadius(row.candidates.length));
       let slot = i;
       let point;
@@ -135,12 +118,10 @@ function autoPlace() {
       pos.set(key, point);
     }
   });
-
 }
 
 const posOf = (key) => pos.get(key) || [0, 0];
 
-/** 位置改了先攒着：拖一次会触发几百次 pointermove，不能每次都打接口 */
 function markDirty() {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(flushLayout, 600);
@@ -154,7 +135,6 @@ async function flushLayout() {
       view: { x: Math.round(view.x), y: Math.round(view.y), z: view.z },
     });
   } catch (e) {
-    // 存不上不影响用：画的还是当前这份，只是刷新后回到上次存下的位置
     toast(`画布位置没存上：${e.message}`, 'err');
   }
 }
@@ -168,11 +148,8 @@ async function ensureLayout() {
       .map(([k, v]) => [k, [Number(v[0]) || 0, Number(v[1]) || 0]]));
     const v = data.view || {};
     view = { x: Number(v.x) || 0, y: Number(v.y) || 0, z: clamp(Number(v.z) || 1, Z_MIN, Z_MAX) };
-    // 一次都没摆过：自动排列的位置可能落在视口外（模型一多就会排到第四列去）。
-    // 不自动框一次的话，新用户打开看到的是空白，会以为页面坏了。
     needFit = pos.size === 0;
   } catch (e) {
-    // 拿不到就当没摆过：画布必须「能用」优先，不能因为一份坐标打不开
     toast(`画布布局读取失败，先按自动排列显示：${e.message}`, 'err');
   } finally {
     ready = true;
@@ -190,7 +167,6 @@ function applyView() {
   }
 }
 
-/** 屏幕坐标 -> 世界坐标。画布内的所有几何运算都在世界坐标里做 */
 function toWorld(clientX, clientY) {
   const rect = host.getBoundingClientRect();
   return {
@@ -205,7 +181,6 @@ function zoomAt(clientX, clientY, factor) {
   const sy = clientY - rect.top;
   const next = clamp(view.z * factor, Z_MIN, Z_MAX);
   if (next === view.z) return;
-  // 让光标底下的那个世界点钉在原地：缩放前后它对应的屏幕位置相同
   view.x = sx - ((sx - view.x) / view.z) * next;
   view.y = sy - ((sy - view.y) / view.z) * next;
   view.z = next;
@@ -216,7 +191,6 @@ function zoomAt(clientX, clientY, factor) {
 /** 框住当前筛选可见的气泡；隐藏节点和历史上游坐标不参与适配。 */
 export function fitCanvas() {
   const rect = host.getBoundingClientRect();
-  // 隐藏或尚未布局时不能用零尺寸计算视野。
   if (rect.width < 80 || rect.height < 80) return false;
   const keys = visibleBubbles().map(row => bubKey(row.model_name, row.protocol));
   if (!keys.length) return false;
@@ -232,27 +206,45 @@ export function fitCanvas() {
     (rect.width - pad * 2) / Math.max(1, x1 - x0),
     (rect.height - pad * 2) / Math.max(1, y1 - y0),
   ), FIT_MIN, 1.05);
+  const prevView = { ...view };
   view = {
     z,
     x: Math.max(24, (rect.width - (x1 - x0) * z) / 2) - x0 * z,
     y: Math.max(24, (rect.height - (y1 - y0) * z) / 2) - y0 * z,
   };
   applyView();
+  if (!needFit) animateCanvasCamera(world, [linksG, fwdG], prevView, view);
   markDirty();
   return true;
 }
 
 /* ---------------------------------------------------------------- 渲染 */
 
-/** 只在内容真的变了才动 innerHTML：15 秒轮询一次，重建会把悬停和选中状态一起抹掉 */
 function paint(el, html) {
-  if (el.__html !== html) { el.innerHTML = html; el.__html = html; }
+  if (el.__html !== html) {
+    el.innerHTML = html;
+    el.__html = html;
+    return true;
+  }
+  return false;
 }
 
 function renderChain() {
   const panel = $('cv-chain');
   const row = bubbleOf(selectedKey);
-  if (!row) { paint(panel, '<p>选择一个下游气泡，展开它的候选链。</p>'); return; }
+  if (!row) {
+    lastChainKey = null;
+    if (paint(panel, '<p>选择一个下游气泡，展开它的候选链。</p>')) {
+      slideIn(panel, { duration: 300, distance: 6 });
+    }
+    return;
+  }
+  const sameChain = lastChainKey === selectedKey;
+  const prevCardRects = sameChain
+    ? captureRects(panel, '.cv-chain-card', (el) => el.querySelector('[data-rid]')?.dataset.rid)
+    : null;
+  lastChainKey = selectedKey;
+
   const data = `data-model="${esc(row.model_name)}" data-proto="${esc(row.protocol)}"`;
   const button = (act, label, extra = '', disabled = false) =>
     `<button type="button" class="btn btn-ghost btn-sm" data-act="${act}" ${data} ${extra}${disabled ? ' disabled' : ''}>${label}</button>`;
@@ -283,15 +275,23 @@ function renderChain() {
       }).join('<span class="cv-chain-arrow" aria-hidden="true">→</span>')}
       ${button('cv-add-cand', '＋ 连接上游')}</div>`;
   }
-  paint(panel, `<div class="cv-chain-head"><b>${esc(row.model_name)}</b><span>${esc(PROTO_LABEL[row.protocol] || row.protocol)}</span>
+  const changed = paint(panel, `<div class="cv-chain-head"><b>${esc(row.model_name)}</b><span>${esc(PROTO_LABEL[row.protocol] || row.protocol)}</span>
     ${button('cv-forward', '全部转发到…')}${button('cv-del-model', '删除模型')}</div>${body}`);
+
+  if (changed) {
+    if (!sameChain) {
+      const head = panel.querySelector('.cv-chain-head');
+      if (head) slideIn(head, { duration: 300, distance: 6 });
+      const cards = panel.querySelectorAll('.cv-chain-card');
+      if (cards.length) {
+        enterStagger(cards, { axis: 'x', step: 28, duration: 380, distance: 12 });
+      }
+    } else if (prevCardRects?.size) {
+      flipElements(panel, '.cv-chain-card', (el) => el.querySelector('[data-rid]')?.dataset.rid, prevCardRects, { staggerNew: true });
+    }
+  }
 }
 
-/* 气泡的骨架建一次就不动了。指针必须是常驻元素：它一变就重建的话，旋转的过渡动画
-   永远来不及播 —— 而「自动拨动」正是靠这个过渡看出来的。
-
-   顺序有讲究：指针排在端口**前面**，端口才画在它上面（不然那条线会横穿端口圆片）；
-   核心圆排在指针后面，针就被「从圆心里长出来」，只露出针尖那一段。 */
 function buildBubble() {
   const el = document.createElement('div');
   el.className = 'cv-node cv-bub';
@@ -310,7 +310,7 @@ function buildBubble() {
 function portsHtml(row, n, R) {
   return orderedCands(row).map((c, i) => {
     const p = polar(R, portAngle(i, n));
-    const u = polar(1, portAngle(i, n));      // 向外的单位向量，标签顺着它往外推
+    const u = polar(1, portAngle(i, n));
     const usable = candUsable(c);
     const cool = coolingLeft(c);
     const on = attemptOrder(row, state.failover.enabled[row.protocol])[0]?.route_id === c.route_id;
@@ -331,7 +331,6 @@ function portsHtml(row, n, R) {
 
 function coreHtml(row) {
   const cands = orderedCands(row);
-  // 交接中的气泡：中间那行直接写出交给谁，比「已交出」有用得多
   const meta = row.forward_to
     ? `→ ${row.forward_to}`
     : (cands.length ? `${cands.length} 个候选` : '没有候选');
@@ -339,17 +338,12 @@ function coreHtml(row) {
     <span class="cv-meta" title="${esc(meta)}">${esc(meta)}</span>`;
 }
 
-/** 箭头指向**直接**目标那一行（配置里写的就是它）。目标不在画布上就返回 null */
 function forwardArrowTarget(row) {
   if (!row.forward_to) return null;
   return state.routes.find(
     (r) => r.model_name === row.forward_to && r.protocol === row.protocol) || null;
 }
 
-/** 顺着转发链走到最终落地的那一行。null = 目标不存在、绕成环、或者落地那边没有候选。
-
-    多跳要按后端那套走完整条链：`a → b → c` 里 a 的直接目标是 b（它自己一个候选都没有），
-    但整条链是通的，不能因为 b 没有候选就说 a 断了。上限和后端 FORWARD_MAX_HOPS 对齐。 */
 function forwardTarget(row) {
   return forwardPath(row, state.routes)?.at(-1) || (!row.forward_to && row.candidates.length ? row : null);
 }
@@ -389,7 +383,6 @@ function paintBubble(el, row) {
   paintNeedle(el, row, n);
 }
 
-/** 指针的角度。只增不减地累加，切到更靠前的端口也不会倒着转回去。 */
 function paintNeedle(el, row, n) {
   const needle = el.querySelector('.cv-needle');
   const cands = orderedCands(row);
@@ -408,7 +401,6 @@ function paintNeedle(el, row, n) {
   needle.style.transform = `rotate(${target}deg)`;
 }
 
-/** 空白画布上写什么。刚装好的机器上游也是空的，那时候「从上游池拖一个过来」根本做不到 */
 function emptyHint() {
   if (filter || iface) return '没有匹配的模型，清掉上面的筛选看看。';
   const hasSource = state.upstreams.some((u) => (u.groups || []).some(
@@ -421,8 +413,6 @@ function emptyHint() {
 
 export function renderCanvas() {
   if (!host || state.view !== 'canvas' || document.visibilityState === 'hidden') return;
-  // 拖拽中间不重画：15 秒一次的配置轮询要是正好落在这里，会把正在拖的那个端口、
-  // 或者正在拨的那根指针重建掉，手势当场跟丢。松手时 onUp 自己会重画一次
   if (drag) return;
   if (!ready) { if (!loading) ensureLayout().then(renderCanvas); return; }
 
@@ -432,19 +422,21 @@ export function renderCanvas() {
     selectedKey = bubbles.length ? bubKey(bubbles[0].model_name, bubbles[0].protocol) : null;
   }
   const alive = new Set();
+  const freshEls = [];
 
   for (const row of bubbles) {
     const key = bubKey(row.model_name, row.protocol);
     alive.add(key);
     let el = nodeEls.get(key);
-    if (!el) {
+    const isNew = !el;
+    if (isNew) {
       el = buildBubble();
       world.append(el);
       nodeEls.set(key, el);
+      freshEls.push(el);
     }
     paintBubble(el, row);
   }
-  // 已经不在画面上的节点收掉（被筛掉、被删掉、接口被停用）
   for (const [key, el] of [...nodeEls]) {
     if (alive.has(key)) continue;
     el.remove();
@@ -452,10 +444,26 @@ export function renderCanvas() {
     rotState.delete(key);
   }
 
+  if (freshEls.length) {
+    freshEls.slice(0, 12).forEach((el, i) => {
+      springAnimate(
+        el,
+        [{ opacity: 0, transform: 'scale(0.68)' }, { opacity: 1, transform: 'none' }],
+        { duration: 380, delay: i * 24, easing: SPRING.bouncy, fill: 'backwards' },
+      );
+    });
+  }
+
+  if (selectedKey !== lastSelectedBubbleKey) {
+    const newBub = nodeEls.get(selectedKey);
+    const oldBub = nodeEls.get(lastSelectedBubbleKey);
+    lastSelectedBubbleKey = selectedKey;
+    animateBubbleSelect(newBub, oldBub);
+  }
+
   drawWires(bubbles);
   applyView();
   renderChain();
-  // 尺寸暂不可用时由 ResizeObserver 再试，不在隐藏页循环请求动画帧。
   if (needFit && bubbles.length) {
     if (fitCanvas()) needFit = false;
   }
@@ -477,7 +485,6 @@ function drawWires(bubbles) {
     if (target && !bubbles.includes(target)) continue;
     const [x0, y0] = posOf(bubKey(row.model_name, row.protocol));
     if (!target) {
-      // 断链：目标是明确指过的，但那边现在没有这个模型。画根短刺提醒，不偷偷改回自己的候选
       forwards.push(`<path class="cv-fwd is-dead" d="M ${x0 + 30} ${y0} l 44 -30"
         marker-end="url(#cv-ah-fwd)"></path>`);
       continue;
@@ -485,8 +492,6 @@ function drawWires(bubbles) {
     const [x1, y1] = posOf(bubKey(target.model_name, target.protocol));
     const dx = x1 - x0, dy = y1 - y0;
     const len = Math.hypot(dx, dy) || 1;
-    // 箭头正好落在两边的环上（不是更外面），读起来就是「从那个盘指进这个盘」；
-    // 落在框边上会离得老远，像没接上
     const r0 = CORE_R;
     const r1 = CORE_R;
     const cls = `cv-fwd${forwardDead(row) ? ' is-dead' : ''}`;
@@ -507,7 +512,7 @@ function buildPool() {
 
 export function renderPool() {
   if (!pool || state.view !== 'canvas' || document.visibilityState === 'hidden') return;
-  if (drag) return;   // 同上：正拖着上游池里的片子时不要重建池子
+  if (drag) return;
   if (!pool.querySelector('.cv-pool-body')) buildPool();
   const input = pool.querySelector('#cv-pool-filter');
   const q = (input.value || '').trim().toLowerCase();
@@ -532,7 +537,11 @@ export function renderPool() {
   const body = pool.querySelector('.cv-pool-body');
   const html = blocks.join('') || '<p class="dim" style="font-size:12px;margin:0">没有可拖的上游模型。'
     + '先去「上游站点」给某个分组拉一次模型列表。</p>';
-  if (body.__html !== html) { body.innerHTML = html; body.__html = html; }
+  if (body.__html !== html) {
+    body.innerHTML = html;
+    body.__html = html;
+    enterStagger(body.children, { step: 22, duration: 320, distance: 6 });
+  }
 }
 
 /* ---------------------------------------------------------------- 菜单 */
@@ -543,7 +552,6 @@ function hideMenu() {
   document.querySelectorAll('.cv-node.is-focus').forEach((el) => el.classList.remove('is-focus'));
 }
 
-/** 光标旁边弹个小菜单。位置按屏幕算，所以菜单不跟着画布缩放 */
 function showMenu(items, el, ev) {
   menu.innerHTML = items.map((it) => it.sep
     ? '<i class="cv-menu-sep"></i>'
@@ -560,6 +568,7 @@ function showMenu(items, el, ev) {
   if (top + h > rect.height - 8) top = Math.max(8, ev.clientY - rect.top - h - 6);
   menu.style.left = `${left}px`;
   menu.style.top = `${top}px`;
+  animateMenuOpen(menu);
 }
 
 function portMenuItems(d, c, n) {
@@ -640,7 +649,6 @@ export async function removeModel(model, proto) {
   toast('已删除', 'ok');
 }
 
-/** 从上游池挂一条候选上来。重复的交给后端 409，这里先说清楚 */
 async function attachCandidate(model, proto, group_id, remote_model) {
   const row = bubbleOf(bubKey(model, proto));
   if (!row) return;
@@ -681,7 +689,6 @@ export function openForwardDialog(model, proto) {
   const row = bubbleOf(bubKey(model, proto));
   if (!row) return;
   fwdEditing = { model, proto };
-  // 目标必须同接口、而且**自己有候选** —— 后端也这么校验，先把不可能的选项藏掉
   const pool = forwardTargets(row, state.routes);
   if (!pool.length) {
     return toast('这个接口下没有可用的转发目标（目标须有完整候选链且不能成环）', 'err');
@@ -715,7 +722,6 @@ export async function clearForwardFromDialog() {
 
 /* ---------------------------------------------------------------- 手势 */
 
-/** 指针落在哪个气泡上（松手时判定）。_ghost 设了 pointer-events:none，不会挡住探测 */
 function bubbleUnder(clientX, clientY) {
   const el = document.elementFromPoint(clientX, clientY);
   const node = el && el.closest ? el.closest('.cv-bub') : null;
@@ -743,8 +749,6 @@ function unlisten() {
   host?.classList.remove('is-panning');
 }
 
-/* 花括号里的一堆 pointerdown 分支都从这里进。和 click 分发抢手势的地方只有一个原则：
-   带 data-act 的元素归 click 分发管（.cv-tag 这种），其余归手势。 */
 function onDown(ev) {
   if (ev.button !== 0) return;
   hideMenu();
@@ -860,7 +864,6 @@ function onMove(ev) {
     const n = cands.length || 1;
     const p = toWorld(ev.clientX, ev.clientY);
     const [bx, by] = posOf(drag.key);
-    // 换算成「0 = 正上方、顺时针为正」的角度，正好对上端口的角度定义
     const deg = ((Math.atan2(p.x - bx, by - p.y) * 180) / Math.PI + 360) % 360;
     const idx = Math.round((deg / 360) * n) % n;
     drag.idx = idx;
@@ -889,8 +892,6 @@ function onUp(ev) {
   d.port?.style.removeProperty('left');
   d.port?.style.removeProperty('top');
 
-  // 平移和挪节点没有写操作，走不到下面那个 run()；这里补一次重画，
-  // 好让拖拽期间被跳过的配置刷新马上补上
   if (d.kind === 'pan') { if (d.moved) markDirty(); return renderCanvas(); }
   if (d.kind === 'node') {
     if (d.moved) markDirty();
@@ -914,7 +915,6 @@ function onUp(ev) {
   if (!row) return renderCanvas();
 
   if (d.kind === 'dial') {
-    // 没拨动就不动配置，只把指针弹回它该在的位置
     if (!d.moved || d.rid === null) return renderCanvas();
     return run(switchTo(row.model_name, row.protocol, d.rid));
   }
@@ -934,7 +934,6 @@ function onUp(ev) {
   }
 }
 
-/* 手势里的写操作统一吞异常并提示，最后都重画一次 —— 失败也不能把画布留在拖拽态 */
 async function run(promise) {
   try {
     await promise;
@@ -1015,8 +1014,6 @@ export function initCanvas(injected) {
     if (ev.target.id === 'cv-pool-filter') renderPool();
   });
 
-  // 点空白关菜单。挂在 click 而不是 pointerdown：菜单里的按钮走 click 分发，
-  // 在 pointerdown 阶段就关掉的话，动作还没执行菜单就没了
   document.addEventListener('click', (ev) => {
     if (!menu || menu.hidden) return;
     if (ev.target.closest('#cv-menu') || ev.target.closest('[data-act^="cv-"]')) return;
@@ -1043,7 +1040,7 @@ export function setCanvasIface(v) {
   renderPool();
 }
 
-/** 重排：忘掉手动位置，交给自动排列。只在用户点「重排」时才做 */
+/** 重排：忘掉手动位置，交给自动排列，并用弹簧把每个气泡滑到新位置 */
 export async function relayout() {
   const okay = await confirmBox({
     title: '重新排列',
@@ -1052,9 +1049,24 @@ export async function relayout() {
     danger: false,
   });
   if (!okay) return;
+  const oldPositions = new Map(pos);
   pos = new Map();
   rotState = new Map();
   renderCanvas();
+  for (const [key, el] of nodeEls) {
+    const prev = oldPositions.get(key);
+    const next = pos.get(key);
+    if (!prev || !next) continue;
+    const dx = prev[0] - next[0];
+    const dy = prev[1] - next[1];
+    if (Math.hypot(dx, dy) > 1) {
+      springAnimate(
+        el,
+        [{ transform: `translate3d(${dx}px, ${dy}px, 0)` }, { transform: 'none' }],
+        { duration: 480, easing: SPRING.bouncy },
+      );
+    }
+  }
   fitCanvas();
   markDirty();
   toast('已重排', 'ok');
@@ -1073,7 +1085,6 @@ export const canvasActions = {
   'cv-fit': () => fitCanvas(),
   'cv-reset': () => relayout(),
   'cv-open-up': ({ uid }) => hooks.openUpstream(Number(uid)),
-  // 气泡下方那个接口角标：点它是「这个模型能做什么」，和右键气泡同一个菜单
   'cv-menu': (d, el, ev) => {
     const row = bubbleOf(bubKey(d.model, d.proto));
     if (!row) return;

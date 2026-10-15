@@ -1,3 +1,4 @@
+// AI生成
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
@@ -101,8 +102,8 @@ function routePadHarness({ desktop = true } = {}) {
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, {
       innerHTML: '', textContent: '', scrollTop: 0, style: {}, dataset: {},
-      contains: () => false, querySelectorAll: () => [], focus: () => {},
-      classList: { toggle: () => {} },
+      contains: () => false, querySelectorAll: () => [], querySelector: () => null, focus: () => {},
+      classList: { toggle: () => {} }, setAttribute: () => {},
     });
     return elements.get(id);
   };
@@ -126,6 +127,8 @@ function routePadHarness({ desktop = true } = {}) {
   };
   const context = vm.createContext({
     ...util, ...canvasModel, routeKey: canvasModel.modelKey, fadeIn: () => {},
+    enterStagger: () => {}, animateDetailSwap: () => {}, captureRects: () => new Map(),
+    flipElements: () => {}, pulse: () => {},
     requestAnimationFrame: (fn) => fn(),
     $: element, document: { documentElement, activeElement: null }, window: win,
   });

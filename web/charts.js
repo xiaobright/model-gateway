@@ -1,10 +1,11 @@
-/* 手写 SVG 图表：Apple 级平滑贝塞尔曲线与柔光投影
+/* 手写 SVG 图表：Apple 级平滑贝塞尔曲线与柔光投影 + 物理弹簧生长动效
    统一做法：
    - SVG 虚拟坐标系 + preserveAspectRatio="none" 弹性自适应
    - Catmull-Rom 三次样条插值，消除折线的机械生硬感
    - vector-effect="non-scaling-stroke" 锁定线宽 */
 
 import { esc } from './util.js';
+import { SPRING } from './motion.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 const VW = 300;   // 虚拟坐标系宽
@@ -19,7 +20,7 @@ function el(name, attrs = {}) {
   return node;
 }
 
-const reduce = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const reduce = () => Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
 
 /* ---------------------------------------------------------------- 样条曲线生成器 */
 
@@ -93,7 +94,7 @@ export function sparkline(values, { stroke = 'var(--accent)', fill = true } = {}
 
 /* ---------------------------------------------------------------- 环形图 */
 
-/** 缓存命中率这类单百分比。返回 {node, set(pct)}，set 会做过渡。 */
+/** 缓存命中率这类单百分比。返回 {node, set(pct)}，set 会做物理弹簧过渡。 */
 export function donut(pct, { size = 66, thickness = 7 } = {}) {
   const r = (size - thickness) / 2;
   const c = 2 * Math.PI * r;
@@ -122,10 +123,10 @@ export function donut(pct, { size = 66, thickness = 7 } = {}) {
     const p = Math.max(0, Math.min(100, Number(value) || 0));
     label.textContent = Math.round(p) + '%';
     const offset = c * (1 - p / 100);
-    if (reduce()) { arc.setAttribute('stroke-dashoffset', offset); return; }
+    if (reduce() || typeof arc.animate !== 'function') { arc.setAttribute('stroke-dashoffset', offset); return; }
     arc.animate(
       [{ strokeDashoffset: arc.getAttribute('stroke-dashoffset') || c }, { strokeDashoffset: offset }],
-      { duration: 750, easing: 'cubic-bezier(.2,.95,.25,1)', fill: 'forwards' },
+      { duration: 680, easing: SPRING.bouncy, fill: 'forwards' },
     ).finished.catch(() => {}).finally(() => arc.setAttribute('stroke-dashoffset', offset));
   };
   set(pct);
@@ -174,7 +175,9 @@ export function areaChart(points, bucket, { onHover } = {}) {
     fill: 'none', stroke: 'var(--good)', 'stroke-width': '1.5',
     'stroke-dasharray': '5 3', 'vector-effect': 'non-scaling-stroke', 'opacity': '.88',
   });
-  svg.append(defs, grid, areaErr, areaOk, lineTok, lineOk);
+  const plotG = el('g', { style: 'transform-origin: 50% 100%' });
+  plotG.append(areaErr, areaOk, lineTok, lineOk);
+  svg.append(defs, grid, plotG);
 
   const cross = document.createElement('div');
   cross.className = 'chart-cross';
@@ -189,6 +192,7 @@ export function areaChart(points, bucket, { onHover } = {}) {
 
   let current = points || [];
   let curBucket = bucket;
+  let lastSig = '';
 
   const geom = (list) => {
     const max = Math.max(1, ...list.map((p) => p.n || 0));
@@ -207,6 +211,7 @@ export function areaChart(points, bucket, { onHover } = {}) {
       areaErr.removeAttribute('d');
       lineOk.removeAttribute('d');
       lineTok.removeAttribute('d');
+      lastSig = '';
       return;
     }
     const { x, y, yTok } = geom(current);
@@ -215,11 +220,25 @@ export function areaChart(points, bucket, { onHover } = {}) {
     const coordsErr = current.map((p, i) => ({ x: x(i), y: y(p.err || 0) }));
     const coordsTok = current.map((p, i) => ({ x: x(i), y: yTok(p.to || 0) }));
 
+    const nextOk = splinePath(coordsOk);
+    const sig = `${curBucket}:${nextOk}`;
+    const changed = sig !== lastSig;
+    lastSig = sig;
+
     areaErr.setAttribute('d', splineArea(coordsErr, VH));
     areaOk.setAttribute('d', splineArea(coordsOk, VH));
-
-    lineOk.setAttribute('d', splinePath(coordsOk));
+    lineOk.setAttribute('d', nextOk);
     lineTok.setAttribute('d', splinePath(coordsTok));
+
+    if (changed && !reduce() && typeof plotG.animate === 'function' && plotG.getClientRects?.().length) {
+      plotG.animate(
+        [
+          { opacity: 0.45, transform: 'scaleY(0.86)' },
+          { opacity: 1, transform: 'scaleY(1)' },
+        ],
+        { duration: 440, easing: SPRING.bouncy },
+      );
+    }
 
     axis.innerHTML = '';
     const labels = pickAxis(current.length);
@@ -274,7 +293,6 @@ function fmtK(v) {
 
 function pickAxis(len) {
   if (len <= 1) return [0];
-  // 桶数少时 count 不能超过 len，否则 Math.round 会算出重复下标，标签叠在一起
   const count = Math.min(len, len > 40 ? 4 : 5);
   const picks = Array.from(
     { length: count }, (_, k) => Math.round((k / (count - 1)) * (len - 1)),

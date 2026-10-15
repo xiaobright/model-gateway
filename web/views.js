@@ -5,7 +5,10 @@ import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft, protocolOn,
   catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTOCOLS,
 } from './util.js';
-import { enterStagger, slideIn, pulse, reduceMotion, updateNumber, readBarWidths, morphBars } from './motion.js';
+import {
+  enterStagger, slideIn, pulse, reduceMotion, updateNumber,
+  readBarWidths, morphBars, animateExpandRows, SPRING, springAnimate,
+} from './motion.js';
 import { renderRouteWorkspace, selectRouteWorkspace, initRoutePad as bindRoutePad } from './route-view.js';
 import { requestResult } from './request-result.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -235,7 +238,11 @@ export function renderPolicies() {
   const box = $('failover-box');
   if (!box || box.contains?.(document.activeElement)) return;
   const html = failoverSwitches(PROTOCOLS.filter(protocolOn));
-  if (box.dataset.rendered !== html) { box.innerHTML = html; box.dataset.rendered = html; }
+  if (box.dataset.rendered !== html) {
+    box.innerHTML = html;
+    box.dataset.rendered = html;
+    enterStagger(box.children, { step: 22, duration: 320, distance: 6 });
+  }
 }
 
 export function renderRoutes() { renderPolicies(); renderRouteWorkspace(); }
@@ -244,13 +251,6 @@ export function initRoutePad() { bindRoutePad(); }
 
 /* ================================================================ 实时请求 */
 
-/* 数据来自 /admin/api/inflight（纯内存）。1 秒一刷，秒数由 tickElapsed 在本地走，
-   不为了走字去打服务器。
-
-   前两个阶段分开是这页的核心：同样的「12 秒没动静」，还没拿到状态码是站连不上或者
-   干脆没在回话（也可能是系统代理的问题）；已收到响应头仍不能确定模型正在思考。
-   注意 connect 这一档不只是 TCP 握手：httpx 的 send() 要等到响应头才返回，所以
-   「上游收了请求但迟迟不回话」也落在这一档里，文案不能写成「正在连接」。 */
 const PHASE = {
   connect: ['等上游回应', '尚未收到响应头，可能在连接、排队或等待上游处理。'],
   wait: ['已回应，等内容', '已收到响应头，但尚未收到内容；不能据此确定模型正在思考。'],
@@ -279,8 +279,6 @@ function trailRow(t) {
     </div>`;
 }
 
-/* 包大小 -> token 估值来自历史比例，不是账单。输入含 JSON/工具结构，
-   输出可能缺少完整推理；收到的内容量与上游报告用量不是同一个数。 */
 function estTok(bytes, dir, proto) {
   const ratio = ((state.tokens || {})[proto] || {})[dir] || 0;
   if (!bytes || !ratio) return '';
@@ -289,8 +287,6 @@ function estTok(bytes, dir, proto) {
     + `≈ ${fmtTokens(Math.round(bytes / ratio))} tok</span>`;
 }
 
-/** 上游自己报的数（加粗）优先，没报就按字节估。估的时候扣掉内嵌数据块
-    （图片 base64、回传的加密推理）：它们不按文本计费，算进整包字节会把估值顶高。 */
 function upText(c) {
   const real = c.tokens_in
     ? ` · 上下文 <b title="上游自己报的数">${fmtTokens(c.tokens_in)}</b> tok`
@@ -298,8 +294,6 @@ function upText(c) {
   return `上行 ${fmtBytes(c.req_bytes)}${real}`;
 }
 
-/* 「收 386KB · 计费输出 9.9k tok」。流还在跑的时候只有「收到的内容」这一个口径，
-   计费量要等末尾那个 usage —— 有思维链时两者会差不少，所以打个标说清楚为什么。 */
 function downText(c, label) {
   const think = (c.thinking || c.encrypted_bytes)
     ? ' <span class="tag" title="思维链计入了计费，但发下来的不是完整可读正文（GPT 的是加密回传）—— 所以「收到的」会明显小于「计费的」">思维链</span>'
@@ -314,7 +308,6 @@ function callHtml(c) {
   const done = c.phase === 'done';
   const { bare, onem } = splitOneM(c.remote_model);
   const wide = onem ? ' <span class="tag tag-accent">1M</span>' : '';
-  // 「下游要的名字 → 它落到了哪、以什么名字」。一条线上只放一个箭头，两个箭头没人读得顺
   const parts = [];
   if (c.upstream) parts.push(esc(c.upstream));
   if (c.group_name && c.group_name !== '默认') parts.push(esc(c.group_name));
@@ -331,7 +324,6 @@ function callHtml(c) {
     c.stream ? '流式' : '非流式',
     upText(c),
   ];
-  // count_tokens 也登记：它会走降级、会踩断路器，「这个站为什么在被打」的答案有时就是它
   if (c.meta) bits.push('<b>count_tokens</b>');
 
   let statePart;
@@ -446,13 +438,16 @@ export function renderBreakers(data) {
 
   const host = $('brk-list');
   if (!rows.length) {
-    host.innerHTML = '<div class="empty">所有分组都是干净的 —— 没有在冷却的，也没有连着失败的</div>';
+    const emptyHtml = '<div class="empty">所有分组都是干净的 —— 没有在冷却的，也没有连着失败的</div>';
+    if (host.__html !== emptyHtml) {
+      host.innerHTML = emptyHtml;
+      host.__html = emptyHtml;
+    }
     return;
   }
-  host.innerHTML = rows.map((b) => {
+  const nextHtml = rows.map((b) => {
     const left = b.cooling_ms > 0
       ? `<span class="tag tag-warn"><span class="dot dot-warn"></span>冷却 ${fmtLeft(b.cooling_ms)}</span>`
-      // 期满但失败次数还留着：会放它试一次，再失败就直接进更长的冷却
       : '<span class="tag">冷却期满 · 会放它试一次</span>';
     return `<div class="brk-row">
       <span class="brk-name">${esc(groupLabel(b.group_id))}</span>
@@ -462,12 +457,15 @@ export function renderBreakers(data) {
       ${b.cooled > 1 ? `<span class="dim">进过 ${b.cooled} 次冷却</span>` : ''}
     </div>`;
   }).join('');
+  if (host.__html !== nextHtml) {
+    host.innerHTML = nextHtml;
+    host.__html = nextHtml;
+    enterStagger(host.children, { step: 24, duration: 340, distance: 6 });
+  }
 }
 
 /* ================================================================ 上游站点 */
 
-/* 分组声明的是「这把 key 走哪种接口」，能不能真的通是另一件事 —— 只能看实际跑过的请求。
-   这一列就是干这个的：每种接口跑过几次 + 按成功率上色。 */
 function protoTags(health) {
   const by = (health && health.by_protocol) || {};
   const keys = Object.keys(by).sort();
@@ -481,7 +479,6 @@ function protoTags(health) {
   }).join(' ');
 }
 
-/** 供应商支持哪几种接口，是它下面分组的接口去重（后端算好放在 supports 里） */
 function ifaceTags(u) {
   const marks = u.supports || [];
   if (!marks.length) return '<span class="tag tag-warn">还没有分组</span>';
@@ -490,14 +487,12 @@ function ifaceTags(u) {
     + `${esc(PROTO_SHORT[p] || PROTO_LABEL[p] || p)}</span>`).join(' ');
 }
 
-/* key 的脱敏形状由后端算好（列表接口不下发原文）；这里只负责空 key 的说明 */
 const keyCell = (g) => (g.has_key
   ? esc(g.key_masked)
   : '<span class="dim">透传客户端</span>');
 
 function modelTags(names) {
   if (!names.length) return '<span class="dim">未录入</span>';
-  // 只列两个：这一列不宽，三个标签会各占一行把行高撑起来
   return names.slice(0, 2).map((n) => `<span class="tag mono">${esc(n)}</span>`).join(' ')
     + (names.length > 2 ? ` <span class="tag">+${names.length - 2}</span>` : '');
 }
@@ -506,7 +501,7 @@ function groupRow(u, g) {
   const names = catalogOfGroup(g.id);
   const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
       + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${esc(PROTO_LABEL[g.protocol] || '?')}</span>`;
-  return `<tr class="grp-row">
+  return `<tr class="grp-row" data-parent-uid="${u.id}">
     <td class="grp-name">${esc(g.name)} ${tag}${g.enabled ? '' : ' <span class="tag">停用</span>'}</td>
     <td class="mono dim nowrap">${keyCell(g)}</td>
     <td>${modelTags(names)}</td>
@@ -520,8 +515,6 @@ function groupRow(u, g) {
     </td></tr>`;
 }
 
-/** 供应商弹窗里的分组列表：管理分组的主路径，点「编辑」会再叠一层分组弹窗。
-    表里那个可展开的行是同一套东西的只读快照，两边最后都调 openGroup。 */
 export function renderUpGroups() {
   const wrap = $('up-groups-wrap');
   const u = state.editing === null ? null : state.upstreams.find((x) => x.id === state.editing);
@@ -533,7 +526,8 @@ export function renderUpGroups() {
   $('up-add-group').dataset.uid = String(u.id);
 
   const only = groups.length === 1 ? groups[0] : null;
-  $('up-groups').innerHTML = groups.map((g) => {
+  const host = $('up-groups');
+  const nextHtml = groups.map((g) => {
     const n = catalogOfGroup(g.id).length;
     const tag = `<span class="tag${g.protocol === 'anthropic' ? ' tag-accent' : ''}"`
     + ` title="${esc(PROTO_PATH[g.protocol] || '')}">${esc(PROTO_LABEL[g.protocol] || '?')}</span>`;
@@ -550,7 +544,12 @@ export function renderUpGroups() {
   }).join('') || '<p class="dim" style="font-size:12px;margin:0">'
     + '没有分组的供应商用不了 —— 加一个，选接口、填那把 key。</p>';
 
-  // 一把 key 两种接口都能用的站不少，而接口是分组的属性，所以给个一键复制
+  if (host.__html !== nextHtml) {
+    host.innerHTML = nextHtml;
+    host.__html = nextHtml;
+    enterStagger(host.children, { step: 24, duration: 320, distance: 6 });
+  }
+
   const clone = $('up-clone-group');
   if (clone) clone.remove();
   const cloneHtml = cloneButtons(only);
@@ -560,9 +559,6 @@ export function renderUpGroups() {
   }
 }
 
-/* 出口不是「跟随系统」时在地址后面标一下：一屏上哪个站走的是另一扇门，
-   得能一眼看出来，不然只有点进编辑才知道。只认后端给的 kind；
-   VPS 预设的完整 URL 里有密码，连后端都只回脱敏形状，前端更别想拿原文。 */
 function egressTag(u) {
   const kind = u.egress_kind || 'system';
   if (kind === 'direct') return ' <span class="tag" title="不走系统代理，从本机自己的出口出去">直连</span>';
@@ -576,6 +572,9 @@ function egressTag(u) {
   return '';
 }
 
+let lastOpenUpstreams = new Set();
+let upstreamsInitialized = false;
+
 export function renderUpstreams() {
   const list = state.upstreams;
   $('upstream-count').textContent = `${list.length} 个`;
@@ -583,11 +582,17 @@ export function renderUpstreams() {
   $('badge-upstreams').textContent = `${on}/${list.length}`;
   renderUpGroups();
 
+  const tbody = $('upstream-body');
   if (!list.length) {
-    $('upstream-body').innerHTML =
+    tbody.innerHTML =
       '<tr><td colspan="7" class="empty">还没有供应商，点右上角「添加供应商」开始</td></tr>';
+    tbody.__html = '';
+    lastOpenUpstreams = new Set();
     return;
   }
+
+  const newlyOpened = [...state.openUpstreams].filter((id) => !lastOpenUpstreams.has(id));
+  lastOpenUpstreams = new Set(state.openUpstreams);
 
   const health = new Map(((state.overview && state.overview.upstreams) || []).map((u) => [u.name, u]));
   const rows = [];
@@ -600,8 +605,6 @@ export function renderUpstreams() {
       ? `<span class="tone-${toneOf(h.ok_rate)}-ink">${Math.round(h.ok_rate * 1000) / 10}%</span>`
         + `<span class="dim"> · ${fmtSec(h.p95)}</span>`
       : '<span class="dim">—</span>';
-    // 整行都是展开开关（那个小三角太难瞄）。行里的按钮和开关有自己的 data-act，
-    // 事件委托取的是最近的那个，所以不会被这里截走
     rows.push(`<tr class="up-row${open ? ' is-open' : ''}" data-act="toggle-groups" data-uid="${u.id}"
                    title="点这一行展开 / 收起它的分组">
       <td>
@@ -623,17 +626,39 @@ export function renderUpstreams() {
       </td></tr>`);
     if (!open) continue;
     for (const g of groups) rows.push(groupRow(u, g));
-    // 一把 key 两种接口都能用的站不少，而接口是分组的属性，所以给个一键复制
     const only = groups.length === 1 ? groups[0] : null;
     const clone = cloneButtons(only);
-    rows.push(`<tr class="grp-row"><td colspan="7">
+    rows.push(`<tr class="grp-row" data-parent-uid="${u.id}"><td colspan="7">
       <button class="btn btn-ghost btn-sm" data-act="new-group" data-uid="${u.id}">＋ 添加分组</button>
       ${clone}
       <span class="dim" style="font-size:12px;margin-left:8px">${groups.length
         ? '同一个站的另一把 key，或者另一种接口' : '这个供应商还没有分组，先加一个（选接口 + 填 key）'}</span>
     </td></tr>`);
   }
-  $('upstream-body').innerHTML = rows.join('');
+
+  const nextHtml = rows.join('');
+  if (tbody.__html === nextHtml) return;
+  tbody.innerHTML = nextHtml;
+  tbody.__html = nextHtml;
+
+  if (!upstreamsInitialized) {
+    upstreamsInitialized = true;
+    enterStagger(tbody.children, { step: 22, duration: 360, distance: 8 });
+  } else if (newlyOpened.length) {
+    for (const uid of newlyOpened) {
+      const parentRow = tbody.querySelector(`.up-row[data-uid="${uid}"]`);
+      const tw = parentRow?.querySelector('.tw');
+      if (tw) {
+        springAnimate(
+          tw,
+          [{ transform: 'rotate(-90deg) scale(0.8)' }, { transform: 'none' }],
+          { duration: 320, easing: SPRING.bouncy },
+        );
+      }
+      const grpRows = tbody.querySelectorAll(`.grp-row[data-parent-uid="${uid}"]`);
+      animateExpandRows(grpRows);
+    }
+  }
 }
 
 /* ================================================================ 转发记录 */
@@ -668,6 +693,8 @@ export function showRequestDetails(id) {
     + fields.map(([key, v]) => `<div><dt>${key}</dt><dd>${value(v)}</dd></div>`).join('')
     + '</dl><p class="detail-note">历史记录按尝试保存。完整的请求内重试经过可在实时页查看；这里不推断缺失的轨迹。</p>';
   $('request-dialog').showModal();
+  const facts = $('request-detail-body').querySelectorAll('.request-facts > div');
+  if (facts.length) enterStagger(facts, { step: 18, duration: 320, distance: 6 });
 }
 
 function logRow(r) {
@@ -675,7 +702,6 @@ function logRow(r) {
   const tokens = r.input_tokens === null
     ? '<span class="dim">—</span>'
     : `${fmtInt(r.input_tokens)} / ${fmtInt(r.output_tokens ?? 0)} / ${fmtInt(r.cached_tokens ?? 0)}`;
-  // 档位名映射到上游真名时把真名跟在后面：不然从记录里看不出实际跑的是哪个模型
   const remote = r.remote_model ? ` <span class="dim">→ ${esc(r.remote_model)}</span>` : '';
   const modelTip = r.remote_model ? `${r.model} → ${r.remote_model}` : r.model;
   const proto = r.protocol || '';
@@ -683,11 +709,9 @@ function logRow(r) {
   const protoCell = proto
     ? `<span class="tag${proto === 'anthropic' ? ' tag-accent' : ''}" title="${esc(protoLabel)}">${esc(PROTO_SHORT[proto] || protoLabel)}</span>`
     : '<span class="dim">—</span>';
-  // 分组名只在不是「默认」时才写出来，不然每一行都拖一条没信息量的尾巴
   const grp = r.group_name && r.group_name !== '默认'
     ? ` <span class="dim">· ${esc(r.group_name)}</span>` : '';
   const upTip = r.group_name ? `${r.upstream} · ${r.group_name}` : r.upstream;
-  // 第几次尝试：> 1 就是前面的候选没打通、换到这个站来的
   const nth = r.attempt > 1
     ? ` <span class="tag tag-accent" title="前 ${r.attempt - 1} 次尝试未完成">第 ${r.attempt} 次</span>` : '';
   return `<tr data-id="${r.id}" data-log-proto="${esc(proto)}" data-log-issue="${requestResult(r).issue}" data-log-search="${esc([r.model, r.remote_model, r.upstream, r.client, r.status, requestResult(r).label].join(" ").toLowerCase())}">
@@ -703,15 +727,10 @@ function logRow(r) {
     </tr>`;
 }
 
-/**
- * 增量渲染：只把没见过的 id 插到顶部，已有的行不动。
- * 这样轮询再快也不会让表格闪，新行才有"飞进来"的对比。
- */
 let lastRows = [];
-// 关掉「自动跟随」时新记录先攒在这里。用户可能正在往下翻旧记录，
-// 这时候硬插一行会把他的视口顶走，先记账、勾选后一次性补上更省心。
 let pending = [];
 const PENDING_CAP = 200;
+let lastLogFilterSig = null;
 
 const followOn = () => {
   const box = $('log-follow');
@@ -724,14 +743,12 @@ function setFollowHint() {
   hint.textContent = pending.length ? `自动跟随新记录（+${pending.length}）` : '自动跟随新记录';
 }
 
-/** 勾选状态变化时调用：把攒下的行一次性补齐 */
 function flushPending() {
   if (!pending.length) return;
   const list = pending.sort((a, b) => a.id - b.id);
   pending = [];
   setFollowHint();
 
-  // 一次补太多就别逐条播动画了，二三十条飞进来只会糊成一片
   if (list.length > 20) {
     const body = $('log-body');
     body.innerHTML = lastRows.map(logRow).join('');
@@ -742,16 +759,11 @@ function flushPending() {
   insertRows(list, lastRows.length);
 }
 
-/** 把 list（按 id 升序）prepend 进去，再按 cap 裁掉尾部 */
 function insertRows(list, cap) {
   const body = $('log-body');
   const known = state.logIds;
   const tmp = document.createElement('tbody');
   tmp.innerHTML = list.map(logRow).join('');
-  /* 逐个 prepend：最后插进去的那个（id 最大）留在最上面，正好接上下面按 id 降序的老行。
-     这里不能先 reverse —— 一次只来一行时看不出区别，但切出去再切回来、或者标签页
-     不可见时攒了十几条，一批插进来就会整块倒过来：上面那块从旧到新，还压在
-     原来最新的那行上面。点「刷新」是整表重画，所以又好了。 */
   for (const tr of [...tmp.children]) {
     body.prepend(tr);
     known.add(Number(tr.dataset.id));
@@ -766,19 +778,25 @@ function insertRows(list, cap) {
   applyLogFilter();
 }
 
-/* 协议筛选做成「只是把行藏起来」：增量渲染那套 diff（logIds / pending）完全不用知道
-   筛选的存在，切档位也不会重建表格、不会重播动画。每次插行之后重跑一遍即可。 */
 export function applyLogFilter() {
   const want = state.proto;
   const keyword = ($('log-filter')?.value || '').trim().toLowerCase();
   const issues = $('log-issues')?.checked;
+  const sig = `${want}|${keyword}|${issues ? 1 : 0}`;
+  const filterChanged = lastLogFilterSig !== null && lastLogFilterSig !== sig;
+  lastLogFilterSig = sig;
+
   let shown = 0;
+  const visibleRows = [];
   for (const tr of $('log-body').children) {
     if (!tr.dataset.id) continue;                     // 空状态那一行不参与
     const hide = (Boolean(want) && tr.dataset.logProto !== want)
       || (keyword && !tr.dataset.logSearch.includes(keyword)) || (issues && tr.dataset.logIssue !== 'true');
     tr.hidden = hide;
-    if (!hide) shown += 1;
+    if (!hide) {
+      shown += 1;
+      if (visibleRows.length < 12) visibleRows.push(tr);
+    }
   }
   const total = lastRows.length;
   $('log-count').textContent = total
@@ -788,6 +806,10 @@ export function applyLogFilter() {
   if (empty) empty.hidden = !total || shown > 0;
   const visibleIds = new Set([...$('log-body').children].map(el => Number(el.dataset.id)));
   for (const id of displayedLogRows.keys()) if (!visibleIds.has(id)) displayedLogRows.delete(id);
+
+  if (filterChanged && visibleRows.length) {
+    enterStagger(visibleRows, { step: 18, duration: 300, distance: 6 });
+  }
 }
 
 export function initLogFollow() {
@@ -824,12 +846,12 @@ function paintLog(rows) {
     for (const r of rows) known.add(r.id);
     pending = [];
     setFollowHint();
+    enterStagger([...body.children].slice(0, 12), { step: 20, duration: 340, distance: 7 });
     return;
   }
   if (!incoming.length) return;
 
   if (!followOn()) {
-    // 先记进 known，否则下一轮还会把它们当新行重复攒一遍
     for (const r of incoming) known.add(r.id);
     pending = pending.concat(incoming).slice(-PENDING_CAP);
     setFollowHint();
@@ -844,13 +866,12 @@ function paintLog(rows) {
 export function renderLive() {
   const live = (state.stats && state.stats.live)
     || (state.overview && state.overview.live) || { requests: 0, streams: 0 };
-  $('live-count').textContent = String(live.requests);
+  updateNumber($('live-count'), String(live.requests));
   if ($('route-live')) $('route-live').textContent = `${live.requests} 个请求进行中`;
   $('live-sub').textContent = live.streams
     ? `${live.streams} 条流式`
     : (live.requests ? '非流式' : '空闲');
   $('live-dot').classList.toggle('is-live', live.requests > 0);
-  // 侧栏导航上的角标：不在实时页也该看得见「现在有几条在跑」
   $('badge-live').textContent = live.requests ? String(live.requests) : '';
 }
 
@@ -859,7 +880,7 @@ export function updateKpiLive() {
   const live = (state.stats && state.stats.live)
     || (state.overview && state.overview.live) || { requests: 0, streams: 0 };
   const el = $('kpis').querySelector('[data-num="live"]');
-  if (el && el.textContent !== String(live.requests)) el.textContent = String(live.requests);
+  if (el && el.textContent !== String(live.requests)) updateNumber(el, String(live.requests));
   const note = $('kpis').querySelector('[data-note="live"]');
   if (note) {
     note.innerHTML = live.streams
@@ -874,34 +895,29 @@ export function updateKpiLive() {
 export function afterSwitch(model, fromRid, toRid, proto) {
   const scope = proto ? `[data-proto="${CSS.escape(proto)}"]` : '';
   const row = $('route-list').querySelector(`.route[data-model="${CSS.escape(model)}"]${scope}`);
-  pulse(row, { duration: 260 });
+  pulse(row, { duration: 360 });
   const candidate = $('route-detail')?.querySelector(`[data-rid="${CSS.escape(String(toRid))}"]`)?.closest('.candidate');
-  pulse(candidate, { duration: 460 });
+  pulse(candidate, { duration: 540 });
 }
 
 /**
- * 时间窗切换：不同窗口的桶数不一样（61 / 25 / 8），路径没法逐点插值，
- * 所以走「先横向淡出、换数据、再横向淡入」，进出用不同曲线。
- *
- * 淡出那条是 fill: forwards，淡入必须真正接管之后才能撤掉它 —— 否则淡入一结束，
- * 淡出的 forwards 又把 opacity 按回 0，图表就是「闪两下然后消失」，而且再也不回来。
+ * 时间窗切换：先横向弹簧淡出、换数据、再横向弹簧回弹淡入。
  */
 export function animateWindowChange(mutate) {
   const host = $('chart-series');
   if (!host || reduceMotion() || typeof host.animate !== 'function') { mutate(); return; }
 
-  // 连着换时间窗时上一轮可能还没跑完，先清掉，免得两条 forwards 叠着把图表按死
   for (const anim of host.getAnimations()) anim.cancel();
 
   const out = host.animate(
-    [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateX(-14px)' }],
-    { duration: 150, easing: 'ease-in', fill: 'forwards' },
+    [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translate3d(-16px, 0, 0) scale(0.985)' }],
+    { duration: 150, easing: SPRING.exit, fill: 'forwards' },
   );
   out.finished.catch(() => {}).then(() => {
     mutate();
     const back = host.animate(
-      [{ opacity: 0, transform: 'translateX(14px)' }, { opacity: 1, transform: 'none' }],
-      { duration: 360, easing: 'cubic-bezier(.2,.9,.2,1)', fill: 'backwards' },
+      [{ opacity: 0, transform: 'translate3d(18px, 0, 0) scale(0.985)' }, { opacity: 1, transform: 'none' }],
+      { duration: 400, easing: SPRING.bouncy, fill: 'backwards' },
     );
     back.ready.catch(() => {}).then(() => out.cancel());
   });

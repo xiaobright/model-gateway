@@ -1,3 +1,4 @@
+// AI生成
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -92,6 +93,9 @@ function harness(t) {
     reduceMotion: () => motionReduced,
     moveNavMarker: noop, slideIn: (el) => h.slides.push(el), fadeIn: noop, toggleMotion: noop,
     readBarWidths: () => new Map(), morphBars: noop,
+    enterStagger: noop, springAnimate: noop, SPRING: { bouncy: 'ease', smooth: 'ease', snappy: 'ease' },
+    animateViewEnter: noop, syncSegMarkers: noop,
+    captureRects: () => new Map(), flipElements: noop, animateDetailSwap: noop, pulse: noop,
     updateNumber: (el, value) => { if (el) el.textContent = value; },
     refreshForTest: () => {
       const job = deferred();
@@ -690,7 +694,7 @@ test('工作台更新保留键盘焦点和滚动；接口关闭后提示恢复�
   const key = JSON.stringify(['shared', 'openai']);
   host.contains = () => true;
   host.scrollTop = 48;
-  host.querySelectorAll = () => [{ dataset: { focusKey: key }, focus: () => { focused++; } }];
+  host.querySelectorAll = () => [{ dataset: { focusKey: key }, classList: { toggle: () => {} }, setAttribute: () => {}, focus: () => { focused++; } }];
   h.evaluate(`document.activeElement = { dataset: { focusKey: ${JSON.stringify(key)} } };`);
   util.state.overview = { models: [{ model: 'shared', protocol: 'openai', n: 7 }] };
   h.evaluate('renderRoutes()');

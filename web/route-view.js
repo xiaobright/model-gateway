@@ -1,10 +1,13 @@
+// AI生成
 /* 模型工作台：只派生和展示配置。所有写入仍通过 app 的 data-act 入口。
    选中模型按「名字 + 接口」保存，刷新、筛选和删除后重新校验。 */
 import { $, state, esc, fmtInt, fmtSec, fmtLeft, protocolOn, PROTO_LABEL, splitOneM } from './util.js';
 import { modelKey as routeKey, orderedCandidates, forwardPath, usable } from './canvas-model.js';
-import { fadeIn } from './motion.js';
+import { fadeIn, enterStagger, animateDetailSwap, captureRects, flipElements, pulse } from './motion.js';
 
 let selectedRouteKey = null;
+let lastFilterSig = null;
+let lastDetailKey = null;
 
 export function routeSummary(row, rows = state.routes) {
   const path = row.forward_to ? forwardPath(row, rows) : [];
@@ -26,7 +29,7 @@ const attrs = row => `data-model="${esc(row.model_name)}" data-proto="${esc(row.
 const tag = (label, tone = '') => `<span class="tag${tone ? ' tag-' + tone : ''}">${esc(label)}</span>`;
 
 function replaceIfChanged(host, html) {
-  if (!host || host.__routeHtml === html) return;
+  if (!host || host.__routeHtml === html) return false;
   // 替换轮询更新中的列表时保留当前按钮焦点，键盘操作不会跳回页面顶部。
   const focused = host.contains?.(document.activeElement) ? document.activeElement : null;
   const token = focused?.dataset.focusKey;
@@ -35,6 +38,53 @@ function replaceIfChanged(host, html) {
   host.__routeHtml = html;
   host.scrollTop = scroll;
   if (token) [...host.querySelectorAll('[data-focus-key]')].find(el => el.dataset.focusKey === token)?.focus({ preventScroll: true });
+  return true;
+}
+
+/* 选中态不写进列表 HTML：只要它进了 innerHTML，切换选择就会让 replaceIfChanged
+   整表重建，蓝条的过渡永远等不到起点。改为渲染后按 key 单独同步类，切换时只切
+   类不重建。 */
+function syncRouteSelection(host) {
+  for (const el of host.querySelectorAll('.route')) {
+    const on = el.dataset.focusKey === selectedRouteKey;
+    el.classList.toggle('is-selected', on);
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  moveRouteMarker(host);
+}
+
+/* 蓝条是 .route-table 下一条独立的 .route-marker：切完类按选中行的位置把整条滑
+   过去。位置取 offsetTop / offsetHeight（相对 .route-table 的 padding box，与 marker
+   的绝对定位同一起点，表头高度自然被算进去），不用 getBoundingClientRect：入场的
+   stagger / FLIP 会给行加 transform，而 rect 会被 transform 污染，首帧量出来就偏下
+   一个身位（刷新后「往下歪」的根因，行升回原位后 marker 却不重量，一直偏着）。offset*
+   是布局值，不受 transform / 滚动影响，量到的永远是行的最终位置。
+   首帧（进页面后第一次落位）临时关掉过渡直接落位：否则 marker 会从 translateY(0) 弹
+   到目标行，就是「刷新后先弹一下」。落位后恢复 CSS 过渡，之后的切换才走弹簧。
+   缺布局信息（测试桩）时藏起来。 */
+let markerPlaced = false;
+
+function moveRouteMarker(host, { instant = false } = {}) {
+  const marker = $('route-marker');
+  if (!marker) return;
+  const table = marker.parentElement;
+  const row = host?.querySelector?.('.route.is-selected');
+  const height = row?.offsetHeight;
+  if (!table || !row || !height || typeof row.offsetTop !== 'number') {
+    marker.style.opacity = 0;
+    markerPlaced = false;   // 没有可见目标时复位，下次重新出现仍按首帧无过渡落位
+    return;
+  }
+  const snap = instant || !markerPlaced;
+  if (snap) marker.style.transition = 'none';
+  marker.style.height = height + 'px';
+  marker.style.transform = `translateY(${row.offsetTop}px)`;
+  marker.style.opacity = 1;
+  if (snap) {
+    void marker.offsetHeight;      // 强制回流，把无过渡的首帧样式提交掉
+    marker.style.transition = '';  // 恢复 CSS 过渡，后续切换才动画
+    markerPlaced = true;
+  }
 }
 
 /* 页面长度由内容决定，但不允许内容变化把用户的视口收回去：右卡或列表一变短，
@@ -69,18 +119,31 @@ export function initRoutePad() {
 
   // 改变窗口高度会改变最大滚动距离：按记住的位置重新兜住，不因为缩放窗口闪回去
   window.addEventListener('resize', () => {
-    if (!padHeight) return;
-    if (window.matchMedia?.('(min-width: 1101px)').matches) pinScrollExtent(lastY);
-    else setPad(0);
+    if (padHeight) {
+      if (window.matchMedia?.('(min-width: 1101px)').matches) pinScrollExtent(lastY);
+      else setPad(0);
+    }
+    // 缩放 / 字体变化会改行高，蓝条按新行高立刻重落位（无过渡），不留在旧位置
+    moveRouteMarker($('route-list'), { instant: true });
   });
+
+  // 字体晚于首帧加载会改行高：就绪后按最终行高把蓝条重落一次
+  document.fonts?.ready?.then(() => moveRouteMarker($('route-list'), { instant: true }));
 }
 
 export function selectRouteWorkspace(model, protocol) {
-  const changed = selectedRouteKey !== routeKey(model, protocol);
-  selectedRouteKey = routeKey(model, protocol);
+  const nextKey = routeKey(model, protocol);
+  const changed = selectedRouteKey !== nextKey;
+  selectedRouteKey = nextKey;
   renderRouteWorkspace();
-  if (changed) fadeIn($('route-detail'));
-  if (window.matchMedia?.('(max-width: 1100px)').matches) $('route-detail')?.scrollIntoView({ block: 'start' });
+  if (changed) {
+    const detail = $('route-detail');
+    fadeIn(detail);
+    animateDetailSwap(detail);
+    const selectedRow = $('route-list')?.querySelector('.route.is-selected');
+    if (selectedRow) pulse(selectedRow, { duration: 360 });
+  }
+  if (window.matchMedia?.('(max-width: 1100px)').matches) $('route-detail')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
 
 export function renderRouteWorkspace() {
@@ -89,6 +152,10 @@ export function renderRouteWorkspace() {
   const y = window.scrollY;   // 留白钉死用：必须在任何 DOM 改动之前抓
   const all = state.routes.filter(r => protocolOn(r.protocol));
   const kw = state.filter.trim().toLowerCase();
+  const filterSig = `${state.iface}|${kw}`;
+  const filterChanged = lastFilterSig !== null && lastFilterSig !== filterSig;
+  lastFilterSig = filterSig;
+
   const list = all.filter(r => (!state.iface || r.protocol === state.iface)
     && (!kw || r.model_name.toLowerCase().includes(kw)));
   $('route-count').textContent = `${list.length}${list.length === all.length ? '' : ' / ' + all.length} 个模型`;
@@ -104,12 +171,11 @@ export function renderRouteWorkspace() {
   const hot = new Map((state.overview?.models || []).map(m => [routeKey(m.model, m.protocol), m]));
   const html = list.map(row => {
     const summary = routeSummary(row);
-    const active = routeKey(row.model_name, row.protocol) === selectedRouteKey;
     const stat = hot.get(routeKey(row.model_name, row.protocol));
     const next = summary.next;
-    return `<button type="button" class="route${active ? ' is-selected' : ''}" ${attrs(row)}
+    return `<button type="button" class="route" ${attrs(row)}
       data-act="select-route" data-focus-key="${esc(routeKey(row.model_name, row.protocol))}"
-      aria-pressed="${active}" aria-label="查看 ${esc(row.model_name)} · ${esc(PROTO_LABEL[row.protocol] || row.protocol)} 的路由">
+      aria-pressed="false" aria-label="查看 ${esc(row.model_name)} · ${esc(PROTO_LABEL[row.protocol] || row.protocol)} 的路由">
       <span class="route-name"><strong>${esc(row.model_name)}</strong><small>${esc(PROTO_LABEL[row.protocol] || row.protocol)}</small></span>
       <span class="route-destination"><strong>${esc(candidateName(next))}</strong><small>${row.forward_to ? '经 ' + esc(row.forward_to) + ' 转发' : next ? esc(splitOneM(next.remote_model).bare) : '检查候选及启用状态'}</small></span>
       <span class="route-state">${tag(summary.label, summary.tone)}<small>${row.candidates.length} 个候选</small></span>
@@ -119,7 +185,20 @@ export function renderRouteWorkspace() {
   const hiddenByProtocol = !all.length && Object.values(state.protocolEnabled).some(on => on === false);
   const emptyTitle = all.length ? '没有匹配的模型' : hiddenByProtocol ? '当前没有可见模型' : '从第一个模型开始';
   const emptyHint = all.length ? '调整搜索词或接口筛选。' : hiddenByProtocol ? '有接口处于关闭状态。已关闭接口的配置仍然保留，可在网关设置中重新启用。' : '先添加上游站点和分组，再创建模型路由。';
-  replaceIfChanged(host, html || `<div class="empty"><strong>${emptyTitle}</strong><p>${emptyHint}</p>${all.length ? '' : hiddenByProtocol ? '<button class="btn btn-ghost" data-act="go-settings">管理接口开关</button>' : '<button class="btn btn-ghost" data-act="go-upstreams">添加上游站点</button>'}</div>`);
+
+  const prevRects = captureRects(host, '.route', (el) => el.dataset.focusKey);
+  const changed = replaceIfChanged(host, html || `<div class="empty"><strong>${emptyTitle}</strong><p>${emptyHint}</p>${all.length ? '' : hiddenByProtocol ? '<button class="btn btn-ghost" data-act="go-settings">管理接口开关</button>' : '<button class="btn btn-ghost" data-act="go-upstreams">添加上游站点</button>'}</div>`);
+  if (changed) {
+    if (filterChanged) {
+      enterStagger(host.children, { step: 22, duration: 360, distance: 8 });
+    } else if (!prevRects.size) {
+      // 首次进入用纯淡入（distance 0）：行不做纵向位移，刚落位的蓝条才不会和行错开半个身位
+      enterStagger(host.children, { step: 22, duration: 360, distance: 0 });
+    } else {
+      flipElements(host, '.route', (el) => el.dataset.focusKey, prevRects, { staggerNew: true });
+    }
+  }
+  syncRouteSelection(host);
   renderRouteDetail(list.find(r => routeKey(r.model_name, r.protocol) === selectedRouteKey));
   pinScrollExtent(y);
 }
@@ -127,7 +206,20 @@ export function renderRouteWorkspace() {
 function renderRouteDetail(row) {
   const host = $('route-detail');
   if (!host) return;
-  if (!row) { replaceIfChanged(host, '<div class="empty">选中一个模型，查看路由详情。</div>'); return; }
+  if (!row) {
+    lastDetailKey = null;
+    if (replaceIfChanged(host, '<div class="empty">选中一个模型，查看路由详情。</div>')) {
+      fadeIn(host);
+    }
+    return;
+  }
+  const currentKey = routeKey(row.model_name, row.protocol);
+  const sameModel = lastDetailKey === currentKey;
+  const prevCandRects = sameModel
+    ? captureRects(host, '.candidate', (el) => el.querySelector('[data-rid]')?.dataset.rid)
+    : null;
+  lastDetailKey = currentKey;
+
   const s = routeSummary(row);
   const own = orderedCandidates(row);
   const buttons = (action, text, extra = '', cls = 'btn-ghost') => `<button type="button" class="btn btn-sm ${cls}" data-act="${action}" ${attrs(row)} ${extra}>${text}</button>`;
@@ -157,6 +249,10 @@ function renderRouteDetail(row) {
         ${buttons('del-candidate', '移除', extra, 'btn-danger')}
       </div></article>`;
   }).join('');
-  replaceIfChanged(host, head + forwarding + facts + `<div class="detail-section-head"><h3>候选顺序</h3>${buttons('add-candidate', '＋ 添加')}</div><p class="detail-note">首选先试，其余按顺序尝试；换首选不会改变这里的排序。</p>` + (candidates || '<p class="empty">这个模型没有自己的候选。</p>')
+  const detailChanged = replaceIfChanged(host, head + forwarding + facts + `<div class="detail-section-head"><h3>候选顺序</h3>${buttons('add-candidate', '＋ 添加')}</div><p class="detail-note">首选先试，其余按顺序尝试；换首选不会改变这里的排序。</p>` + (candidates || '<p class="empty">这个模型没有自己的候选。</p>')
     + `<div class="detail-footer">${!row.forward_to ? buttons('cv-forward', '全部转发到…') : ''}${buttons('cv-del-model', '删除模型', '', 'btn-danger')}</div>`);
+
+  if (detailChanged && sameModel && prevCandRects?.size) {
+    flipElements(host, '.candidate', (el) => el.querySelector('[data-rid]')?.dataset.rid, prevCandRects, { staggerNew: true });
+  }
 }

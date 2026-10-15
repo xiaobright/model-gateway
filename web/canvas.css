@@ -1,11 +1,11 @@
 /* ============================================================
-   编排画布
+   编排画布（全局丝滑物理弹簧动效版）
    ------------------------------------------------------------
    一个下游气泡 = 一条链；只展开选中的气泡，指针表示保存的首选。
    候选顺序在下方箭头链中编辑。连线交给 SVG，节点交给 DOM —— 文字和按钮
    必须是真元素，缩放时才有正常的选择、悬停和无障碍行为。
 
-   颜色一律走 style.css 那套变量，深浅色自动跟随，这里不另开一套配色。
+   颜色与弹簧变量一律走 style.css，深浅色自动跟随。
    ============================================================ */
 
 .cv-wrap {
@@ -67,9 +67,10 @@
   color: var(--ink);
   cursor: pointer;
   text-align: left;
+  transition: color .2s, transform .26s var(--spring-bouncy);
 }
 
-.cv-pool-open:hover { color: var(--accent-ink); text-decoration: underline; }
+.cv-pool-open:hover { color: var(--accent-ink); text-decoration: underline; transform: translateX(2px); }
 
 .cv-pool-grp {
   display: flex;
@@ -105,12 +106,12 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  transition: background .16s, transform .16s, color .16s;
+  transition: background .2s, transform .28s var(--spring-bouncy), color .2s, border-color .2s, box-shadow .24s;
 }
 
-.cv-chip:hover { background: var(--accent-wash); color: var(--accent-ink); transform: translateX(2px); }
-.cv-chip:active { cursor: grabbing; }
-.cv-chip:disabled { opacity: .45; cursor: not-allowed; }
+.cv-chip:hover { background: var(--accent-wash); border-color: color-mix(in srgb, var(--accent) 35%, var(--edge)); color: var(--accent-ink); transform: translateX(3px) scale(1.01); }
+.cv-chip:active { cursor: grabbing; transform: scale(.96); }
+.cv-chip:disabled { opacity: .45; cursor: not-allowed; transform: none; }
 
 /* 拖动时的跟随小块。fixed 定位 + pointer-events:none：既要跟手，又不能挡住
    elementFromPoint 去认它底下那个气泡 */
@@ -130,9 +131,18 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: transform .22s var(--spring-bouncy), border-color .18s, box-shadow .22s;
+  animation: ghost-pop .24s var(--spring-bouncy);
+}
+@keyframes ghost-pop {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(.82); }
 }
 
-.cv-ghost.is-over { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+.cv-ghost.is-over {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-glow), var(--shadow-2);
+  transform: translate(-50%, -50%) scale(1.08);
+}
 
 /* ---------- 画布 ---------- */
 
@@ -169,6 +179,7 @@
   stroke-width: 3;
   opacity: .85;
   stroke-linecap: round;
+  transition: opacity .25s, stroke .25s;
 }
 
 .cv-fwd.is-live { stroke-dasharray: 7 6; opacity: 1; }
@@ -179,16 +190,25 @@
 
 .cv-node { position: absolute; user-select: none; }
 .cv-bub { cursor: grab; }
-.cv-bub.is-drag { cursor: grabbing; }
+.cv-bub.is-drag { cursor: grabbing; z-index: 8; }
 
 .cv-dial {
   position: absolute;
   left: 50%;
   top: 50%;
-  transform: translate(-50%, -50%);
+  transform: translate(-50%, -50%) scale(1);
   border-radius: 50%;
   border: 1px dashed var(--hair-2);
   pointer-events: none;
+  transition: transform .44s var(--spring-bouncy), opacity .28s var(--spring-smooth), border-color .25s;
+}
+
+.cv-ports {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  transform-origin: 50% 50%;
+  transition: transform .46s var(--spring-bouncy), opacity .28s var(--spring-smooth), visibility .28s;
 }
 
 .cv-core {
@@ -209,6 +229,17 @@
   background: var(--glass-2);
   border: 1px solid var(--edge);
   box-shadow: var(--edge-highlight), var(--shadow-1);
+  transition: transform .36s var(--spring-bouncy), border-color .24s, background .24s, box-shadow .3s var(--spring-smooth);
+}
+
+.cv-bub:hover .cv-core {
+  transform: translate(-50%, -50%) scale(1.04);
+  box-shadow: var(--edge-highlight), var(--shadow-2);
+}
+
+.cv-bub.is-drag .cv-core {
+  transform: translate(-50%, -50%) scale(1.09);
+  box-shadow: var(--edge-highlight), var(--shadow-2);
 }
 
 .cv-name {
@@ -238,9 +269,11 @@
   color: var(--ink-3);
   cursor: pointer;
   white-space: nowrap;
+  transition: color .2s, border-color .2s, background .2s, transform .28s var(--spring-bouncy);
 }
 
-.cv-tag:hover { color: var(--accent-ink); border-color: var(--accent); }
+.cv-tag:hover { color: var(--accent-ink); border-color: var(--accent); transform: translateX(-50%) scale(1.08); }
+.cv-tag:active { transform: translateX(-50%) scale(.94); }
 
 /* 拉交接箭头的接线柱 */
 .cv-wire {
@@ -260,14 +293,15 @@
   color: var(--ink-3);
   cursor: crosshair;
   opacity: 0;
-  transition: opacity .18s, color .18s, border-color .18s;
+  transform: scale(.75);
+  transition: opacity .22s var(--spring-smooth), transform .32s var(--spring-bouncy), color .18s, border-color .18s;
 }
 
 .cv-bub:hover .cv-wire,
 .cv-bub.is-focus .cv-wire,
-.cv-bub.is-wiring .cv-wire { opacity: 1; }
+.cv-bub.is-wiring .cv-wire { opacity: 1; transform: scale(1); }
 
-.cv-wire:hover, .cv-bub.is-wiring .cv-wire { color: var(--accent-ink); border-color: var(--accent); }
+.cv-wire:hover, .cv-bub.is-wiring .cv-wire { color: var(--accent-ink); border-color: var(--accent); transform: scale(1.16); }
 
 /* ---------- 指针（轮盘） ---------- */
 
@@ -275,13 +309,11 @@
   position: absolute;
   inset: 0;
   transform-origin: 50% 50%;
-  /* 它是个 <button>：不清掉浏览器默认的底色和边框，那圈灰底会盖住整个气泡 */
   border: 0;
   padding: 0;
   background: none;
-  /* 指针铺在整块方框上，不能挡住气泡本体的拖动：只有针尖那个圆点收手势 */
   pointer-events: none;
-  transition: transform .55s cubic-bezier(.34, 1.3, .42, 1);
+  transition: transform .55s var(--spring-bouncy), opacity .28s var(--spring-smooth), visibility .28s;
 }
 
 .cv-bub.is-dialing .cv-needle { transition: none; }
@@ -299,8 +331,7 @@
   background: linear-gradient(180deg, var(--accent), var(--accent-glow));
 }
 
-/* 针尖做成「空心的抓手」，不要做成实心圆点：它和端口长一样的话，就成了两个蓝点套在
-   同一条射线上，看不出哪个是「正在打的那条」。实心 = 端口（当前生效），空心 = 抓手 */
+/* 针尖做成「空心的抓手」 */
 .cv-knob {
   position: absolute;
   left: 50%;
@@ -315,13 +346,14 @@
   box-shadow: 0 1px 5px rgba(24, 34, 86, .22);
   pointer-events: auto;
   cursor: grab;
+  transition: transform .28s var(--spring-bouncy), border-color .18s, background .18s;
 }
 
 /* 针尖小，给它一圈看不见的大命中区，不然拨盘很难拨中 */
 .cv-knob::before { content: ''; position: absolute; inset: -8px; border-radius: 50%; }
 
-.cv-knob:hover { border-color: var(--accent-ink); background: var(--accent-wash); }
-.cv-bub.is-dialing .cv-knob { cursor: grabbing; border-color: var(--accent-ink); }
+.cv-knob:hover { border-color: var(--accent-ink); background: var(--accent-wash); transform: scale(1.22); }
+.cv-bub.is-dialing .cv-knob { cursor: grabbing; border-color: var(--accent-ink); transform: scale(1.18); }
 
 /* ---------- 端口 ---------- */
 
@@ -340,15 +372,17 @@
   background: var(--glass-2);
   color: var(--ink-3);
   cursor: pointer;
-  transition: transform .18s, border-color .18s, background .18s, color .18s, box-shadow .18s;
+  pointer-events: auto;
+  transition: transform .3s var(--spring-bouncy), border-color .2s, background .2s, color .2s, box-shadow .24s;
 }
 
 .cv-port:hover {
-  transform: scale(1.18);
+  transform: scale(1.22);
   border-color: var(--accent);
   color: var(--accent-ink);
   z-index: 3;
 }
+.cv-port:active { transform: scale(.92); }
 
 /* 当前生效的那条：实心 + 一圈光晕 */
 .cv-port.is-on {
@@ -358,8 +392,7 @@
   box-shadow: 0 0 0 4px var(--accent-wash);
 }
 
-/* 手动选定的首选。冷却把流量拨走之后它就不是 is-on 了 —— 两个标记分开画，
-   才看得出「你选的是它，但现在打的是别人」 */
+/* 手动选定的首选 */
 .cv-port.is-preferred { border-color: var(--accent); border-width: 3px; }
 
 .cv-port.is-off { border-style: dashed; opacity: .55; }
@@ -372,7 +405,7 @@
 
 .cv-port-n { line-height: 1; }
 
-/* 端口标签按需露出：一圈候选全展开的话，候选一多就糊成一团 */
+/* 端口标签按需露出 */
 .cv-port-label {
   position: absolute;
   left: calc(50% + var(--lx, 0) * 52px);
@@ -392,7 +425,7 @@
   text-overflow: ellipsis;
   opacity: 0;
   pointer-events: none;
-  transition: opacity .16s, transform .16s;
+  transition: opacity .2s, transform .28s var(--spring-bouncy);
 }
 
 .cv-port:hover .cv-port-label,
@@ -448,8 +481,6 @@
 
 /* ---------- 状态 ---------- */
 
-/* 转发布置：自己的环不参与路由，所以把环压暗，靠中间那行「→ 目标」和粗箭头说话。
-   边框不用虚线 —— 虚线描在圆上会渲染成一圈齿轮，反倒像个故障图标 */
 .cv-bub.is-fwd .cv-dial { opacity: .3; }
 .cv-bub.is-fwd .cv-needle { opacity: 0; }
 .cv-bub.is-fwd .cv-core {
@@ -459,7 +490,7 @@
 }
 .cv-bub.is-fwd .cv-meta { color: var(--accent-ink); font-weight: 600; }
 
-/* 断链：指过去那边已经没有这个模型了，整条链是 404。这属于配置错误，得显眼 */
+/* 断链 */
 .cv-bub.is-dead .cv-core { border-color: var(--crit); box-shadow: var(--edge-highlight), 0 0 0 3px rgba(255, 59, 48, .16); }
 .cv-bub.is-dead .cv-meta { color: var(--crit-ink); }
 
@@ -492,6 +523,7 @@
   box-shadow: var(--shadow-2);
   display: flex;
   flex-direction: column;
+  transform-origin: top left;
 }
 
 .cv-menu[hidden] { display: none; }
@@ -507,12 +539,14 @@
   color: var(--ink-2);
   cursor: pointer;
   white-space: nowrap;
+  transition: background .18s, color .18s, transform .24s var(--spring-snappy);
 }
 
-.cv-menu button:hover { background: var(--hover); color: var(--ink); }
+.cv-menu button:hover { background: var(--hover); color: var(--ink); transform: translateX(2px); }
+.cv-menu button:active { transform: scale(.97); }
 .cv-menu button.is-danger { color: var(--crit-ink); }
 .cv-menu button.is-danger:hover { background: rgba(255, 59, 48, .1); }
-.cv-menu button:disabled { opacity: .45; cursor: not-allowed; }
+.cv-menu button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
 .cv-menu button:disabled:hover { background: none; color: var(--ink-2); }
 .cv-menu-sep { height: 1px; margin: 4px 6px; background: var(--hair-2); }
 
@@ -537,30 +571,56 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .cv-needle, .cv-port, .cv-chip { transition: none; }
+  .cv-needle, .cv-port, .cv-chip, .cv-dial, .cv-ports, .cv-core { transition: none; }
   .cv-bub.is-shift .cv-core { animation: none; }
 }
-/* 单模型展开：画布只保留下游拓扑，完整名称和操作放在候选链。 */
+
+/* 单模型径向弹簧展开：未选中或已转发的气泡平滑收回环与端口，选中的气泡弹性绽放 */
 .cv-wrap { height: 420px; min-height: 320px; }
 .cv-bub:not(.is-selected) .cv-dial,
+.cv-bub.is-fwd .cv-dial {
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(.52);
+  visibility: hidden;
+  pointer-events: none;
+}
 .cv-bub:not(.is-selected) .cv-ports,
+.cv-bub.is-fwd .cv-ports {
+  opacity: 0;
+  transform: scale(.48);
+  visibility: hidden;
+  pointer-events: none;
+}
+.cv-bub:not(.is-selected) .cv-port,
+.cv-bub.is-fwd .cv-port,
+.cv-bub:not(.is-selected) .cv-knob,
+.cv-bub.is-fwd .cv-knob {
+  pointer-events: none;
+}
 .cv-bub:not(.is-selected) .cv-needle,
-.cv-bub.is-fwd .cv-dial,
-.cv-bub.is-fwd .cv-ports,
-.cv-bub.is-fwd .cv-needle { display: none; }
-.cv-bub.is-selected .cv-core { border: 2px solid var(--accent); }
+.cv-bub.is-fwd .cv-needle {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.cv-bub.is-selected .cv-core {
+  border: 2px solid var(--accent);
+  transform: translate(-50%, -50%) scale(1.05);
+  box-shadow: var(--edge-highlight), var(--shadow-2), 0 0 0 4px var(--accent-wash);
+}
 .cv-core { font: inherit; cursor: pointer; }
 .cv-port-label { display: none; }
-.cv-chain { margin-top: 14px; padding: 16px; border: 1px solid var(--edge); border-radius: 14px; background: var(--glass-2); }
+.cv-chain { margin-top: 14px; padding: 16px; border: 1px solid var(--edge); border-radius: 14px; background: var(--glass-2); transition: border-color .25s, box-shadow .3s var(--spring-smooth); }
 .cv-chain-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .cv-chain-head > span, .cv-route-summary { color: var(--ink-3); font-size: 12px; line-height: 1.8; }
 .cv-chain-list { display: flex; align-items: center; overflow-x: auto; gap: 10px; padding: 4px 0 10px; }
-.cv-chain-card { flex: 0 0 240px; padding: 12px; border: 1px solid var(--edge); border-radius: 12px; background: var(--glass); }
-.cv-chain-card.is-preferred { border-color: var(--accent); }
+.cv-chain-card { flex: 0 0 240px; padding: 12px; border: 1px solid var(--edge); border-radius: 12px; background: var(--glass); transition: transform .32s var(--spring-bouncy), border-color .22s, box-shadow .26s var(--spring-smooth), background .22s; }
+.cv-chain-card:hover { transform: translateY(-2px); box-shadow: var(--edge-highlight), var(--shadow-1); }
+.cv-chain-card.is-preferred { border-color: var(--accent); box-shadow: var(--edge-highlight), 0 0 0 2px var(--accent-wash); }
 .cv-chain-card > b, .cv-chain-card > span, .cv-chain-card > small { display: block; overflow-wrap: anywhere; margin-bottom: 7px; }
 .cv-chain-card > span, .cv-chain-card > small { color: var(--ink-3); font-size: 12px; }
 .cv-chain-card .btn { padding: 4px 7px; }
-.cv-chain-arrow { color: var(--accent); font-size: 24px; }
+.cv-chain-arrow { color: var(--accent); font-size: 24px; transition: transform .3s var(--spring-bouncy); }
 .cv-forward-path { color: var(--accent-ink); overflow-wrap: anywhere; }
 @media (max-width: 900px) {
   .cv-wrap { grid-template-columns: minmax(0, 1fr); height: auto; }

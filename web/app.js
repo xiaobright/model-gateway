@@ -14,7 +14,7 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import * as views from './views.js';
-import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition } from './motion.js';
+import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition, animateViewEnter, syncSegMarkers, enterStagger, springAnimate, SPRING } from './motion.js';
 import {
   initCanvas, renderCanvas, renderPool, setCanvasFilter, setCanvasIface,
   saveForward, canvasActions,
@@ -64,6 +64,7 @@ function renderProtocolControls() {
   for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
   for (const b of $('seg-proto').children) b.classList.toggle('is-on', b.dataset.proto === state.proto);
   $('protocol-status').textContent = '';
+  syncSegMarkers();
 }
 
 // Preserve the current new-model default when OpenAI is registered; a test or
@@ -273,7 +274,9 @@ function showView(name) {
   if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
   if (name === 'routes') views.renderRoutes();
   if (name === 'settings') views.renderPolicies();
-  if (!moved) slideIn(document.querySelector(`.view[data-view="${name}"]`));
+  const viewEl = document.querySelector(`.view[data-view="${name}"]`);
+  if (!moved) slideIn(viewEl);
+  animateViewEnter(viewEl, dir, { withVt: moved });
 }
 
 /* ---------------------------------------------------------------- 时间窗 */
@@ -284,6 +287,7 @@ async function setWindow(w) {
   for (const b of $('seg-window').children) {
     b.classList.toggle('is-on', b.dataset.window === w);
   }
+  syncSegMarkers();
   await run(null, async () => {
     await refreshOverview({ skipSeries: true });
     views.animateWindowChange(() => views.renderSeries());
@@ -300,6 +304,7 @@ function setIface(v) {
   state.iface = v;
   localStorage.setItem('mg-iface', v);
   for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === v);
+  syncSegMarkers();
   views.renderRoutes();
 }
 
@@ -308,6 +313,7 @@ function setProto(p) {
   if (p === state.proto) return;
   state.proto = p;
   for (const b of $('seg-proto').children) b.classList.toggle('is-on', b.dataset.proto === p);
+  syncSegMarkers();
   views.applyLogFilter();
 }
 
@@ -319,6 +325,7 @@ function applyTheme(name) {
   if (name === 'auto') document.documentElement.removeAttribute('data-theme');
   else document.documentElement.dataset.theme = name;
   $('theme-icon').textContent = THEME_ICON[name];
+  springAnimate($('theme-icon'), [{ transform: 'rotate(-90deg) scale(0.65)' }, { transform: 'none' }], { duration: 380, easing: SPRING.bouncy });
   localStorage.setItem('mg-theme', name);
 }
 
@@ -519,7 +526,9 @@ function egressValue() {
 
 function egressHint() {
   const kind = egressKind();
+  const wasHidden = $('up-egress-url').hidden;
   $('up-egress-url').hidden = kind !== 'proxy';
+  if (wasHidden && kind === 'proxy') slideIn($('up-egress-url'), { duration: 280, distance: 8, axis: 'x' });
   $('up-egress-hint').textContent = EGRESS_TIP[kind] || '';
 }
 
@@ -976,6 +985,7 @@ function renderPicker() {
   host.innerHTML = head + body + tail;
   $('grp-mcount').textContent = `${mine.length} 个`;
   applyPickerFilter();
+  enterStagger(host.querySelectorAll('label:not([hidden])'), { step: 16, limit: 12, duration: 300, distance: 6 });
   // 目录里的行（没拉过列表也会显示）同样要带对应建议：缺建议的名字补问一次，
   // 回来后重画一次。问过的不重复问，所以不会转圈；建议拿不到只是没有那几个选项，
   // 行照样能勾、能选「新开 / 只留着」
@@ -1531,6 +1541,7 @@ function renderBatchPicker() {
   host.innerHTML = html;
   applyBatchFilter();
   syncBatchSelection();
+  enterStagger(host.querySelectorAll('label.pick-row:not([hidden])'), { step: 18, limit: 14, duration: 320, distance: 7 });
 }
 
 /* 按钮那一侧的文案和可用性都由这里说了算。批量的 busy 也压在这里：run() 收尾会把
@@ -2268,6 +2279,7 @@ document.addEventListener('click', (ev) => {
   const cvIfaceSeg = ev.target.closest('#cv-seg-iface [data-cv-iface]');
   if (cvIfaceSeg) {
     for (const b of cvIfaceSeg.parentElement.children) b.classList.toggle('is-on', b === cvIfaceSeg);
+    syncSegMarkers();
     setCanvasIface(cvIfaceSeg.dataset.cvIface);
     return;
   }
