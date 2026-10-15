@@ -57,7 +57,9 @@ function harness(t) {
     style: { setProperty: (k, v) => vtVars.set(k, v), removeProperty: (k) => vtVars.delete(k) },
     dataset: {},
   };
-  const h = { element, requests: [], refreshes: [], timers: [], toasts: [], blockRefresh: false, vt: { vars: vtVars, root: vtRoot }, setReduceMotion: (v) => { motionReduced = v; } };
+  const h = { element, requests: [], refreshes: [], timers: [], toasts: [], blockRefresh: false,
+    vt: { vars: vtVars, root: vtRoot, calls: [], runs: true }, slides: [],
+    setReduceMotion: (v) => { motionReduced = v; } };
   const oldFetch = globalThis.fetch;
   globalThis.fetch = async (path, options) => {
     const job = { ...deferred(), path, method: options.method, body: options.body && JSON.parse(options.body) };
@@ -74,7 +76,7 @@ function harness(t) {
       documentElement: vtRoot,
       startViewTransition: (fn) => { fn(); return { finished: Promise.resolve() }; },
     },
-    window: { addEventListener: noop, innerWidth: 1000, innerHeight: 800 }, localStorage: { getItem: () => null, setItem: noop },
+    window: { addEventListener: noop, innerWidth: 1000, innerHeight: 800, scrollY: 0, scrollTo: noop }, localStorage: { getItem: () => null, setItem: noop },
     location: { origin: 'http://127.0.0.1', hash: '' }, history: { replaceState: noop },
     views: new Proxy({}, { get: () => noop }),
     // canvas.js 的行为在真实浏览器里验证（dev/check-canvas.mjs），这里只补 app.js
@@ -83,8 +85,13 @@ function harness(t) {
     setCanvasFilter: noop, setCanvasIface: noop, saveForward: async () => {},
     toast: (...args) => h.toasts.push(args), run: (_el, fn) => fn(), confirmBox: async () => true,
     requestAnimationFrame: (fn) => fn(), setInterval: (fn, ms) => h.timers.push({ fn, ms }),
-    withViewTransition: (_dir, fn) => fn(), reduceMotion: () => motionReduced,
-    moveNavMarker: noop, slideIn: noop, fadeIn: noop, toggleMotion: noop,
+    withViewTransition: (dir, fn) => {
+      if (!h.vt.runs) { fn(); return false; }
+      h.vt.calls.push(dir); fn(); return true;
+    },
+    reduceMotion: () => motionReduced,
+    moveNavMarker: noop, slideIn: (el) => h.slides.push(el), fadeIn: noop, toggleMotion: noop,
+    readBarWidths: () => new Map(), morphBars: noop,
     updateNumber: (el, value) => { if (el) el.textContent = value; },
     refreshForTest: () => {
       const job = deferred();
@@ -99,7 +106,7 @@ function harness(t) {
     openUpstream, saveUpstream, probeUpstream, openGroup, saveGroup, openRoute,
     fillRemoteList, saveRewrite, actions: ACTIONS, groupDirty,
     openBatchAdd, scanModels, commitBatch, syncBatchSelection,
-    editingKey: () => editingKey
+    editingKey: () => editingKey, showView
   })`, context);
   h.evaluate = (code) => vm.runInContext(code, context);
   h.latest = () => h.requests.at(-1);
@@ -988,4 +995,27 @@ test('减少动态时主题切换不走视图过渡，直接换', (t) => {
   assert.equal(h.vt.root.dataset.theme, 'light');
   assert.equal(h.vt.vars.size, 0);
   assert.equal(h.vt.root.dataset.vtTheme, undefined);
+});
+
+test('视图切换按导航顺序定横向方向，同视图和未知名不切', (t) => {
+  const h = harness(t);
+  h.vt.calls.length = 0;              // 启动时已经翻到默认视图一次
+  h.app.showView('canvas');           // routes(0) → canvas(1)
+  h.app.showView('routes');           // 往回翻
+  h.app.showView('routes');           // 同视图
+  h.app.showView('nope');             // 不存在的视图
+  assert.deepEqual(h.vt.calls, ['down', 'up']);
+});
+
+test('没套上过渡时视图切换自己补淡入，不重复播放入场动画', (t) => {
+  const h = harness(t);
+  h.vt.calls.length = 0;
+  h.vt.runs = false;
+  h.app.showView('overview');
+  assert.equal(h.vt.calls.length, 0);
+  assert.equal(h.slides.length, 1);
+  h.vt.runs = true;
+  h.app.showView('settings');
+  assert.equal(h.vt.calls.length, 1, '套上过渡就不再补淡入，否则两段动画叠在一起');
+  assert.equal(h.slides.length, 1);
 });

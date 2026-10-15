@@ -5,7 +5,7 @@ import {
   $, state, esc, fmtInt, fmtTokens, fmtBytes, fmtDur, fmtSec, fmtLeft, protocolOn,
   catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTOCOLS,
 } from './util.js';
-import { enterStagger, slideIn, pulse, reduceMotion, updateNumber } from './motion.js';
+import { enterStagger, slideIn, pulse, reduceMotion, updateNumber, readBarWidths, morphBars } from './motion.js';
 import { renderRouteWorkspace, selectRouteWorkspace, initRoutePad as bindRoutePad } from './route-view.js';
 import { requestResult } from './request-result.js';
 import { sparkline, donut, areaChart, barRow } from './charts.js';
@@ -151,7 +151,7 @@ export function renderHealth() {
   const next = rows.map((u) => {
     const pct = Math.round(u.ok_rate * 1000) / 10;
     const tone = toneOf(u.ok_rate);
-    return `<div class="health-row">
+    return `<div class="health-row" data-key="${esc(u.name)}">
       <span class="h-name" title="${esc(u.name)}">${esc(u.name)}</span>
       <span class="h-bar"><i class="tone-${tone}" style="width:${Math.max(2, u.ok_rate * 100)}%"></i></span>
       <span class="h-num tone-${tone}-ink">${pct}%</span>
@@ -160,7 +160,9 @@ export function renderHealth() {
     </div>`;
   }).join('');
   if (host.innerHTML === next) return;  // 轮询重画不用重播入场动画
+  const widths = readBarWidths(host, (el) => el.querySelector('.h-bar > i'));
   host.innerHTML = next;
+  morphBars(host, widths, (el) => el.querySelector('.h-bar > i'));
   enterStagger(host.children);
 }
 
@@ -178,11 +180,7 @@ export function renderHot() {
   host.dataset.sig = sig;
 
   // 记住旧宽度，重建后先把新条拉回旧宽度再放开，就有"此消彼长"的形变
-  const prev = new Map();
-  for (const el of host.children) {
-    const fill = el.querySelector('.bar-fill');
-    if (fill) prev.set(el.dataset.key, fill.style.width);
-  }
+  const prev = readBarWidths(host, (el) => el.querySelector('.bar-fill'));
 
   const frag = document.createDocumentFragment();
   for (const m of rows) {
@@ -200,22 +198,7 @@ export function renderHot() {
   host.innerHTML = '';
   host.append(frag);
 
-  if (!reduceMotion() && prev.size) {
-    const pending = [...host.children].map((row) => {
-      const fill = row.querySelector('.bar-fill');
-      const target = fill.style.width;
-      const old = prev.get(row.dataset.key);
-      if (old) { fill.style.transition = 'none'; fill.style.width = old; }
-      return { fill, target, animated: Boolean(old) };
-    });
-    requestAnimationFrame(() => {
-      for (const item of pending) {
-        if (!item.animated) continue;
-        item.fill.style.transition = '';
-        item.fill.style.width = item.target;
-      }
-    });
-  }
+  morphBars(host, prev, (el) => el.querySelector('.bar-fill'));
   enterStagger(host.children, { step: 22 });
 }
 

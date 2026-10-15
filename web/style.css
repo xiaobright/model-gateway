@@ -72,6 +72,33 @@
   from { clip-path: circle(0% at var(--vt-x, 50%) var(--vt-y, 50%)); }
   to   { clip-path: circle(var(--vt-r, 150%) at var(--vt-x, 50%) var(--vt-y, 50%)); }
 }
+
+/* ------------------------------------------------ 视图切换：两块主区横向错开
+   只有 withViewTransition 会挂 data-vt-dir，主题切换时主区不会莫名跟着横滑一下。
+   和上面那套圆形揭开互斥：圆形要摘掉所有 view-transition-name，正在滑的时候抢走
+   名字会把页面撕开，所以两条路在 app.js 里互相挡着。
+   侧栏不参与：它是 sticky 的常驻容器，滑进去会和"钉死在左边"的观感打架。 */
+:root[data-vt-dir]::view-transition-old(view-main) {
+  animation: slideOutLeft .38s cubic-bezier(.2, .95, .25, 1) both;
+}
+:root[data-vt-dir]::view-transition-new(view-main) {
+  animation: slideInRight .44s cubic-bezier(.2, .95, .25, 1) both;
+}
+:root[data-vt-dir="up"]::view-transition-old(view-main) { animation-name: slideOutRight; }
+:root[data-vt-dir="up"]::view-transition-new(view-main) { animation-name: slideInLeft; }
+
+@keyframes slideOutLeft {
+  to { opacity: 0; transform: translate3d(-35px, 0, 0) scale(.98); filter: blur(2px); }
+}
+@keyframes slideInRight {
+  from { opacity: 0; transform: translate3d(35px, 0, 0) scale(1.01); filter: blur(2px); }
+}
+@keyframes slideOutRight {
+  to { opacity: 0; transform: translate3d(35px, 0, 0) scale(.98); filter: blur(2px); }
+}
+@keyframes slideInLeft {
+  from { opacity: 0; transform: translate3d(-35px, 0, 0) scale(1.01); filter: blur(2px); }
+}
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--page-1); font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; -webkit-font-smoothing: antialiased; }
@@ -120,13 +147,23 @@ h3 { font-size: 14px; }
 .side-live:hover { background-color: var(--hover); transform: translateY(-2px); }
 .side-live-text .dim { display: block; font-size: 11px; }
 .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); flex: none; }
-.live-dot.is-live { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 12%, transparent); }
+/* 有请求在跑时让光晕慢慢呼吸：一眼看出"现在活着"，不用去读数字 */
+.live-dot.is-live { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 12%, transparent); animation: live-breathe 2.6s ease-in-out infinite; }
+@keyframes live-breathe {
+  50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--good) 3%, transparent); }
+}
+:root[data-motion="light"] .live-dot.is-live { animation: none; }
 .side-foot { margin-top: auto; padding-top: 30px; display: grid; gap: 12px; }
 .motion-toggle { padding: 4px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-3); font-size: 11px; transition: background .2s; }
 .motion-toggle:hover { background: var(--hover); }
 .pill { display: block; border: 0; background: none; color: var(--ink-3); padding: 3px 0; text-align: center; min-width: 0; }
 .pill code { display: block; font: 10.5px var(--mono); overflow: hidden; text-overflow: ellipsis; }
-.main { min-width: 0; padding-top: 8px; }
+/* view-transition-name 让 .main 在视图切换时新旧各成一层（规则见上面的 data-vt-dir），
+   同时它本身就把 .main 变成了 backdrop root。will-change: filter 让这个副作用在名字被
+   主题切换临时摘掉时也保持住：卡片的 backdrop-filter 只采样 .main 内部、吃不到页面
+   极光，两个时刻渲染一致，圆形揭开的收尾才不会整块跳色。
+   以后若给别的元素加 view-transition-name，同样记得补这条兜底。 */
+.main { min-width: 0; padding-top: 8px; view-transition-name: view-main; will-change: filter; }
 .view-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 23px; }
 .view-head h2 { font-size: 27px; line-height: 1.3; font-weight: 650; letter-spacing: -.6px; margin: 0; }
 .view-description { color: var(--ink-3); margin: 8px 0 0; font-size: 13px; }
@@ -142,10 +179,16 @@ h3 { font-size: 14px; }
 .seg { display: inline-flex; align-items: center; gap: 3px; padding: 4px; border: 1px solid var(--hair); border-radius: 12px; background: var(--glass-sunken); box-shadow: inset 0 1px 3px light-dark(#526a9b09, #00000020); flex-wrap: wrap; }
 .seg-item { border: 1px solid transparent; border-radius: 9px; padding: 5px 11px; background: transparent; color: var(--ink-3); font-size: 12px; transition: background .2s, color .2s, transform .25s var(--spring); }
 .seg-item:hover { color: var(--ink); }.seg-item:active { transform: scale(.95); }
-.seg-item.is-on { color: var(--accent); background: var(--glass-2); border-color: var(--edge); box-shadow: var(--edge-highlight), 0 2px 5px light-dark(#1232570f, #00000035); }
+/* 点中的那一下轻轻回弹：分段是即时生效的筛选，给个"按下去"的确认 */
+.seg-item.is-on { color: var(--accent); background: var(--glass-2); border-color: var(--edge); box-shadow: var(--edge-highlight), 0 2px 5px light-dark(#1232570f, #00000035); animation: seg-pop .3s var(--spring); }
+@keyframes seg-pop { from { transform: scale(.93); } }
 .view-tabs { display: flex; gap: 22px; }
-.view-tabs button { padding: 12px 0; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--ink-3); }
-.view-tabs .is-active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+/* 下划线从中间长出来：换页时旧的那条缩回去、新的那条展开，比硬切边框顺 */
+.view-tabs button { position: relative; padding: 12px 0 10px; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--ink-3); transition: color .2s; }
+.view-tabs button::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; border-radius: 2px; background: var(--accent); transform: scaleX(0); transition: transform .32s var(--spring); }
+.view-tabs button:hover::after { transform: scaleX(.3); }
+.view-tabs .is-active { color: var(--accent); font-weight: 600; }
+.view-tabs .is-active::after { transform: scaleX(1); }
 .workspace-status { display: flex; gap: 12px 22px; align-items: center; flex-wrap: wrap; padding: 12px 0; border-top: 1px solid var(--hair-2); border-bottom: 1px solid var(--hair-2); color: var(--ink-3); font-size: 12px; }
 .text-button { color: var(--accent); border: 0; background: transparent; padding: 0; }
 .workspace-toolbar { display: flex; align-items: center; gap: 12px; margin: 14px 0; }
@@ -498,8 +541,9 @@ tbody tr:hover td { background: var(--hover); }
 .sw-ok { background: var(--accent); }.sw-err { background: var(--crit); }.sw-tok { background: var(--good); }
 .bar-row { display: grid; grid-template-columns: minmax(0, 1fr) 70px 44px 50px; gap: 10px; align-items: center; padding: 7px 0; font-size: 12px; }
 .bar-label { overflow-wrap: anywhere; }
+/* 宽度过渡是给 morphBars 用的：重建 DOM 后新条从旧宽度长过来（见 motion.js） */
 .bar-track, .h-bar { height: 6px; border-radius: 4px; background: var(--track); overflow: hidden; }
-.bar-fill, .h-bar > i { display: block; height: 100%; border-radius: 4px; }
+.bar-fill, .h-bar > i { display: block; height: 100%; border-radius: 4px; transition: width .55s var(--spring); }
 .bar-num, .bar-note, .h-p95, .h-n, .h-num { text-align: right; font-size: 11px; font-variant-numeric: tabular-nums; }
 .health-row { display: grid; grid-template-columns: minmax(0, 1fr) 60px 42px 76px 45px; gap: 9px; align-items: center; padding: 7px 0; font-size: 12px; }
 .h-name { overflow-wrap: anywhere; }
@@ -526,7 +570,8 @@ tbody tr:hover td { background: var(--hover); }
 /* Shared status and feedback */
 .toasts { position: fixed; inset: auto 16px 24px; width: fit-content; max-width: calc(100vw - 32px); margin: auto; padding: 0; background: none; border: 0; overflow: visible; z-index: 100; }
 .toasts:not(:popover-open) { display: none; }
-.toast { display: flex; align-items: center; gap: 9px; border: 1px solid var(--edge); border-radius: 14px; padding: 11px 16px; margin-top: 8px; background: var(--solid); color: var(--ink); box-shadow: var(--shadow-2); font-size: 13px; }
+.toast { display: flex; align-items: center; gap: 9px; border: 1px solid var(--edge); border-radius: 14px; padding: 11px 16px; margin-top: 8px; background: var(--solid); color: var(--ink); box-shadow: var(--shadow-2); font-size: 13px; animation: toast-in .3s var(--spring); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(10px) scale(.97); } }
 .toast-err { color: var(--crit-ink); }.toast-ok { color: var(--good-ink); }
 .tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 5px; font-size: 11px; line-height: 1.5; background: var(--glass-3); color: var(--ink-3); white-space: nowrap; }
 .tag-good { color: var(--good-ink); background: color-mix(in srgb, var(--good) 10%, var(--glass)); }

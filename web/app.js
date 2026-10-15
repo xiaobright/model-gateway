@@ -14,7 +14,7 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import * as views from './views.js';
-import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion } from './motion.js';
+import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition } from './motion.js';
 import {
   initCanvas, renderCanvas, renderPool, setCanvasFilter, setCanvasIface,
   saveForward, canvasActions,
@@ -255,9 +255,16 @@ function showView(name) {
   const next = VIEWS.indexOf(name);
   const cur = VIEWS.indexOf(currentView);
   if (next < 0 || next === cur) return;
+  const dir = cur < 0 || next > cur ? 'down' : 'up';
   currentView = name;
   state.view = name;
-  paintView(name);
+  // 换视图会改文档高度，浏览器可能把滚动位置夹回去；同一次任务里补回来，过渡期间
+  // 视口是冻结的，用户看不见这一下。没套上过渡（减弱动效 / 不支持）时退回淡入。
+  const moved = withViewTransition(dir, () => {
+    const y = window.scrollY;
+    paintView(name);
+    if (window.scrollY !== y) window.scrollTo(0, y);
+  });
   history.replaceState(null, '', '#' + name);
   if (name === 'log' && state.protocolsReady) run(null, refreshLog);
   if (name === 'live') run(null, refreshInflight);
@@ -266,7 +273,7 @@ function showView(name) {
   if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
   if (name === 'routes') views.renderRoutes();
   if (name === 'settings') views.renderPolicies();
-  slideIn(document.querySelector(`.view[data-view="${name}"]`));
+  if (!moved) slideIn(document.querySelector(`.view[data-view="${name}"]`));
 }
 
 /* ---------------------------------------------------------------- 时间窗 */
@@ -330,7 +337,9 @@ function cycleTheme(dataset, el) {
   const now = localStorage.getItem('mg-theme') || 'auto';
   const next = THEMES[(THEMES.indexOf(now) + 1) % THEMES.length];
   const label = { auto: '跟随系统', light: '浅色', dark: '深色' }[next];
-  if (reduceMotion() || typeof document.startViewTransition !== 'function') {
+  // 视图切换正在滑的时候不套过渡：那套要把 view-transition-name 全摘掉，会把它撕开
+  if (reduceMotion() || typeof document.startViewTransition !== 'function'
+    || document.documentElement.dataset.vtDir) {
     applyTheme(next);
     toast(`外观：${label}`);
     return;

@@ -32,6 +32,66 @@ export function fadeIn(el) {
   animate(el, [{ opacity: .4 }, { opacity: 1 }], { duration: 220 });
 }
 
+/* ---------------------------------------------------------------- 视图切换 */
+
+/* 视图切换：新旧两块主区横向错开推过去，规则在 style.css 的 data-vt-dir 上。
+   dir 只有 'down'（往后翻）和 'up'（往回翻）两种，按导航顺序定。
+   主题切换走的是另一套 —— data-vt-theme 的圆形揭开要把所有 view-transition-name
+   摘掉，两条路同时跑会互相抢名字、把页面撕开，所以互斥。
+   返回是否真的套上了过渡，没套上时调用方自己补一个淡入。 */
+let vtSeq = 0;
+
+export function withViewTransition(dir, mutate) {
+  const root = document.documentElement;
+  if (reduceMotion() || typeof document.startViewTransition !== 'function' || root.dataset.vtTheme) {
+    mutate();
+    return false;
+  }
+  root.dataset.vtDir = dir;
+  // 连点导航会把上一次的过渡打断，它的收尾不能把新过渡的方向擦掉
+  const seq = ++vtSeq;
+  const vt = document.startViewTransition(mutate);
+  vt.finished
+    .catch(() => { /* 切换被打断不算错误 */ })
+    .finally(() => { if (seq === vtSeq) delete root.dataset.vtDir; });
+  return true;
+}
+
+/* ---------------------------------------------------------------- 条形图形变 */
+
+/* 条形列表换数据时让还认识的条从旧宽度长过来。重建 DOM 的话新元素一插进来就是
+   目标宽度，CSS 过渡没有起点就不会触发，所以先按 data-key 记下旧宽度，重建后把
+   对得上的条拉回旧值，下一帧再放开交给样式表里的 width 过渡。 */
+export function readBarWidths(host, fillOf) {
+  const prev = new Map();
+  for (const el of host.children) {
+    const fill = fillOf(el);
+    if (fill) prev.set(el.dataset.key, fill.style.width);
+  }
+  return prev;
+}
+
+export function morphBars(host, prev, fillOf) {
+  if (!prev || !prev.size || reduceMotion()) return;
+  const pending = [];
+  for (const row of host.children) {
+    const old = prev.get(row.dataset.key);
+    const fill = fillOf(row);
+    if (!old || !fill || fill.style.width === old) continue;
+    const target = fill.style.width;
+    fill.style.transition = 'none';
+    fill.style.width = old;
+    pending.push({ fill, target });
+  }
+  if (!pending.length) return;
+  requestAnimationFrame(() => {
+    for (const { fill, target } of pending) {
+      fill.style.transition = '';
+      fill.style.width = target;
+    }
+  });
+}
+
 export function updateNumber(el, text) {
   if (!el || el.textContent === text) return;
   el.textContent = text;
