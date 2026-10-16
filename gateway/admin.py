@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from . import (
-    capture, canvas, db, failover, inflight, protocols, proxy as proxy_mod, rewrite, truncation,
+    capture, db, failover, inflight, protocols, proxy as proxy_mod, rewrite, truncation,
 )
 from . import model_batch
 from . import model_match
@@ -149,30 +149,6 @@ class ForwardIn(BaseModel):
 class FailoverIn(BaseModel):
     protocol: str = Field(min_length=1)
     enabled: bool
-
-
-class CanvasViewIn(BaseModel):
-    """画布的平移和缩放。用来「下次打开还在刚才那个位置」。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    x: float = Field(default=0.0, allow_inf_nan=False)
-    y: float = Field(default=0.0, allow_inf_nan=False)
-    z: float = Field(default=1.0, gt=0, le=4, allow_inf_nan=False)
-
-
-class CanvasLayoutIn(BaseModel):
-    """编排画布上各节点的坐标。**只收位置**：路由配置一律走 /models 那几个接口。
-
-    `nodes` 的键是后端 canvas 模块拼出来的节点标识，这里不解析它 —— 形状校验和剪枝都在
-    canvas.save 里做，管理接口只负责挡住明显超量的请求体。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    # 值是 [x, y]。上限按「手滑塞进来」定，正常人摆不到几百个模型
-    nodes: dict[str, tuple[float, float]] = Field(default_factory=dict)
-    view: CanvasViewIn = Field(default_factory=CanvasViewIn)
 
 
 class ProtocolSwitchIn(BaseModel):
@@ -1113,25 +1089,6 @@ def remove_model_forward(
         raise HTTPException(404, "这条转发不存在")
     log(f"FORWARD off {model_name!r} [{protocol}]")
     return {"ok": True}
-
-
-# ---------------------------------------------------------------- 编排画布
-
-
-@router.get("/canvas-layout")
-def get_canvas_layout() -> dict[str, Any]:
-    """画布上各节点的摆放位置。纯展示状态，坏了一份也只是回到自动摆放。"""
-    return canvas.load()
-
-
-@router.put("/canvas-layout")
-def put_canvas_layout(payload: CanvasLayoutIn) -> dict[str, Any]:
-    if len(payload.nodes) > canvas.MAX_NODES:
-        raise HTTPException(400, f"节点太多（最多 {canvas.MAX_NODES} 个）")
-    try:
-        return canvas.save(payload.model_dump())
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
 
 
 # ---------------------------------------------------------------- 实时

@@ -1,4 +1,4 @@
-/* 编排页的数据派生：不写配置，不把配置顺序与单次请求轨迹混在一起。 */
+/* 模型路由的数据派生：不写配置，不把配置顺序与单次请求轨迹混在一起。 */
 export const modelKey = (model, protocol) => JSON.stringify([model, protocol]);
 export const orderedCandidates = (row) => [...row.candidates]
   .sort((a, b) => a.priority - b.priority || a.route_id - b.route_id);

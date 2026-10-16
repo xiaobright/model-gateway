@@ -7,7 +7,7 @@ import vm from 'node:vm';
 import * as util from '../web/util.js';
 import * as groupEditor from '../web/group-editor.js';
 import { createRefreshQueue } from '../web/async-state.js';
-import * as canvasModel from '../web/canvas-model.js';
+import * as routeModel from '../web/route-model.js';
 import { requestResult } from '../web/request-result.js';
 
 // 执行真实 app.js 的处理函数，只替换 DOM/网络和启动轮询的宿主。
@@ -69,7 +69,7 @@ function harness(t) {
   };
   t.after(() => { globalThis.fetch = oldFetch; groupEditor.invalidateGroupEdit(); });
   const context = vm.createContext({
-    ...util, ...groupEditor, ...canvasModel, routeKey: canvasModel.modelKey, performance,
+    ...util, ...groupEditor, ...routeModel, routeKey: routeModel.modelKey, performance,
     requestResult, createRefreshQueue, $: element,
     document: {
       addEventListener: noop, querySelectorAll: () => [], visibilityState: 'visible',
@@ -80,10 +80,8 @@ function harness(t) {
     window: { addEventListener: noop, innerWidth: 1000, innerHeight: 800, scrollY: 0, scrollTo: noop }, localStorage: { getItem: () => null, setItem: noop },
     location: { origin: 'http://127.0.0.1', hash: '' }, history: { replaceState: noop },
     views: new Proxy({}, { get: () => noop }),
-    // canvas.js 的行为在真实浏览器里验证（dev/check-canvas.mjs），这里只补 app.js
-    // 求值阶段就要读到的出口 —— ACTIONS 里 spread 了 canvasActions，少了它整个模块都跑不起来
-    canvasActions: {}, initCanvas: noop, renderCanvas: noop, renderPool: noop,
-    setCanvasFilter: noop, setCanvasIface: noop, saveForward: async () => {},
+    // forward-dialog.js 的出口 —— ACTIONS 里 spread 了 forwardActions，少了它整个模块都跑不起来
+    forwardActions: {}, initForwardDialog: noop, saveForward: async () => {},
     toast: (...args) => h.toasts.push(args), run: (_el, fn) => fn(), confirmBox: async () => true,
     requestAnimationFrame: (fn) => fn(), setInterval: (fn, ms) => h.timers.push({ fn, ms }),
     withViewTransition: (dir, fn, afterPaint) => {
@@ -1005,7 +1003,7 @@ test('减少动态时主题切换不走视图过渡，直接换', (t) => {
 test('视图切换按导航顺序定横向方向，同视图和未知名不切', (t) => {
   const h = harness(t);
   h.vt.calls.length = 0;              // 启动时已经翻到默认视图一次
-  h.app.showView('canvas');           // routes(0) → canvas(1)
+  h.app.showView('live');             // routes(0) → live(1)
   h.app.showView('routes');           // 往回翻
   h.app.showView('routes');           // 同视图
   h.app.showView('nope');             // 不存在的视图

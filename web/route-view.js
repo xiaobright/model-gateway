@@ -2,7 +2,7 @@
 /* 模型工作台：只派生和展示配置。所有写入仍通过 app 的 data-act 入口。
    选中模型按「名字 + 接口」保存，刷新、筛选和删除后重新校验。 */
 import { $, state, esc, fmtInt, fmtSec, fmtLeft, protocolOn, PROTO_LABEL, splitOneM } from './util.js';
-import { modelKey as routeKey, orderedCandidates, forwardPath, usable } from './canvas-model.js';
+import { modelKey as routeKey, orderedCandidates, forwardPath, usable } from './route-model.js';
 import { fadeIn, enterStagger, animateDetailSwap, captureRects, flipElements, pulse, reduceMotion } from './motion.js';
 
 let selectedRouteKey = null;
@@ -226,7 +226,7 @@ function renderRouteDetail(row) {
   const own = orderedCandidates(row);
   const buttons = (action, text, extra = '', cls = 'btn-ghost') => `<button type="button" class="btn btn-sm ${cls}" data-act="${action}" ${attrs(row)} ${extra}>${text}</button>`;
   const head = `<div class="detail-head"><span class="eyebrow">路由详情</span><h2>${esc(row.model_name)}</h2>${tag(PROTO_LABEL[row.protocol] || row.protocol)}${tag(s.label, s.tone)}</div>`;
-  const forwarding = row.forward_to ? `<div class="route-forward"><b>全部转发</b><p>${esc(row.model_name)} → ${s.path ? s.path.map(r => esc(r.model_name)).join(' → ') : esc(row.forward_to) + '（不可用）'}</p><div class="action-row">${buttons('cv-forward', '更改目标')}${buttons('cv-unforward', '恢复自己的候选')}</div></div>` : '';
+  const forwarding = row.forward_to ? `<div class="route-forward"><b>全部转发</b><p>${esc(row.model_name)} → ${s.path ? s.path.map(r => esc(r.model_name)).join(' → ') : esc(row.forward_to) + '（不可用）'}</p><div class="action-row">${buttons('fwd-open', '更改目标')}${buttons('fwd-clear', '恢复自己的候选')}</div></div>` : '';
   const policy = Boolean(state.failover?.enabled?.[row.protocol]);
   const reason = row.forward_to ? '下次请求使用最终目标的候选；自己的候选保留。'
     : !s.next ? '没有可用候选，请检查候选配置、供应商和分组是否启用。'
@@ -247,12 +247,12 @@ function renderRouteDetail(row) {
       <div class="candidate-tags">${preferred ? tag('首选', 'accent') : ''}${current ? tag('下次起点', 'good') : ''}${!enabled ? tag(c.upstream_enabled ? '分组停用' : '站点停用') : ''}${c.cooling_ms > 0 ? tag('冷却 ' + fmtLeft(c.cooling_ms), 'warn') : ''}${row.forward_to ? tag('暂不参与路由') : ''}</div>
       <div class="candidate-actions">${buttons('switch', c.cooling_ms > 0 ? '切换并清除冷却' : preferred && current ? '已设为首选' : '设为首选', `${extra} data-focus-key="switch-${c.route_id}"${!enabled || row.forward_to || (preferred && current && !c.cooling_ms) ? ' disabled' : ''}`)}
         ${buttons('edit-candidate', '编辑', extra + ` data-focus-key="edit-${c.route_id}"`)}
-        <span class="grow"></span>${buttons('cv-move', '↑', `${extra} data-delta="-1" aria-label="候选 ${i + 1} 前移" data-focus-key="up-${c.route_id}"${i === 0 || row.forward_to ? ' disabled' : ''}`)}${buttons('cv-move', '↓', `${extra} data-delta="1" aria-label="候选 ${i + 1} 后移" data-focus-key="down-${c.route_id}"${i === own.length - 1 || row.forward_to ? ' disabled' : ''}`)}
+        <span class="grow"></span>${buttons('cand-shift', '↑', `${extra} data-delta="-1" aria-label="候选 ${i + 1} 前移" data-focus-key="up-${c.route_id}"${i === 0 || row.forward_to ? ' disabled' : ''}`)}${buttons('cand-shift', '↓', `${extra} data-delta="1" aria-label="候选 ${i + 1} 后移" data-focus-key="down-${c.route_id}"${i === own.length - 1 || row.forward_to ? ' disabled' : ''}`)}
         ${buttons('del-candidate', '移除', extra, 'btn-danger')}
       </div></article>`;
   }).join('');
   const detailChanged = replaceIfChanged(host, head + forwarding + facts + `<div class="detail-section-head"><h3>候选顺序</h3>${buttons('add-candidate', '＋ 添加')}</div><p class="detail-note">首选先试，其余按顺序尝试；换首选不会改变这里的排序。</p>` + (candidates || '<p class="empty">这个模型没有自己的候选。</p>')
-    + `<div class="detail-footer">${!row.forward_to ? buttons('cv-forward', '全部转发到…') : ''}${buttons('cv-del-model', '删除模型', '', 'btn-danger')}</div>`);
+    + `<div class="detail-footer">${!row.forward_to ? buttons('fwd-open', '全部转发到…') : ''}${buttons('del-model', '删除模型', '', 'btn-danger')}</div>`);
 
   if (detailChanged && sameModel && prevCandRects?.size) {
     flipElements(host, '.candidate', (el) => el.querySelector('[data-rid]')?.dataset.rid, prevCandRects, { staggerNew: true });

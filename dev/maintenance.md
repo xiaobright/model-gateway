@@ -11,7 +11,6 @@
 - [Claude Code 配置](#claude-code-配置)
 - [重试与自动换候选](#重试与自动换候选)
 - [整条链交给另一个模型](#整条链交给另一个模型)
-- [编排画布](#编排画布)
 - [实时状态与统计](#实时状态与统计)
 - [代理和证书](#代理和证书)
 - [抓包排查](#抓包排查)
@@ -41,11 +40,9 @@
 | `gateway/capture.py` | 请求头/形状诊断、临时请求/响应抓包和压缩观察结果落盘。 |
 | `gateway/learning.py` | 只记录调度元数据的有界后台采集，不参与路由决策。 |
 | `gateway/rewrite.py` | 按规则替换请求文本。 |
-| `gateway/canvas.py` | 编排画布的节点坐标（只存位置，不碰路由配置）。 |
 | `gateway/admin.py`、`gateway/app.py` | 管理接口、本机访问限制和静态页面。 |
 | `web/app.js`、`web/views.js` | 页面入口、操作分发和显示内容。 |
 | `web/route-view.js`、`web/request-result.js` | 路由工作台的选择与状态派生；实时和历史记录共用的请求结果口径。 |
-| `web/canvas.js`、`web/canvas.css` | 编排画布：下游气泡、首选轮盘、候选链和手势。 |
 | `web/group-editor.js`、`web/async-state.js` | 分组编辑状态、迟到请求的处理和刷新合并。 |
 | `web/util.js`、`web/charts.js`、`web/motion.js` | 公共工具、图表和动效。 |
 | `web/theme.js` | 主题风格登记表与读写（`mg-style`）；新增皮肤只改这里加一行，详见[修改前端时注意什么](#修改前端时注意什么)。 |
@@ -89,7 +86,7 @@
 - 已配置但全部停用的链返回 404，不会落到另一个同档位模型；只有该接口下未配置的名字才尝试档位兼容。
 - `/v1/models` 通过 `anthropic-version` 请求头识别 Anthropic 客户端，只返回该接口的模型；其他情况返回未被全局关闭的接口下的模型。
 
-旧编排的候选复制/移动接口和旧批量暴露接口已移除，历史实现见[旧编排查阅指引](orchestration-history.md)。
+旧编排的候选复制/移动接口和旧批量暴露接口已移除，历史实现见 git 记录。
 当前新增候选用 `POST /admin/api/models`，上游目录登记用 `POST /admin/api/groups/{id}/models`，两种含义不要混用。
 `DELETE /admin/api/models` 用 `route_id` 删除单条，或用 `model_name` 与 `protocol` 删除一条链。
 旧 `group_id` 删除参数和其他未知参数会返回 400，避免把局部删除误当成整模型删除。
@@ -321,41 +318,6 @@ anyrouter 上连着重试 6 次，请求体字节数完全相同（1005868B）�
 
 管理接口是 `POST /models/forward` 和 `DELETE /models/forward`（用 query 参数定位，模型名可能带 `/`）。
 
-## 编排画布
-
-「模型路由 → 编排视图」沿用原生 DOM + SVG，一次只展开选中的下游模型。
-
-- `web/canvas-model.js` 派生候选顺序、当前起点和完整转发路径，不写配置。
-- 下方候选链的箭头表示保存的优先级，用前移/后移按钮排序；首选单独保存。
-- 轮盘指针表示 `preferred_route_id`。点击端口或拨针只设置首选，不排序；端口拖动不写配置。
-- 当前可用起点按后端规则派生：过滤停用项、首选提前，开启降级时冷却项后移。单次请求还会因失败类别跳过分组，不能把配置显示称为实时轨迹。
-- 全部转发隐藏自己的候选操作，显示完整目标路径。目标允许多跳，但排除跨协议、成环和断链；后端仍负责最终校验。
-- 气泡拖动只保存坐标。上游池拖到气泡添加候选；气泡上的 ↦ 拖到其他气泡设置全部转发。
-- 气泡骨架保持稳定，拖拽期间不重画；针尖在环外以免被端口遮挡。
-- SVG marker 保留 `markerUnits="userSpaceOnUse"`。首次视图切换量不到尺寸时，下帧再适配。
-
-坐标是**纯展示状态**，单独存在 `settings` 表的 `canvas_layout` 条目里（不动 schema），
-读写走 `GET`/`PUT /admin/api/canvas-layout`。节点键的格式在 `gateway/canvas.py` 和 `web/canvas.js`
-各写了一份，改一处必须改两处：
-| 键 | 含义 |
-| --- | --- |
-| `m\|模型名\|接口` | 下游气泡 |
-| `u\|分组 id\|上游真名` | 上游节点 |
-
-坏坐标只丢自己（坏 JSON、越界数值、拆不出来的键都退化成自动摆放），节点数有上限（800）直接拒。
-写入时会剪掉库里已经不存在的节点 —— 剪枝按「库里有没有」算，不按「界面上看不看得见」算，
-所以某个接口被整体停用时位置留着，重新打开还在原处。画布坏了一份坐标绝不该影响转发，
-这一点有 `test_canvas.py::test_layout_never_touches_routing` 盯着。
-
-### 空画布
-
-刚装好的机器上画布是空的，而且这时上游池也没有东西可拖。所以空状态下的提示会分两种：
-上游池**有**模型可拖时提示先添加下游模型，再连接候选；
-上游池也是空的时候直接指向「上游站点」（先去加供应商、建分组、拉一次模型列表）。
-
-要复现这个状态：`dev/preview-canvas.py --empty`（不造任何数据）。当时的截图存在
-`dev/blank-first-open.png`。
-
 ## 实时状态与统计
 
 实时登记在内存中，包含等响应头、等内容和输出中三个阶段。结束记录保留 90 秒，最多 24 条。
@@ -577,18 +539,18 @@ pwsh -NoProfile -File dev\capture-net.ps1 -Stop    # 停止并转成 pcapng
 
 ### 日常按改动检查
 
-例如只改画布坐标，跑对应文件；默认排除需要真实监听端口的 `network` 用例：
+例如只改模型转发，跑对应文件；默认排除需要真实监听端口的 `network` 用例：
 
 ```powershell
 $env:PYTHONUTF8 = '1'
 $env:PYTHONDONTWRITEBYTECODE = '1'
-uv run .venv\Scripts\python.exe -m pytest tests/test_canvas.py -q -p no:cacheprovider --durations=5
+uv run .venv\Scripts\python.exe -m pytest tests/test_forwards.py -q -p no:cacheprovider --durations=5
 ```
 
 | 改动范围 | 首选检查 |
 | --- | --- |
 | 启动等待、错误提示与日志 | `tests/test_startup.py`；再用同文件 `--network` 检查实际端口占用、临时库起停和超时后的迟到收尾。 |
-| 画布坐标、模型批量添加 | `tests/test_canvas.py` 或 `tests/test_model_batch.py`；界面同时改动时加 Node 测试。 |
+| 模型批量添加 | `tests/test_model_batch.py`；界面同时改动时加 Node 测试。 |
 | 分组拉取模型的下游对应 | `tests/test_model_match.py`；界面同时改动时加 `tests/web_app.test.mjs`。 |
 | 路由、模型转发 | `tests/test_routing.py`、`tests/test_forwards.py`，以及改动涉及的 `test_proxy` 用例。 |
 | 重试、冷却 | `tests/test_same_retry.py`、`tests/test_failover.py`；取消等待还需相关 `test_lifecycle` 用例。 |
@@ -650,38 +612,19 @@ git diff --check
 | `test_model_batch` | 批量添加模型：名字相似度分级、扫描不写配置、单站失败与其他站隔离、提交幂等与跨接口各一条链。 |
 | `test_model_match` | 分组拉取模型的下游对应：完全/部分匹配分档与并列时的确定性、plan 接口只读、已暴露标记、纯转发模型不列为目标、只匹配本接口暴露的下游模型。 |
 | `test_forwards` | 下游→下游转发：多跳、成环与死链校验、候选保留和恢复。 |
-| `test_canvas` | 编排画布坐标：存取、剪枝、坏输入退化，以及「坐标不影响路由」。 |
 | `test_failover`、`test_same_retry` | 换候选、冷却、同站重试及限制。 |
 | `test_truncation` | 200 截断拦截：武装条件、扣住与重发、次数上限、见到正文即放行、配置校验。 |
 | `test_stats`、`test_inflight` | 用量、成功/失败统计、实时状态和取消。 |
 | `test_learning` | 调度元数据、请求/尝试关联、事件时间线、取消、容量限制及采集故障旁路。 |
 | `test_egress`、`test_units` | 代理、证书、工具函数与内容观察。 |
 | `web_protocols.test.mjs`、`web_app.test.mjs` | 协议选项、刷新队列、弹窗会话、模型列表重开与统计展示。 |
-| `web_workbench.test.mjs`、`web_canvas.test.mjs` | 首选与实际起点、协议隔离、转发路径、请求结果与隐藏画布生命周期。 |
+| `web_workbench.test.mjs` | 首选与实际起点、协议隔离、转发路径、请求结果与请求结果标签。 |
 
 测试使用临时数据库和模拟上游，不拿真实 `data/` 做演练。为了提速不能删必要断言、隐藏失败用例，或修改正式运行的超时/重试参数。
 通用 `gateway` fixture 关闭采集线程；`test_learning` 自己开启真实采集器验证写盘与转发挂接。
 普通模拟流不做无意义的逐块延时；真实网络流保留原有时序。挂起的模拟上游只在用例断言结束后释放，并检查服务线程确实退出。
 统计样本批量写入，参数检查不额外创建 TLS transport；真实代理和证书仍由网络组覆盖。
 语法检查不等于浏览器验证，模拟转发通过也不等于真实站点具备某项能力；报告时分开写。
-
-### 编排画布的浏览器检查
-
-上面的语法检查看不出画布对不对 —— 端口位置、拖拽、拨盘都需要真实浏览器。
-这两个脚本用**独立临时库和假站点**，不碰日常那份配置：
-
-```powershell
-# 一个终端：起一个独立实例（临时库在 dev/.canvas-preview/）
-& '.\.venv\Scripts\python.exe' dev/preview-canvas.py --port 8331
-# 另一个终端：跑验收，截图写到 dev/canvas-qa/
-node dev/check-canvas.mjs 8331
-```
-
-加 `--empty` 起的是**不造任何数据**的实例，用来看全新用户第一次打开的样子（画布和上游池都是空的）。
-
-`check-canvas.mjs` 只接受假站点预览库，验证单模型展开、首选与排序分离、真实鼠标拨盘、上游池拖拽与重复连接、同名跨接口隔离、多跳转发/取消和窄窗口布局。
-截图写到 `dev/canvas-qa/`。测试会修改预览库配置，不应对正式实例运行。
-纯数据规则另跑 `node --test tests/web_canvas.test.mjs`；涉及页面入口时加 `tests/web_app.test.mjs`。
 
 ### 批量添加模型的浏览器检查
 
@@ -713,10 +656,10 @@ node dev/verify-batch-add.mjs 8399
 
 ## 修改前端时注意什么
 
-默认入口是 `#routes`，`#canvas` 为同一份路由配置的可选视图；全局控制放在 `#settings`，用量图表放在 `#overview`。
-界面保留原生 ES 模块，无新增运行依赖。玻璃模糊限于侧栏、主面板、指标卡、画布容器和弹窗，表格行、候选、按钮不叠加模糊。三层环境渐变只做缓慢变换，不动画化模糊半径。
+默认入口是 `#routes`；全局控制放在 `#settings`，用量图表放在 `#overview`。
+界面保留原生 ES 模块，无新增运行依赖。玻璃模糊限于侧栏、主面板、指标卡和弹窗，表格行、候选、按钮不叠加模糊。三层环境渐变只做缓慢变换，不动画化模糊半径。
 
-明暗（`data-theme`：auto/light/dark）与风格（`data-style`）是两个正交的轴，选择分别记在本机 `mg-theme`、`mg-style`，不随网关配置走，也不进数据库。控件在设置页「外观」卡片，侧栏保留明暗圆钮做快捷切换；两个入口改同一份状态，`applyTheme` 会顺手同步分段选中。风格皮肤只重新声明 `style.css` `:root` 里的同一批 token（契约注释在文件开头），两套明暗值各自用 `light-dark()` 给，`color-scheme` 仍由 `data-theme` 决定；没声明的 token 继承默认值，所以皮肤可以只写自己要改的那几个。新增风格 = `web/theme.js` 的 `STYLES` 登记一行 + `style.css` 加一段 `:root[data-style="id"]`，JS 不用动；id 只用小写字母、数字和连字符（会拼进属性选择器）。`canvas.css` 用同一批 token，画布跟着风格走。明暗和风格切换共用 `app.js` 的 `withCircleReveal` 圆形揭开，与视图过渡互斥、dpr 非 1 时用百分比半径这些规则不变。
+明暗（`data-theme`：auto/light/dark）与风格（`data-style`）是两个正交的轴，选择分别记在本机 `mg-theme`、`mg-style`，不随网关配置走，也不进数据库。控件在设置页「外观」卡片，侧栏保留明暗圆钮做快捷切换；两个入口改同一份状态，`applyTheme` 会顺手同步分段选中。风格皮肤只重新声明 `style.css` `:root` 里的同一批 token（契约注释在文件开头），两套明暗值各自用 `light-dark()` 给，`color-scheme` 仍由 `data-theme` 决定；没声明的 token 继承默认值，所以皮肤可以只写自己要改的那几个。新增风格 = `web/theme.js` 的 `STYLES` 登记一行 + `style.css` 加一段 `:root[data-style="id"]`，JS 不用动；id 只用小写字母、数字和连字符（会拼进属性选择器）。明暗和风格切换共用 `app.js` 的 `withCircleReveal` 圆形揭开，与视图过渡互斥、dpr 非 1 时用百分比半径这些规则不变。
 
 侧栏提供「标准 / 轻量」动效切换并本地记忆：标准包含环境流动与单个悬停面板的光感，轻量保留短交互动画。系统减少动态效果优先；页面隐藏暂停环境动画并取消动效模块待执行的帧。窄屏路由定位在系统减弱时使用立即滚动。JS 弹簧曲线读取 CSS 的 `--spring-*` token，有限动画通过 `springAnimate` 登记；环形图先写最新 SVG 数值，再过渡，完成或取消后都显示最新值。鼠标光感按帧合并，只更新一个当前容器，离开、滚动、打开弹窗、切入后台时清除，无常驻 JS 动画循环。
 
@@ -737,7 +680,7 @@ uv run python dev/preview-workbench.py --port 8341
 uv run python dev/preview-workbench.py --port 8342 --empty
 ```
 
-每次创建新的 `dev/.canvas-preview/workbench-*` 目录，保留旧数据；模拟所有 httpx 出站请求，不使用正式数据库和供应商。
+每次创建新的 `dev/.preview/workbench-*` 目录，保留旧数据；模拟所有 httpx 出站请求，不使用正式数据库和供应商。
 检查切换/排序/转发、目录登记、批量添加、请求筛选/详情，以及浅色/深色/窄屏；结束后停止自己启动的预览进程。
 
 - 浏览器直接加载 ES 模块。`/static` 使用 `cache-control: no-store`，避免新旧模块混用。

@@ -8,6 +8,6 @@ data/
 /gateway.db
 dev/liquid-qa/
 dev/orbit-shot.png
-dev/canvas-qa/
+dev/.preview/
 dev/.canvas-preview/
 dev/captures/

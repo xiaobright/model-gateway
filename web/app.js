@@ -17,9 +17,9 @@ import * as views from './views.js';
 import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition, animateViewEnter, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog } from './motion.js';
 import { STYLES, DEFAULT_STYLE, normalizeStyle, loadStyle, applyStyle, styleHint } from './theme.js';
 import {
-  initCanvas, renderCanvas, renderPool, setCanvasFilter, setCanvasIface,
-  saveForward, canvasActions,
-} from './canvas.js';
+  initForwardDialog, saveForward, forwardActions,
+} from './forward-dialog.js';
+import { modelKey, moveCandidate } from './route-model.js';
 import { createRefreshQueue } from './async-state.js';
 import {
   beginGroupEdit, currentGroupEdit, updateGroupEdit,
@@ -56,12 +56,6 @@ function renderProtocolControls() {
       + `${esc(PROTO_LABEL[p])}</button>`).join('');
   $('seg-iface').innerHTML = make('data-iface');
   $('seg-proto').innerHTML = make('data-proto');
-  // 编排画布有自己的一份接口筛选：它和概览看的是同一批数据，但两边切换互不影响
-  const cvSeg = $('cv-seg-iface');
-  if (cvSeg) {
-    cvSeg.innerHTML = make('data-cv-iface');
-    for (const b of cvSeg.children) b.classList.toggle('is-on', b.dataset.cvIface === '');
-  }
   for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
   for (const b of $('seg-proto').children) b.classList.toggle('is-on', b.dataset.proto === state.proto);
   $('protocol-status').textContent = '';
@@ -150,9 +144,6 @@ const configRefresh = createRefreshQueue(
     renderSearchTarget();
     renderRewriteRules(data.rewriteRules);
     syncPickerChecks();
-    // 画布和「模型路由」用的是同一份 state.routes：那边改了什么，这边跟着变
-    renderCanvas();
-    renderPool();
   },
 );
 
@@ -237,7 +228,7 @@ function refreshInflight(options) {
 
 /* ---------------------------------------------------------------- 视图路由 */
 
-const VIEWS = ['routes', 'canvas', 'live', 'upstreams', 'log', 'overview', 'settings'];
+const VIEWS = ['routes', 'live', 'upstreams', 'log', 'overview', 'settings'];
 let currentView = '';
 
 function paintView(name) {
@@ -245,7 +236,7 @@ function paintView(name) {
     sec.hidden = sec.dataset.view !== name;
   }
   for (const btn of document.querySelectorAll('.nav-item')) {
-    const on = btn.dataset.view === name || (name === 'canvas' && btn.dataset.view === 'routes');
+    const on = btn.dataset.view === name;
     btn.classList.toggle('is-active', on);
     if (on) btn.setAttribute('aria-current', 'page');
     else btn.removeAttribute('aria-current');
@@ -266,7 +257,6 @@ function showView(name) {
   withViewTransition(dir, () => {
     const y = window.scrollY;
     paintView(name);
-    if (name === 'canvas') { renderCanvas(); renderPool(); }
     if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
     if (name === 'routes') views.renderRoutes();
     if (name === 'settings') views.renderPolicies();
@@ -2116,7 +2106,6 @@ const ACTIONS = {
   'open-search': openSearch,
   'select-route': ({ model, proto }) => views.selectRoute(model, proto),
   'go-routes': () => showView('routes'),
-  'go-canvas': () => showView('canvas'),
   'go-settings': () => showView('settings'),
   'go-upstreams': () => showView('upstreams'),
   'request-details': ({ id }) => views.showRequestDetails(id),
@@ -2209,6 +2198,16 @@ const ACTIONS = {
     requestAnimationFrame(orderHint);
   },
 
+  /* 路由列表里的候选 ↑↓：直接挪这一行，和编辑弹窗里那套（move-cand）是两处入口 */
+  'cand-shift': async (d) => {
+    const row = state.routes.find((r) =>
+      modelKey(r.model_name, r.protocol) === modelKey(d.model, d.proto));
+    const order = row && moveCandidate(row, d.rid, d.delta);
+    if (!order || row.forward_to) return;
+    await api('POST', '/admin/api/models/order', { model_name: d.model, order });
+    await refreshConfig();
+  },
+
   'switch': async ({ model, rid, proto }) => {
     const id = Number(rid);
     const group = state.routes.find((r) => r.model_name === model && r.protocol === proto);
@@ -2280,9 +2279,9 @@ const ACTIONS = {
     toast('已清空', 'ok');
   },
 
-  // 编排画布的动作表和上面这套是同一个分发：画布自己的逻辑全在 canvas.js 里，
-  // 这边只是把入口挂上，免得画布的写操作和列表页各写一遍
-  ...canvasActions,
+  // 转发弹窗的动作表和上面这套是同一个分发：逻辑全在 forward-dialog.js 里，
+  // 这边只是把入口挂上，免得弹窗和列表页各写一遍
+  ...forwardActions,
 };
 
 /* 分组弹窗上半部分（组名 / 接口 / key / 启用 / 所属供应商）有没有改过。
@@ -2313,16 +2312,6 @@ document.addEventListener('click', (ev) => {
   // 点「切换 / ✎ / ✕ / 删除」只会去切转发记录的协议筛选，动作本身永远不执行
   const ifaceSeg = ev.target.closest('#seg-iface [data-iface]');
   if (ifaceSeg) { setIface(ifaceSeg.dataset.iface); return; }
-
-  // 编排画布的接口筛选：它自己的容器，绝不能和上面那个共用 —— 共用的话在画布上
-  // 切接口会顺手把概览的列表也筛了
-  const cvIfaceSeg = ev.target.closest('#cv-seg-iface [data-cv-iface]');
-  if (cvIfaceSeg) {
-    for (const b of cvIfaceSeg.parentElement.children) b.classList.toggle('is-on', b === cvIfaceSeg);
-    syncSegMarkers();
-    setCanvasIface(cvIfaceSeg.dataset.cvIface);
-    return;
-  }
 
   const protoSeg = ev.target.closest('#seg-proto [data-proto]');
   if (protoSeg) { setProto(protoSeg.dataset.proto); return; }
@@ -2375,13 +2364,10 @@ $('batch-model').addEventListener('keydown', (ev) => {
   run(null, scanModels);
 });
 
-$('cv-fwd-form').addEventListener('submit', (ev) => {
+$('fwd-form').addEventListener('submit', (ev) => {
   ev.preventDefault();
-  run($('cv-fwd-save'), saveForward);
+  run($('fwd-save'), saveForward);
 });
-
-// 编排画布的名字筛选是纯前端过滤，不重新拉数据
-$('cv-filter').addEventListener('input', () => setCanvasFilter($('cv-filter').value));
 
 // 供应商换了就把分组下拉重填一遍；接口换了连供应商池一起换
 $('rt-upstream').addEventListener('change', () => {
@@ -2494,13 +2480,6 @@ window.addEventListener('hashchange', () => {
   if (VIEWS.includes(target) && target !== currentView) showView(target);
 });
 
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.view === 'canvas') {
-    renderCanvas();
-    renderPool();
-  }
-});
-
 /* ---------------------------------------------------------------- 轮询 */
 
 const ticking = () => document.visibilityState === 'visible' && !document.querySelector('dialog[open]');
@@ -2546,12 +2525,8 @@ initMotion();
 views.initRoutePad();   // 路由视图：内容变短时用留白兜住滚动位置，不把用户夹回去
 $('endpoint').textContent = `${location.origin}/v1`;
 views.initLogFollow();   // 「自动跟随新记录」的勾选状态变化时补插攒下的行
-// 编排画布：写操作全部通过这三个入口回到主流程，画布自己不碰弹窗和刷新
-initCanvas({
-  openRoute,
-  refreshConfig: () => refreshConfig(),
-  openUpstream: (uid) => { showView('upstreams'); return openUpstream(uid); },
-});
+// 转发弹窗：写操作通过这一个入口回到主流程，弹窗自己不碰刷新
+initForwardDialog({ refreshConfig: () => refreshConfig() });
 for (const b of $('seg-window').children) b.classList.toggle('is-on', b.dataset.window === state.window);
 
 state.iface = '';

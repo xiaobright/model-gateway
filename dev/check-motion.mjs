@@ -12,7 +12,7 @@ assert.ok(Number.isInteger(port) && port > 0 && port <= 65535 && port !== 8317,
   '必须使用独立 preview-workbench 端口，禁止连接正式网关 8317');
 const origin = `http://127.0.0.1:${port}`;
 const profile = mkdtempSync(join(tmpdir(), 'mg-motion-'));
-const output = 'dev/.canvas-preview/motion-qa';
+const output = 'dev/.preview/motion-qa';
 mkdirSync(output, { recursive: true });
 const chrome = spawn(process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe', [
   '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,

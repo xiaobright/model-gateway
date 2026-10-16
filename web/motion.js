@@ -4,7 +4,7 @@
    2. 侧栏导航胶囊（#nav-marker）与全站分段控制器胶囊（.seg::before）的弹簧滑动
    3. 主视图切换（View Transitions API + 视图内部区块级联弹簧入场）
    4. 列表 / 候选卡片 FLIP（First-Last-Invert-Play）物理重排过渡
-   5. 详情面板切换、表格分组折叠展开、弹窗与折叠面板（<details>）、画布相机与气泡展开、Toast 退场 */
+   5. 详情面板切换、表格分组折叠展开、弹窗与折叠面板（<details>）、Toast 退场 */
 
 export const reduceMotion = () => Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
 
@@ -160,13 +160,10 @@ export function animateViewEnter(viewEl, dir = 'down', { withVt = false } = {}) 
   const blocks = [
     viewEl.querySelector('.view-head'),
     viewEl.querySelector('.workspace-status'),
-    viewEl.querySelector('.workspace-toolbar'),
     viewEl.querySelector('.route-filters'),
     viewEl.querySelector('.log-filters'),
     ...viewEl.querySelectorAll(':scope > .kpis > .kpi'),
     ...viewEl.querySelectorAll(':scope > .route-workspace > *'),
-    ...viewEl.querySelectorAll(':scope > .cv-wrap > *'),
-    viewEl.querySelector(':scope > .cv-chain'),
     ...viewEl.querySelectorAll(':scope > .card, :scope > .cols > .card'),
   ].filter((el) => el && !el.hidden);
 
@@ -194,19 +191,6 @@ export function animateViewEnter(viewEl, dir = 'down', { withVt = false } = {}) 
     );
   });
 
-  // 路由列表 <-> 编排视图顶部的 .view-tabs 指示条平滑滑入
-  const activeTab = viewEl.querySelector('.view-tabs .is-active');
-  if (activeTab) {
-    const fromX = viewEl.dataset.view === 'canvas' ? -48 : 48;
-    animate(
-      activeTab,
-      [
-        { transform: `translate3d(${fromX * 0.22}px, 0, 0)` },
-        { transform: 'none' },
-      ],
-      { duration: 360, easing: SPRING.bouncy },
-    );
-  }
 }
 
 /* ---------------------------------------------------------------- FLIP 物理布局重排 */
@@ -354,90 +338,6 @@ export function closeDialog(dialog, returnValue) {
   if (animation) animation.finished.catch(() => {}).then(() => finish(true));
   else finish(true);
   return finished;
-}
-
-/* ---------------------------------------------------------------- 画布与弹窗/Toast 专用弹簧动效 */
-
-export function animateCanvasCamera(worldEl, svgGroups, fromView, toView) {
-  if (!worldEl || !fromView || !toView || reduceMotion()) return;
-  const dx = Math.abs((fromView.x || 0) - (toView.x || 0));
-  const dy = Math.abs((fromView.y || 0) - (toView.y || 0));
-  const dz = Math.abs((fromView.z || 1) - (toView.z || 1));
-  if (dx < 1 && dy < 1 && dz < 0.005) return;
-  animate(
-    worldEl,
-    [
-      { transform: `translate(${fromView.x}px, ${fromView.y}px) scale(${fromView.z})` },
-      { transform: `translate(${toView.x}px, ${toView.y}px) scale(${toView.z})` },
-    ],
-    { duration: 480, easing: SPRING.gentle },
-  );
-  for (const g of svgGroups || []) {
-    if (!g) continue;
-    animate(
-      g,
-      [
-        { transform: `translate(${fromView.x}px, ${fromView.y}px) scale(${fromView.z})` },
-        { transform: `translate(${toView.x}px, ${toView.y}px) scale(${toView.z})` },
-      ],
-      { duration: 480, easing: SPRING.gentle },
-    );
-  }
-}
-
-export function animateBubbleSelect(newBub, oldBub) {
-  if (reduceMotion()) return;
-  if (newBub) {
-    const core = newBub.querySelector?.('.cv-core');
-    const dial = newBub.querySelector?.('.cv-dial');
-    const ports = newBub.querySelectorAll?.('.cv-port');
-    if (core) {
-      animate(
-        core,
-        [
-          { transform: 'translate(-50%, -50%) scale(0.92)' },
-          { transform: 'translate(-50%, -50%) scale(1.08)', offset: 0.55 },
-          { transform: 'translate(-50%, -50%) scale(1.05)' },
-        ],
-        { duration: 420, easing: SPRING.bouncy },
-      );
-    }
-    if (dial && !newBub.classList.contains('is-fwd')) {
-      animate(
-        dial,
-        [
-          { opacity: 0, transform: 'translate(-50%, -50%) scale(0.55)' },
-          { opacity: 1, transform: 'translate(-50%, -50%) scale(1)' },
-        ],
-        { duration: 440, easing: SPRING.bouncy },
-      );
-    }
-    if (ports?.length && !newBub.classList.contains('is-fwd')) {
-      [...ports].forEach((port, i) => {
-        animate(
-          port,
-          [
-            { opacity: 0, transform: 'scale(0.35)' },
-            { opacity: 1, transform: 'scale(1)' },
-          ],
-          { duration: 380, delay: i * 26, easing: SPRING.bouncy, fill: 'backwards' },
-        );
-      });
-    }
-  }
-  if (oldBub && oldBub !== newBub) {
-    const core = oldBub.querySelector?.('.cv-core');
-    if (core) {
-      animate(
-        core,
-        [
-          { transform: 'translate(-50%, -50%) scale(1.05)' },
-          { transform: 'translate(-50%, -50%) scale(1)' },
-        ],
-        { duration: 280, easing: SPRING.smooth },
-      );
-    }
-  }
 }
 
 export function animateMenuOpen(menuEl) {

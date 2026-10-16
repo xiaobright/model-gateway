@@ -8,8 +8,7 @@
    风格「轻盈玻璃」。新增风格只加一段 :root[data-style="id"]，重新声明这批
    token —— 两套明暗值各自用 light-dark() 给（color-scheme 由 data-theme
    决定，与风格无关）；没声明的 token 自动继承这里的默认值。登记表在
-   web/theme.js 的 STYLES，控件在设置页「外观」卡片。canvas.css 用的是同一
-   批 token，画布视图跟着风格走，不用另做。 */
+   web/theme.js 的 STYLES，控件在设置页「外观」卡片。 */
 :root {
   color-scheme: light dark;
   --page-1: light-dark(#e9edfc, #0d1327);
@@ -147,7 +146,7 @@ h3 { font-size: 14px; }
    就是"跟着页面往上飘"）。锁到 100vh-72 后行底再也顶不动；窗口矮到内容更高时在
    栏内滚动，不截断也不位移。 */
 .sidebar { position: sticky; top: 24px; align-self: start; min-height: calc(100vh - 72px); max-height: calc(100vh - 72px); overflow-x: clip; overflow-y: auto; overscroll-behavior: contain; padding: 20px 12px 14px; border: 1px solid var(--edge); border-radius: 26px; background: linear-gradient(145deg, var(--sheen), transparent 65%), var(--glass); box-shadow: var(--edge-highlight), var(--shadow-1); display: flex; flex-direction: column; gap: 10px; }
-.sidebar, .route-table, .route-detail, .card, .kpi, .cv-host, dialog { backdrop-filter: blur(18px) saturate(135%); }
+.sidebar, .route-table, .route-detail, .card, .kpi, dialog { backdrop-filter: blur(18px) saturate(135%); }
 .route-table, .route-detail, .card, .kpi { isolation: isolate; overflow: clip; background-image: linear-gradient(135deg, var(--sheen), transparent 50%); box-shadow: var(--edge-highlight), var(--shadow-1); }
 .card, .kpi { position: relative; }
 .route-table { position: relative; }
@@ -284,7 +283,6 @@ h3 { font-size: 14px; }
 .text-button { color: var(--accent); border: 0; background: transparent; padding: 2px 6px; border-radius: 6px; transition: background .2s, transform .26s var(--spring-bouncy); }
 .text-button:hover { background: var(--accent-wash); transform: translateY(-1px); }
 .text-button:active { transform: scale(.96); }
-.workspace-toolbar { display: flex; align-items: center; gap: 12px; margin: 14px 0; }
 .route-filters { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin: 0 0 18px; }
 .route-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 350px; gap: 18px; align-items: start; }
 .route-table { background-color: var(--glass); border: 1px solid var(--edge); border-radius: var(--r-lg); overflow: hidden; }
@@ -721,5 +719,5 @@ tbody tr:hover td { background: var(--hover); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
 @media (max-width: 760px) { .side-foot { flex-wrap: wrap; }.motion-toggle { margin-left: auto; }.ambient i { width: 125vw; height: 90vh; }.ambient-blue { left: -50%; }.ambient-violet { right: -50%; } }
 @media (hover: none) { .btn:hover, .kpi:hover, .side-live:hover, .candidate:hover { transform: none; } }
-@supports not (backdrop-filter: blur(1px)) { .sidebar, .route-table, .route-detail, .card, .kpi, .cv-host { background-color: var(--solid); } }
-@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) { .sidebar, .route-table, .route-detail, .card, .kpi, .cv-host, dialog { backdrop-filter: none; background: var(--solid); } }
+@supports not (backdrop-filter: blur(1px)) { .sidebar, .route-table, .route-detail, .card, .kpi { background-color: var(--solid); } }
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) { .sidebar, .route-table, .route-detail, .card, .kpi, dialog { backdrop-filter: none; background: var(--solid); } }
