@@ -20,12 +20,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import threading
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+import anyio
 
 from .reqlog import log
 
@@ -113,29 +116,30 @@ class UpstreamStall(Exception):
 
 
 async def wait_for_upstream(
-    call: Call, operation: Awaitable[Any], timeout: float | None = None
+    call: Call, operation: Awaitable[Any], timeout: float | None = None,
+    *, on_cancel: Callable[[Any], Awaitable[None]] | None = None,
 ) -> Any:
     """登记当前等待，让管理接口能立即取消 send/read 或同站重试间隔。
 
     timeout 给了就是发呆超时：这段时间内没等到结果就取消等待并抛 UpstreamStall，
     由调用方决定是换候选还是切断这条流；None = 不限时（等响应头、等首字都用它）。
 
-    等待必须包在 asyncio.shield 里：直接 await 这个任务时，外层（relay）被取消会
-    顺着 _fut_waiter 把读取任务一起取消，httpx 的流迭代就在取消中收尾 —— httpcore
-    关流的 shield 挡不住 anyio 对同一任务的取消重投，连接既没归还也没关，还留下
-    「已关闭」的假标记让后面真正的 aclose 变成空操作。客户端每中途离开一次就泄漏
-    一条 ACTIVE 连接，占满 max_connections(64) 之后新请求全部 PoolTimeout 挂 600s。
-    shield 之后读取任务只被显式取消（手动中断/超时）或等 relay 收尾关流时自然结束，
-    两种情况下的收尾都不在取消Scope里，连接能正常归还。
+    shield 阻止外层取消反复打断 httpx 的关流；退出时只取消操作一次，并屏蔽外层
+    取消等它收尾。不能只 shield 后清空 pending，否则超时/断开会遗留后台发送或读取。
+    on_cancel 释放「操作已返回、调用方却恰好被取消」时无人接管的结果。
     """
     pending = asyncio.ensure_future(operation)
     call.pending = pending
     if call.cancel_requested:
         pending.cancel()
+    delivered = False
     try:
         if timeout is not None:
-            return await asyncio.wait_for(asyncio.shield(pending), timeout)
-        return await asyncio.shield(pending)
+            result = await asyncio.wait_for(asyncio.shield(pending), timeout)
+        else:
+            result = await asyncio.shield(pending)
+        delivered = True
+        return result
     except asyncio.CancelledError:
         if call.cancel_requested:
             raise ManualAbort from None
@@ -143,7 +147,19 @@ async def wait_for_upstream(
     except (asyncio.TimeoutError, TimeoutError):
         raise UpstreamStall from None
     finally:
-        call.pending = None
+        try:
+            if not delivered:
+                # 手动中断已经 cancel 过；不要在它关流时再投一次取消。
+                if not pending.done() and not getattr(pending, "cancelling", lambda: 0)():
+                    pending.cancel()
+                with anyio.CancelScope(shield=True):
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await asyncio.shield(pending)
+                    if (on_cancel is not None and not pending.cancelled()
+                            and pending.exception() is None):
+                        await on_cancel(pending.result())
+        finally:
+            call.pending = None
 
 
 def cancel(call_id: int) -> bool:
@@ -154,7 +170,8 @@ def cancel(call_id: int) -> bool:
             return False
         if not call.cancel_requested:
             call.cancel_requested = True
-            if call.pending is not None:
+            if (call.pending is not None
+                    and not getattr(call.pending, "cancelling", lambda: 0)()):
                 call.pending.cancel()
         return True
 

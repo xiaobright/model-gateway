@@ -599,32 +599,51 @@ def _pooled_connection_states() -> list[str]:
 
     states = []
     for client in upstream_mod._clients.values():
-        pool = getattr(client._transport, "_pool", None)
-        if pool is None:
-            continue
-        for conn in pool._connections:
-            inner = getattr(conn, "_connection", conn)
-            states.append(inner._state.name)
+        transports = {client._transport, *client._mounts.values()} - {None}
+        for transport in transports:
+            pool = getattr(transport, "_pool", None)
+            if pool is None:
+                continue
+            for conn in pool._connections:
+                inner = getattr(conn, "_connection", conn)
+                states.append(inner._state.name)
     return states
 
 
 @pytest.mark.network
-def test_client_leaving_midstream_does_not_leak_pool_connections(gateway):
+@pytest.mark.parametrize("egress", ["direct", "system", "proxy"])
+def test_client_leaving_midstream_does_not_leak_pool_connections(gateway, monkeypatch, egress):
     """客户端拿到完成事件就走、上游却挂着流不收：连接必须被收尾关掉，不能留在池里。
 
     codex 的真实形态：响应发完 [DONE] 后上游并不收连接，客户端读完完成事件就离开。
     这时 relay 的读取被取消——若取消顺着 await 把读取任务一起干掉，httpx 的流迭代会在
     取消中收尾失败：连接既不归还也不关闭，还留下「已关闭」的假标记。客户端每离开一次
-    泄漏一条 ACTIVE 连接，占满 max_connections(64) 之后新请求全部 PoolTimeout 挂 600s。
+    泄漏一条 ACTIVE 连接，占满 max_connections(64) 之后新请求全部 PoolTimeout。
     """
     from gateway import db
 
     db.set_setting("stall_timeout_s", "0")
-    with MockUpstream("siteA") as a:
+    import socket
+    from gateway import upstream as upstream_mod
+    from helpers import MockProxy
+
+    resolve = socket.getaddrinfo
+
+    def local_host(host, *args, **kwargs):
+        if host in ("pool.test", b"pool.test"):
+            host = "127.0.0.1"
+        return resolve(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", local_host)
+    with MockUpstream("siteA") as a, MockProxy() as px:
+        if egress == "system":
+            a.base_url = f"http://pool.test:{a.port}"
+            monkeypatch.setattr(upstream_mod, "_system_proxy_signature", lambda: (("http", px.url),))
+        mode = "" if egress == "system" else px.url if egress == "proxy" else "direct"
         g = add_upstream(gateway, a, "siteA")
         resp = gateway.put(
             f"/admin/api/upstreams/{provider_id(gateway, 'siteA')}",
-            json={"name": "siteA", "base_url": a.base_url, "egress": "direct"},
+            json={"name": "siteA", "base_url": a.base_url, "egress": mode},
         )
         assert resp.status_code == 200, resp.text
         add_route(gateway, "gpt-test", g, "gpt-test")
@@ -641,5 +660,8 @@ def test_client_leaving_midstream_does_not_leak_pool_connections(gateway):
 
         states = _pooled_connection_states()
         assert "ACTIVE" not in states, f"连接池泄漏了 ACTIVE 连接：{states}"
+        assert sum(client.active for client in upstream_mod._clients.values()) == 0
+        assert (len(px.seen) == 12) if egress != "direct" else (not px.seen)
+        assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200
         row = wait_for_row(gateway)
         assert row["note"] in ("ok", "client_abort"), row["note"]

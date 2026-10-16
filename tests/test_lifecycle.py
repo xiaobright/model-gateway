@@ -52,6 +52,316 @@ def use_upstream(monkeypatch, client):
     monkeypatch.setattr(upstream_mod, "get_client", get_client)
 
 
+@pytest.mark.parametrize("kind", ["timeout", "task", "manual", "scope"])
+def test_upstream_wait_cancels_once_and_joins_cleanup(app, kind):
+    import anyio
+
+    async def run():
+        call = inflight.begin(client="test", protocol="openai", model="m", stream=True, req_bytes=0)
+        entered, cleaned = asyncio.Event(), asyncio.Event()
+        operations = []
+
+        async def operation():
+            operations.append(asyncio.current_task())
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                assert call.pending is asyncio.current_task(), "收尾前不能遗失 pending"
+                await asyncio.sleep(0.01)
+                cleaned.set()
+
+        async def wait():
+            return await inflight.wait_for_upstream(call, operation(), timeout=0.03 if kind == "timeout" else None)
+
+        try:
+            if kind == "scope":
+                async with anyio.create_task_group() as group:
+                    group.start_soon(wait)
+                    await entered.wait()
+                    group.cancel_scope.cancel()
+            else:
+                task = asyncio.create_task(wait())
+                await entered.wait()
+                expected = inflight.UpstreamStall
+                if kind == "manual":
+                    inflight.cancel(call.id)
+                    inflight.cancel(call.id)
+                    expected = inflight.ManualAbort
+                elif kind == "task":
+                    task.cancel()
+                    expected = asyncio.CancelledError
+                with pytest.raises(expected):
+                    await asyncio.wait_for(task, 2)
+            assert cleaned.is_set(), "不能把仍在运行的操作留给事件循环退出时清理"
+            assert operations[0].done() and operations[0].cancelling() == 1
+            assert call.pending is None
+        finally:
+            inflight.finish(call, status=499, note="test")
+
+    asyncio.run(run())
+
+
+def test_completed_response_is_closed_when_waiter_loses_cancellation_race(app):
+    async def run():
+        call = inflight.begin(client="test", protocol="openai", model="m", stream=True, req_bytes=0)
+        response = httpx.Response(200, stream=httpx.ByteStream(b"test"))
+        parent = None
+
+        async def operation():
+            # 结果已生成，shield 唤醒等待者之前取消它。
+            asyncio.get_running_loop().call_soon(parent.cancel)
+            return response
+
+        try:
+            parent = asyncio.create_task(inflight.wait_for_upstream(call, operation(), on_cancel=proxy._close_response))
+            with pytest.raises(asyncio.CancelledError):
+                await parent
+            assert response.is_closed
+            assert call.pending is None
+        finally:
+            inflight.finish(call, status=499, note="test")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("spec", ["2.0", "2.4"])
+@pytest.mark.parametrize("stage", ["start", "body"])
+@pytest.mark.parametrize("failure", ["broken_pipe", "cancel"])
+def test_response_send_failure_closes_even_an_unstarted_relay(app, monkeypatch, spec, stage, failure):
+    from starlette.requests import Request, ClientDisconnect
+    from gateway import protocols
+
+    configure_routes("openai")
+
+    async def run():
+        entered = asyncio.Event()
+
+        async def chunks():
+            yield b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+            await asyncio.Event().wait()
+
+        body = Body(chunks())
+        response = httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+        scope = {"type": "http", "app": app, "asgi": {"version": "3.0", "spec_version": spec},
+                 "method": "POST", "path": "/v1/responses", "headers": [], "query_string": b""}
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if message["type"] == f"http.response.{stage}":
+                entered.set()
+                if failure == "broken_pipe":
+                    raise BrokenPipeError("test downstream gone")
+                await asyncio.Event().wait()
+
+        request = Request(scope, receive)
+        request._body = b'{"model":"m","stream":true}'
+        async with upstream_mod._SystemClient(transport=httpx.MockTransport(lambda r: response), trust_env=False) as upstream:
+            use_upstream(monkeypatch, upstream)
+            streaming = await proxy.forward(request, protocols.OPENAI, "/responses")
+            task = asyncio.create_task(streaming(scope, receive, send))
+            await asyncio.wait_for(entered.wait(), 2)
+            if failure == "cancel":
+                task.cancel()
+            with pytest.raises((asyncio.CancelledError, BrokenPipeError, ClientDisconnect)):
+                await asyncio.wait_for(task, 2)
+            assert response.is_closed and body.closed and upstream.active == 0
+            assert inflight.counts()["requests"] == 0
+            assert len(db.recent_requests()) == 1
+            assert db.recent_requests(1)[0]["note"] == "client_abort"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("old_mode", ["", "direct", "http://127.0.0.1:7890"])
+def test_supplier_egress_update_retires_pool_without_cutting_active_stream(app, monkeypatch, old_mode):
+    provider = db.create_upstream("primary", "https://primary.example", egress=old_mode)
+
+    async def run():
+        async def chunks():
+            yield b"first"
+            yield b"last"
+
+        bodies = []
+
+        def handle(request):
+            body = Body(chunks())
+            bodies.append(body)
+            return httpx.Response(200, stream=body)
+
+        monkeypatch.setattr(upstream_mod, "_system_proxy_signature", lambda: ())
+        monkeypatch.setattr(upstream_mod, "client_args", lambda *args, **kwargs: {
+            "transport": httpx.MockTransport(handle), "trust_env": False,
+        })
+        try:
+            old = await upstream_mod.get_client(old_mode)
+            response = await old.send(old.build_request("GET", "https://primary.example"), stream=True)
+            chunks_iter = response.aiter_bytes()
+            assert await anext(chunks_iter) == b"first"
+            other_mode = "direct" if old_mode != "direct" else ""
+            other = await upstream_mod.get_client(other_mode)
+            assert not old.retired, "同时使用另一个出口不能淘汰此池"
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1") as admin:
+                for mode in (old_mode, other_mode):
+                    result = await admin.put(f"/admin/api/upstreams/{provider.id}", json={
+                        "name": provider.name, "base_url": provider.base_url, "egress": mode,
+                    })
+                    assert result.status_code == 200
+                    assert old.retired is (mode != old_mode), "未改出口的保存不能退役池"
+            assert old.active == 1 and not old.is_closed
+            replacement = await upstream_mod.get_client(old_mode)
+            assert replacement is not old
+            assert await upstream_mod.get_client(other_mode) is other
+            # get_client 先取到旧对象、配置随后变化的竞态，也必须发到该出口的新池。
+            again = await old.send(old.build_request("GET", "https://primary.example"), stream=True)
+            await again.aclose()
+            assert replacement.active == 0 and old.active == 1
+            assert [chunk async for chunk in chunks_iter] == [b"last"]
+            await response.aclose()
+            assert bodies[0].closed and old.active == 0 and old.is_closed
+            assert old not in upstream_mod._retired_clients and not other.is_closed
+        finally:
+            await upstream_mod.aclose_client()
+
+    asyncio.run(run())
+
+
+def test_local_pool_timeout_stops_without_retry_or_breaker_failure(app, monkeypatch):
+    configure_routes("anthropic")
+    primary = db.list_upstreams()[0]
+    db.update_upstream(primary.id, primary.name, primary.base_url, True, egress="direct",
+                       retry_rules='[{"status":502,"times":3,"delay_ms":0}]')
+
+    async def run():
+        seen = []
+
+        async def handle(request):
+            seen.append(request.url.host)
+            raise httpx.PoolTimeout("test saturated pool", request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle), trust_env=False) as upstream:
+            use_upstream(monkeypatch, upstream)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1") as client:
+                response = await client.post("/v1/messages", json={"model": "m"})
+                assert response.status_code == 502 and "连接池" in response.text
+                assert seen == ["primary.example"]
+        assert failover.snapshot() == []
+        assert inflight.counts()["requests"] == 0
+        assert [(r["status"], r["note"]) for r in db.recent_requests()] == [(502, "pool_timeout")]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_cancel_during_retry_response_close_finishes_releasing_connection(app, monkeypatch, retry):
+    from starlette.requests import Request
+    from gateway import protocols
+
+    configure_routes("anthropic")
+    if retry:
+        primary = db.list_upstreams()[0]
+        db.update_upstream(primary.id, primary.name, primary.base_url, True, egress="direct",
+                           retry_rules='[{"status":400,"times":1,"delay_ms":0}]')
+
+    async def run():
+        entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class ClosingBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"error"
+
+            async def aclose(self):
+                entered.set()
+                await release.wait()
+                closed.set()
+
+        response = httpx.Response(400, stream=ClosingBody())
+        scope = {"type": "http", "app": app, "method": "POST", "path": "/v1/messages",
+                 "headers": [], "query_string": b""}
+        request = Request(scope)
+        request._body = b'{"model":"m"}'
+        async with upstream_mod._SystemClient(transport=httpx.MockTransport(lambda r: response), trust_env=False) as upstream:
+            use_upstream(monkeypatch, upstream)
+            task = asyncio.create_task(proxy.forward(request, protocols.ANTHROPIC, "/messages"))
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "关流尚未完成，取消不能直接离开"
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            assert closed.is_set() and upstream.active == 0
+            assert inflight.counts()["requests"] == 0
+            assert db.recent_requests(1)[0]["note"] == "client_abort"
+
+    asyncio.run(run())
+
+
+@pytest.mark.network
+def test_cancel_before_real_headers_clears_operation_and_pool(app, monkeypatch):
+    import contextlib
+    from starlette.requests import Request
+    from gateway import protocols
+
+    async def run():
+        arrived = asyncio.Event()
+        handlers = set()
+
+        async def handle(reader, writer):
+            handlers.add(asyncio.current_task())
+            try:
+                head = await reader.readuntil(b"\r\n\r\n")
+                length = next(int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")
+                              if line.lower().startswith(b"content-length:"))
+                await reader.readexactly(length)
+                arrived.set()
+                await reader.read()  # 不发响应头；等网关取消并真正断开 socket。
+            finally:
+                writer.close()
+                with contextlib.suppress(ConnectionError):
+                    await writer.wait_closed()
+                handlers.discard(asyncio.current_task())
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        provider = db.create_upstream("headers", f"http://127.0.0.1:{port}", egress="direct")
+        group = db.create_group(provider.id, "g", "openai")
+        db.add_model_route("m", group.id, "m")
+        scope = {"type": "http", "app": app, "method": "POST", "path": "/v1/responses",
+                 "headers": [], "query_string": b""}
+        request = Request(scope)
+        request._body = b'{"model":"m","stream":true}'
+
+        async def connected():
+            return False
+
+        monkeypatch.setattr(request, "is_disconnected", connected)
+        try:
+            async with upstream_mod._SystemClient(trust_env=False) as upstream:
+                use_upstream(monkeypatch, upstream)
+                task = asyncio.create_task(proxy.forward(request, protocols.OPENAI, "/responses"))
+                await asyncio.wait_for(arrived.wait(), 2)
+                pending = inflight._calls[inflight.snapshot()["calls"][0]["id"]].pending
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 2)
+                assert pending.done() and pending.cancelled()
+                assert not upstream._transport._pool._requests
+                assert not upstream._transport._pool.connections
+                assert upstream.active == 0 and inflight.counts()["requests"] == 0
+                assert db.recent_requests(1)[0]["note"] == "client_abort"
+        finally:
+            server.close()
+            await server.wait_closed()
+            for handler in list(handlers):
+                handler.cancel()
+            await asyncio.gather(*handlers, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("cancel_kind", ["disconnect", "task", "manual"])
 def test_hold_wait_before_first_chunk_releases_request_and_system_pool(app, monkeypatch, cancel_kind):
     from starlette.requests import Request
@@ -394,10 +704,10 @@ def test_retry_delay_is_cancellable_without_another_attempt(app, monkeypatch, fa
         calls = []
         original_wait = inflight.wait_for_upstream
 
-        async def wait(call, operation, timeout=None):
+        async def wait(call, operation, timeout=None, **kwargs):
             if call.trail and call.trail[-1]["note"] == "same_retry":
                 paused.set()
-            return await original_wait(call, operation, timeout)
+            return await original_wait(call, operation, timeout, **kwargs)
 
         monkeypatch.setattr(inflight, "wait_for_upstream", wait)
 

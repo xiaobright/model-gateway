@@ -55,6 +55,9 @@ test('请求结果优先于 HTTP 200，主动中断与未知结果不画成成�
   assert.equal(requestResult({ status: 0 }).label, '未收到响应');
   assert.equal(requestResult({ status: 200, note: 'ok' }).issue, false);
   assert.equal(requestResult({ status: 200, note: 'protocol_error' }).label, '上游协议错误');
+  assert.deepEqual(requestResult({ status: 502, note: 'pool_timeout' }), {
+    label: '网关连接池拥堵', tone: 'crit', issue: true,
+  });
 });
 
 test('隐藏画布不取布局、不生成节点或安排动画帧；打开时只发一个布局请求', async () => {

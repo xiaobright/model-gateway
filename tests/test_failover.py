@@ -181,7 +181,11 @@ def test_route_order_decides_who_is_tried_next(gateway):
         assert [r["upstream"] for r in rows] == ["siteA", "siteC"], "第二个该按顺序轮到 C 而不是 B"
 
 
-def test_stateful_openai_request_is_not_failed_over(gateway):
+@pytest.mark.parametrize("state", [
+    {"store": True}, {"previous_response_id": "resp_previous"},
+    {"store": False, "previous_response_id": "resp_previous"},
+])
+def test_stateful_openai_request_is_not_failed_over(gateway, state):
     """带 store / previous_response_id 的请求，上游可能已经存下来了才失败，重试会留下两条。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA")
@@ -191,10 +195,24 @@ def test_stateful_openai_request_is_not_failed_over(gateway):
         gateway.post("/admin/api/failover", json={"protocol": "openai", "enabled": True})
         a.fail_with(503)
 
-        resp = gateway.post("/v1/responses", json={"model": "gpt-test", "store": True})
+        resp = gateway.post("/v1/responses", json={"model": "gpt-test", **state})
         assert resp.status_code == 503
         rows = wait_rows(gateway, 1)
         assert len(rows) == 1 and rows[0]["upstream"] == "siteA"
+
+
+def test_store_false_allows_configured_openai_failover(gateway):
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        for site in (a, b):
+            group = add_upstream(gateway, site, site.name)
+            add_route(gateway, "gpt-test", group)
+        gateway.post("/admin/api/failover", json={"protocol": "openai", "enabled": True})
+        a.fail_with(503)
+        response = gateway.post("/v1/responses", json={"model": "gpt-test", "store": False})
+        assert response.status_code == 200 and response.json()["upstream"] == "siteB"
+        assert [(r["upstream"], r["note"]) for r in wait_rows(gateway, 2)] == [
+            ("siteA", "failed_over"), ("siteB", "ok"),
+        ]
 
 
 def test_model_level_404_tries_the_sibling_in_the_same_group(gateway):

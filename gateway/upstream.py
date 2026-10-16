@@ -11,13 +11,15 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import anyio
 import httpx
 
 from . import config, protocols
 
 # connect 只给 8 秒：真库里 104 个 502 全是连不上，平均白等 16.6 秒（旧值是 15 秒的
 # connect 超时在磨）。握手 8 秒都完不成的站，也扛不住几十万 token 的请求体。
-PROXY_TIMEOUT = httpx.Timeout(connect=8.0, read=600.0, write=60.0, pool=600.0)
+# 池内排队还没发到上游，不应该跟模型首字一样等 600 秒。
+PROXY_TIMEOUT = httpx.Timeout(connect=8.0, read=600.0, write=60.0, pool=10.0)
 PROXY_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 
 # 系统出口中的本机地址一律直连；显式指定代理不受此规则影响。
@@ -262,10 +264,11 @@ class _SystemStream(httpx.AsyncByteStream):
         if self.closed:
             return
         self.closed = True
-        try:
-            await self.stream.aclose()
-        finally:
-            await self.client.release()
+        with anyio.CancelScope(shield=True):
+            try:
+                await self.stream.aclose()
+            finally:
+                await self.client.release()
 
 
 class _SystemClient(httpx.AsyncClient):
@@ -274,16 +277,21 @@ class _SystemClient(httpx.AsyncClient):
     retired = False
     active = 0
 
+    def __init__(self, *, egress: str = EGRESS_SYSTEM, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.egress = egress
+
     async def send(self, request: httpx.Request, **kwargs) -> httpx.Response:
         if self.retired:
             # get_client 返回后、send 真正执行前，另一个请求可能已切换出口。
-            current = await get_client()
+            current = await get_client(self.egress)
             return await current.send(request, **kwargs)
         self.active += 1
         try:
             response = await super().send(request, **kwargs)
         except BaseException:
-            await self.release()
+            with anyio.CancelScope(shield=True):
+                await self.release()
             raise
         if response.is_closed:
             await self.release()
@@ -323,8 +331,8 @@ async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
     cache_key: object = (EGRESS_SYSTEM, snapshot) if snapshot is not None else egress
     client = _clients.get(cache_key)
     if client is None or client.is_closed:
-        client_type = _SystemClient if snapshot is not None else httpx.AsyncClient
-        client = client_type(
+        client = _SystemClient(
+            egress=egress,
             timeout=PROXY_TIMEOUT, limits=PROXY_LIMITS,
             **client_args(egress, system_proxy=snapshot)
         )
@@ -332,7 +340,8 @@ async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
     if snapshot is not None:
         retired = []
         for key, old in list(_clients.items()):
-            if key != cache_key and isinstance(old, _SystemClient):
+            if (key != cache_key and isinstance(old, _SystemClient)
+                    and old.egress == EGRESS_SYSTEM):
                 del _clients[key]
                 old.retired = True
                 _retired_clients.add(old)
@@ -341,6 +350,27 @@ async def get_client(egress: str = EGRESS_SYSTEM) -> httpx.AsyncClient:
             with contextlib.suppress(Exception):
                 await old.close_if_idle()
     return client
+
+
+async def retire_client(egress: str) -> None:
+    """供应商更换出口后丢弃旧缓存；在途流继续，新请求使用新池。"""
+    egress = (egress or "").strip()
+    retired = []
+    for key, client in list(_clients.items()):
+        mode = key[0] if isinstance(key, tuple) else key
+        if mode != egress:
+            continue
+        del _clients[key]
+        if isinstance(client, _SystemClient):
+            client.retired = True
+            _retired_clients.add(client)
+        retired.append(client)
+    with anyio.CancelScope(shield=True):
+        for client in retired:
+            if isinstance(client, _SystemClient):
+                await client.close_if_idle()
+            else:
+                await client.aclose()
 
 
 async def aclose_client() -> None:

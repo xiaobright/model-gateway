@@ -289,10 +289,10 @@ def test_cancellation_records_partial_observation_without_phantom_attempt(app, m
         ready = asyncio.Event()
         seen = []
         original = inflight.wait_for_upstream
-        async def waiting(call, operation, timeout=None):
+        async def waiting(call, operation, timeout=None, **kwargs):
             if phase == "retry" and call.trail:
                 ready.set()
-            return await original(call, operation, timeout)
+            return await original(call, operation, timeout, **kwargs)
         monkeypatch.setattr(inflight, "wait_for_upstream", waiting)
 
         async def chunks():

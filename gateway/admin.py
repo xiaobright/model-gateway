@@ -514,7 +514,7 @@ def post_upstream(payload: UpstreamIn) -> dict[str, Any]:
 
 
 @router.put("/upstreams/{upstream_id}")
-def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
+async def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
     name = payload.name.strip()
     current = _require_upstream(upstream_id)
     egress = current.egress if payload.egress is None else _validate_egress(payload.egress)
@@ -535,6 +535,8 @@ def put_upstream(upstream_id: int, payload: UpstreamIn) -> dict[str, Any]:
         raise HTTPException(409, _DUP_BASE.format(exc.args[0])) from exc
     if not ok:
         raise HTTPException(404, f"供应商 {upstream_id} 不存在")
+    if egress != current.egress:
+        await upstream_mod.retire_client(current.egress)
     return _one_upstream(upstream_id)
 
 

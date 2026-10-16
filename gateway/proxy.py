@@ -140,9 +140,30 @@ RESPONSE_POLL = 0.05
 
 
 async def _close_response(response: httpx.Response) -> None:
-    # Starlette 的取消作用域中也要让连接归还完成。
-    with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
-        await response.aclose()
+    # 作用域取消和直接 task.cancel 都不能中途打断关流。
+    with anyio.CancelScope(shield=True):
+        task = asyncio.create_task(response.aclose())
+        try:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+
+
+class _UpstreamResponse(StreamingResponse):
+    """ASGI 响应拥有上游资源；即使响应头发送失败、relay 从未启动也要收尾。"""
+
+    def __init__(self, content, *, cleanup, **kwargs):
+        super().__init__(content, **kwargs)
+        self.cleanup = cleanup
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.cleanup()
 
 
 async def _next_while_connected(request: Request, iterator: AsyncIterator[bytes]) -> bytes:
@@ -156,7 +177,7 @@ async def _next_while_connected(request: Request, iterator: AsyncIterator[bytes]
             if await request.is_disconnected():
                 raise ClientDisconnected
     finally:
-        if not task.done():
+        if not task.done() and not task.cancelling():
             task.cancel()
         with anyio.CancelScope(shield=True), contextlib.suppress(asyncio.CancelledError, Exception):
             await task
@@ -191,34 +212,31 @@ async def _send_until_headers(
     task = asyncio.create_task(client.send(prepared, stream=True))
     began = time.monotonic()
     next_warn = HEADER_WAIT_WARN_S
+    delivered = False
     try:
         while True:
             # 可被完成唤醒的等待：响应头一到就返回，不能让 50ms 的轮询节拍变成
             # 每个请求的关键路径延迟（断开检测仍是每 RESPONSE_POLL 一次）
             done, _ = await asyncio.wait({task}, timeout=RESPONSE_POLL)
             if task in done:
-                return await task
+                response = task.result()
+                delivered = True
+                return response
             if await request.is_disconnected():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
                 raise ClientDisconnected
             waited = time.monotonic() - began
             if waited >= next_warn:
                 log(f"  WARN {label}等响应头已 {waited:.0f}s，仍未取消（客户端在等）")
                 next_warn += HEADER_WAIT_WARN_S
-        return await task
-    except BaseException:
-        # 取消恰好撞上响应头到达时，send 的任务可能已经完成，也要归还那条连接。
-        if task.done() and not task.cancelled() and task.exception() is None:
-            with contextlib.suppress(Exception):
-                await task.result().aclose()
-        raise
     finally:
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        if not delivered:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            with anyio.CancelScope(shield=True):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(task)
+                if not task.cancelled() and task.exception() is None:
+                    await _close_response(task.result())
 
 
 def _error(proto: protocols.Protocol, status: int, message: str) -> JSONResponse:
@@ -480,7 +498,7 @@ async def forward(
 
     stream_flag = bool(payload.get("stream"))
     # 有副作用的 OpenAI 请求不降级：上游可能已经把它存下来了才失败，重试会留下两条
-    stateful = payload.get("store") is not None or payload.get("previous_response_id") is not None
+    stateful = bool(payload.get("store")) or payload.get("previous_response_id") is not None
     # Standalone Codex search is side-effect free. It may be unavailable on an
     # otherwise healthy OpenAI-compatible upstream (404/405/501), so probe the
     # next configured candidate for this endpoint even when normal OpenAI
@@ -553,6 +571,14 @@ async def forward(
                 usage=NO_USAGE, note=note, attempt=attempt,
             )
         return _error(proto, 499, "请求已手动中断" if note == "manual_abort" else "客户端已断开")
+
+    async def close_upstream(response: httpx.Response) -> None:
+        try:
+            await _close_response(response)
+        except asyncio.CancelledError:
+            if not call.done_at:
+                abort_request("client_abort")
+            raise
 
     async def same_retry_pause(delay_s: float) -> bool:
         """重试间隔也登记为可取消的等待；False 表示手动中断或客户端已离开。"""
@@ -653,6 +679,7 @@ async def forward(
                     client.build_request("POST", url, content=sent_body, headers=headers),
                     label=f"{label} 出口={_egress_label(route.upstream.egress)} ",
                 ),
+                on_cancel=_close_response,
             )
         except inflight.ManualAbort:
             elapsed = time.monotonic() - began
@@ -669,6 +696,25 @@ async def forward(
         except asyncio.CancelledError:
             abort_request("client_abort")
             raise
+        except httpx.PoolTimeout:
+            # 本地共享池拥堵，不是供应商故障；同站重试只会让排队更长。
+            elapsed = time.monotonic() - began
+            log(
+                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} "
+                f"出口={_egress_label(route.upstream.egress)} -> 502 "
+                f"(PoolTimeout: 本地连接池等待超时) after {elapsed:.1f}s"
+            )
+            trace.end_attempt(status=502, note="pool_timeout", action="stop")
+            trace.result(502, "pool_timeout")
+            inflight.finish(call, status=502, note="pool_timeout")
+            if record:
+                _record(
+                    request=request, route=route, proto=proto, model=asked,
+                    remote_model=remote, status=502, stream_flag=stream_flag,
+                    req_bytes=len(sent_body), req_blob_bytes=req_blob, resp_bytes=0,
+                    elapsed=elapsed, usage=NO_USAGE, note="pool_timeout", attempt=attempt,
+                )
+            return _error(proto, 502, "网关本地连接池等待超时，请稍后重试")
         except (httpx.HTTPError, httpx.InvalidURL, ImportError, ValueError) as exc:
             fail, resp = exc, None
             elapsed = time.monotonic() - began
@@ -757,8 +803,7 @@ async def forward(
                 f"{delay:.2f}s 后再发（第 {same_counts[route.upstream.id]} 次）"
             )
             status_for_retry = resp.status_code
-            with contextlib.suppress(Exception):
-                await resp.aclose()
+            await close_upstream(resp)
             elapsed = time.monotonic() - began
             inflight.failed(call, status=status_for_retry, note="same_retry", ms=int(elapsed * 1000))
             if record:
@@ -787,8 +832,7 @@ async def forward(
                     f"  alpha/search unsupported ({resp.status_code}) at {label}，"
                     "关闭响应后尝试下一个候选"
                 )
-                with contextlib.suppress(Exception):
-                    await resp.aclose()
+                await close_upstream(resp)
                 elapsed = time.monotonic() - began
                 inflight.failed(call, status=resp.status_code, note="search_failed_over", ms=int(elapsed * 1000))
                 if record:
@@ -816,16 +860,16 @@ async def forward(
                 try:
                     probe = await _hold_probe(request, call, proto, resp, chunks_iter)
                 except ClientDisconnected:
-                    await _close_response(resp)
+                    await close_upstream(resp)
                     return abort_request("client_abort")
                 except inflight.ManualAbort:
-                    await _close_response(resp)
+                    await close_upstream(resp)
                     return abort_request("manual_abort")
                 except asyncio.CancelledError:
                     try:
                         abort_request("client_abort")
                     finally:
-                        await _close_response(resp)
+                        await close_upstream(resp)
                     raise
                 if (
                     probe.verdict == "bad"
@@ -845,8 +889,7 @@ async def forward(
                         delay_s=delay,
                     )
                     elapsed = time.monotonic() - began
-                    with contextlib.suppress(Exception):
-                        await resp.aclose()
+                    await close_upstream(resp)
                     inflight.failed(
                         call, status=resp.status_code, note="hold_retry", ms=int(elapsed * 1000)
                     )
@@ -891,8 +934,7 @@ async def forward(
         # 这里直接关掉响应，日志只记状态和候选，不等待可能永远不来的正文。
         log(f"  上游返回 {resp.status_code}，关闭响应后换下一个候选")
         trace.end_attempt(status=resp.status_code, note="http_error", action="failover")
-        with contextlib.suppress(Exception):
-            await resp.aclose()
+        await close_upstream(resp)
         elapsed = time.monotonic() - began
         inflight.failed(call, status=resp.status_code, note="failed_over", ms=int(elapsed * 1000))
         if record:
@@ -1201,8 +1243,20 @@ async def forward(
     keep_encoding = _resp_encoding_to_keep(upstream_resp)
     if keep_encoding:
         passthrough["content-encoding"] = keep_encoding
-    return StreamingResponse(
-        relay(),
+    body_iter = relay()
+
+    async def cleanup() -> None:
+        try:
+            await body_iter.aclose()
+        finally:
+            try:
+                if not call.done_at:
+                    abort_request("manual_abort" if call.cancel_requested else "client_abort")
+            finally:
+                await _close_response(upstream_resp)
+
+    return _UpstreamResponse(
+        body_iter, cleanup=cleanup,
         status_code=upstream_resp.status_code,
         headers=passthrough,
         media_type=upstream_resp.headers.get("content-type", "application/json"),
