@@ -86,9 +86,78 @@ def _largest(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
     return max(values) if values else None
 
 
+def _object_end(buf: bytes, start: int) -> int:
+    """buf[start] 指向 '{'；返回配对 '}' 之后的位置，没闭合就返回 len(buf)。
+
+    字符串里的括号不算：usage 的明细里会回显任意文本（标识符、提示词），
+    裸数括号一个就能让作用域整个错位。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(buf)):
+        ch = buf[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == 0x5C:  # 反斜杠转义
+                escaped = True
+            elif ch == 0x22:  # 引号收尾
+                in_string = False
+        elif ch == 0x22:
+            in_string = True
+        elif ch == 0x7B:
+            depth += 1
+        elif ch == 0x7D:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return len(buf)
+
+
+# usage 对象里按输入项 / 按请求字段 / 按工具拆的明细，每个明细内部又有同名的
+# token 数字；tool_usage 通常是 usage 的兄弟节点，括号配对后自然隔在外面
+_USAGE_DETAILS = (b'"attribution":{', b'"tool_usage":{')
+
+
+def _top_level_usage(tail: bytes) -> bytes:
+    """尾巴里最后一个 usage 对象的顶层字段，明细整体抠掉。
+
+    response.completed 的 usage 会带 attribution 这类按输入项、按请求字段拆的明细
+    （DDD 2026-10 起如此），明细里的数字不是整个请求的计量，却排在真数后面 ——
+    按「最后一次出现」取会把它们当成终值，记成 in=0/out=0。找不到 "usage":{ 就
+    原样返回，保持对不带这层包装的站的宽容。
+    """
+    pos = tail.rfind(b'"usage":{')
+    if pos < 0:
+        return tail
+    start = pos + len(b'"usage":')
+    end = _object_end(tail, start)
+    inner = tail[start + 1 : end - 1] if end < len(tail) else tail[start + 1 :]
+    spans: list[tuple[int, int]] = []
+    for key in _USAGE_DETAILS:
+        at = inner.find(key)
+        while at >= 0:
+            stop = _object_end(inner, at + len(key) - 1)
+            spans.append((at, stop))
+            at = inner.find(key, stop)
+    if not spans:
+        return inner
+    kept = bytearray()
+    cursor = 0
+    for begin, stop in sorted(spans):
+        if begin < cursor:
+            continue  # 嵌在已抠掉的明细里
+        kept += inner[cursor:begin]
+        cursor = stop
+    kept += inner[cursor:]
+    return bytes(kept)
+
+
 def openai_usage(head: bytes, tail: bytes) -> Usage:
     """Responses API 只在最后的 response.completed 里报一次 usage，看尾巴就够。"""
-    return _last(_IN, tail), _last(_OUT, tail), _last(_CACHED, tail), None
+    scope = _top_level_usage(tail)
+    return _last(_IN, scope), _last(_OUT, scope), _last(_CACHED, scope), None
 
 
 def chat_usage(head: bytes, tail: bytes) -> Usage:
