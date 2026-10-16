@@ -1,6 +1,15 @@
 /* AI生成 */
 /* Model Gateway · 轻盈的玻璃工作台（全局丝滑物理弹簧动效版）
    环境色只移动渐变图层；玻璃限于容器，行与控件不叠加 backdrop-filter。 */
+
+/* ------------------------------------------------ 主题 token 层（风格契约）
+   明暗与风格是两个正交的轴：data-theme 管 auto/light/dark（见下面
+   :root[data-theme]），data-style 管风格皮肤。下面 :root 的这套值就是默认
+   风格「轻盈玻璃」。新增风格只加一段 :root[data-style="id"]，重新声明这批
+   token —— 两套明暗值各自用 light-dark() 给（color-scheme 由 data-theme
+   决定，与风格无关）；没声明的 token 自动继承这里的默认值。登记表在
+   web/theme.js 的 STYLES，控件在设置页「外观」卡片。canvas.css 用的是同一
+   批 token，画布视图跟着风格走，不用另做。 */
 :root {
   color-scheme: light dark;
   --page-1: light-dark(#e9edfc, #0d1327);
@@ -350,6 +359,10 @@ input:disabled, select:disabled { opacity: .65; }
 .switch:checked:active::after { transform: translateX(11px); }
 .fo-box, .side-proto { display: flex; flex-direction: column; gap: 17px; }
 .fo-item { display: flex; gap: 10px; align-items: center; color: var(--ink-2); font-size: 12px; transition: opacity .24s; }
+/* 设置页 · 外观：一行一个标签 + 一个分段控制器，窄屏时标签换到上一行 */
+.appearance-row { display: flex; gap: 12px 14px; align-items: center; flex-wrap: wrap; }
+.appearance-row + .appearance-row { margin-top: 14px; }
+.appearance-label { flex: none; min-width: 32px; color: var(--ink-2); font-size: 12px; }
 .side-proto .fo-item { justify-content: space-between; }
 .stall-input { max-width: 75px; }
 .policy-fields { padding-top: 8px; }

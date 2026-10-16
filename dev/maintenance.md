@@ -48,6 +48,7 @@
 | `web/canvas.js`、`web/canvas.css` | 编排画布：下游气泡、首选轮盘、候选链和手势。 |
 | `web/group-editor.js`、`web/async-state.js` | 分组编辑状态、迟到请求的处理和刷新合并。 |
 | `web/util.js`、`web/charts.js`、`web/motion.js` | 公共工具、图表和动效。 |
+| `web/theme.js` | 主题风格登记表与读写（`mg-style`）；新增皮肤只改这里加一行，详见[修改前端时注意什么](#修改前端时注意什么)。 |
 | `tests/` | 自动测试。 |
 | `dev/` | 维护说明、历史记录和诊断/页面实验脚本，不参与正常运行。 |
 
@@ -680,6 +681,9 @@ node dev/verify-batch-add.mjs 8399
 
 默认入口是 `#routes`，`#canvas` 为同一份路由配置的可选视图；全局控制放在 `#settings`，用量图表放在 `#overview`。
 界面保留原生 ES 模块，无新增运行依赖。玻璃模糊限于侧栏、主面板、指标卡、画布容器和弹窗，表格行、候选、按钮不叠加模糊。三层环境渐变只做缓慢变换，不动画化模糊半径。
+
+明暗（`data-theme`：auto/light/dark）与风格（`data-style`）是两个正交的轴，选择分别记在本机 `mg-theme`、`mg-style`，不随网关配置走，也不进数据库。控件在设置页「外观」卡片，侧栏保留明暗圆钮做快捷切换；两个入口改同一份状态，`applyTheme` 会顺手同步分段选中。风格皮肤只重新声明 `style.css` `:root` 里的同一批 token（契约注释在文件开头），两套明暗值各自用 `light-dark()` 给，`color-scheme` 仍由 `data-theme` 决定；没声明的 token 继承默认值，所以皮肤可以只写自己要改的那几个。新增风格 = `web/theme.js` 的 `STYLES` 登记一行 + `style.css` 加一段 `:root[data-style="id"]`，JS 不用动；id 只用小写字母、数字和连字符（会拼进属性选择器）。`canvas.css` 用同一批 token，画布跟着风格走。明暗和风格切换共用 `app.js` 的 `withCircleReveal` 圆形揭开，与视图过渡互斥、dpr 非 1 时用百分比半径这些规则不变。
+
 侧栏提供「标准 / 轻量」动效切换并本地记忆：标准包含环境流动与单个悬停面板的光感，轻量保留短交互动画。系统减少动态效果优先；页面隐藏暂停环境动画并取消动效模块待执行的帧。鼠标光感按帧合并，只更新一个当前容器，离开、滚动、打开弹窗、切入后台时清除，无常驻 JS 动画循环。
 
 视图切换用 View Transitions 把 `.main` 的新旧两块横向错开推过来（`style.css` 的 `data-vt-dir`，`motion.js` 的 `withViewTransition`），侧栏不参与。它和明暗切换的圆形揭开互斥：圆形要摘掉所有 `view-transition-name`，两条路同时跑会互相抢名字把页面撕开，所以在 `app.js` 里互相挡着；`.main` 上的 `will-change: filter` 让它在名字被临时摘掉时仍是 backdrop root，收尾才不会整块跳色。换视图会改文档高度，`paintView` 包在过渡回调里、同一次任务内把 `scrollY` 夹回来。`withViewTransition` 返回是否真套上了过渡，没套上时调用方自己补淡入。连点导航会打断上一次过渡，靠序号保证旧过渡的收尾不擦掉新方向。

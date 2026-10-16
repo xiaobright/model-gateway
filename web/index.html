@@ -251,6 +251,25 @@
 
     <section class="view" data-view="settings" hidden>
       <div class="view-head"><div><span class="eyebrow">网关行为</span><h2>网关设置</h2><p class="view-description">全局策略集中管理，模型和站点配置各自独立。</p></div></div>
+      <section class="card">
+        <div class="card-head"><h2>外观</h2><span class="tag">即时生效</span></div>
+        <p class="card-hint">明暗和风格是两个独立的轴，各选各的；选择只记在这台浏览器里，不随网关配置走。</p>
+        <div class="card-body">
+          <div class="appearance-row">
+            <span class="appearance-label">明暗</span>
+            <span class="seg" id="seg-theme" role="group" aria-label="明暗">
+              <button type="button" class="seg-item" data-act="set-theme" data-theme-choice="auto">跟随系统</button>
+              <button type="button" class="seg-item" data-act="set-theme" data-theme-choice="light">浅色</button>
+              <button type="button" class="seg-item" data-act="set-theme" data-theme-choice="dark">深色</button>
+            </span>
+          </div>
+          <div class="appearance-row">
+            <span class="appearance-label">风格</span>
+            <span class="seg" id="seg-style" role="group" aria-label="主题风格"></span>
+          </div>
+          <p class="card-hint" id="style-hint" aria-live="polite"></p>
+        </div>
+      </section>
       <div class="cols settings-grid">
         <section class="card"><div class="card-head"><h2>接口开关</h2><span class="tag">即时生效</span></div><p class="card-hint">关闭接口会隐藏相关配置并拒绝新请求，已有配置保留。</p><div class="side-proto card-body" id="proto-switches" role="group" aria-label="接口全局开关"></div></section>
         <section class="card"><div class="card-head"><h2>失败与超时</h2><span class="tag">即时生效</span></div><p class="card-hint">失败自动换站按接口设置；无内容超时是全局设置，0 表示关闭。等响应头与首个内容不计时。</p><div class="fo-box policy-fields card-body" id="failover-box"></div></section>

@@ -15,6 +15,7 @@ import {
 } from './util.js';
 import * as views from './views.js';
 import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition, animateViewEnter, syncSegMarkers, enterStagger, springAnimate, SPRING } from './motion.js';
+import { STYLES, DEFAULT_STYLE, normalizeStyle, loadStyle, applyStyle, styleHint } from './theme.js';
 import {
   initCanvas, renderCanvas, renderPool, setCanvasFilter, setCanvasIface,
   saveForward, canvasActions,
@@ -320,17 +321,19 @@ function setProto(p) {
 /* ---------------------------------------------------------------- 主题 */
 const THEMES = ['auto', 'light', 'dark'];
 const THEME_ICON = { auto: '◐', light: '☀', dark: '☾' };
+const THEME_LABEL = { auto: '跟随系统', light: '浅色', dark: '深色' };
 
 function applyTheme(name) {
   if (name === 'auto') document.documentElement.removeAttribute('data-theme');
   else document.documentElement.dataset.theme = name;
   $('theme-icon').textContent = THEME_ICON[name];
   springAnimate($('theme-icon'), [{ transform: 'rotate(-90deg) scale(0.65)' }, { transform: 'none' }], { duration: 380, easing: SPRING.bouncy });
-  localStorage.setItem('mg-theme', name);
+  try { localStorage.setItem('mg-theme', name); } catch { /* 隐私模式：当前会话仍然生效 */ }
+  syncThemeControls(name);
 }
 
-/* 明暗切换用一张圆形 clip 从按钮位置揭开整页。圆心和半径通过 CSS 变量交给
-   style.css 里的关键帧。
+/* 明暗和风格切换都整页换色，共用同一个「从按钮位置圆形揭开」的过渡。圆心和
+   半径通过 CSS 变量交给 style.css 里的关键帧。
 
    这里一律用百分比、不用 px。实测在 devicePixelRatio 非 1 的环境（Windows 150%
    缩放，dpr=1.5）下，写进 view-transition 伪元素 clip-path 的 px 长度会被 dpr
@@ -340,16 +343,12 @@ function applyTheme(name) {
 let themeSeq = 0;
 const VT_VARS = ['--vt-x', '--vt-y', '--vt-r', '--vt-duration'];
 
-function cycleTheme(dataset, el) {
-  const now = localStorage.getItem('mg-theme') || 'auto';
-  const next = THEMES[(THEMES.indexOf(now) + 1) % THEMES.length];
-  const label = { auto: '跟随系统', light: '浅色', dark: '深色' }[next];
+function withCircleReveal(mutate, el) {
   // 视图切换正在滑的时候不套过渡：那套要把 view-transition-name 全摘掉，会把它撕开
   if (reduceMotion() || typeof document.startViewTransition !== 'function'
     || document.documentElement.dataset.vtDir) {
-    applyTheme(next);
-    toast(`外观：${label}`);
-    return;
+    mutate();
+    return false;
   }
 
   // 圆心固定取按钮几何中心：比点击坐标更稳，键盘触发（clientX 为 0）时也一样
@@ -374,16 +373,56 @@ function cycleTheme(dataset, el) {
   root.style.setProperty('--vt-duration', '560ms');
   root.dataset.vtTheme = '1';
 
-  const vt = document.startViewTransition(() => {
-    applyTheme(next);
-  });
+  const vt = document.startViewTransition(mutate);
 
   vt.finished.catch(() => {}).finally(() => {
     if (seq !== themeSeq) return;   // 连点时已有新的切换在跑，别擦掉它的圆心
     delete root.dataset.vtTheme;
     for (const name of VT_VARS) root.style.removeProperty(name);
   });
-  toast(`外观：${label}`);
+  return true;
+}
+
+function cycleTheme(_dataset, el) {
+  const now = localStorage.getItem('mg-theme') || 'auto';
+  setTheme(THEMES[(THEMES.indexOf(now) + 1) % THEMES.length], el);
+}
+
+function setTheme(name, el) {
+  if (!THEMES.includes(name)) return;
+  withCircleReveal(() => applyTheme(name), el);
+  toast(`明暗：${THEME_LABEL[name]}`);
+}
+
+/* 风格控件（设置页「外观」）：分段项从登记表渲染，切风格和切明暗走同一套揭开 */
+function renderStyleControls() {
+  const host = $('seg-style');
+  if (!host) return;
+  const current = document.documentElement.dataset.style || DEFAULT_STYLE;
+  host.innerHTML = STYLES.map((s) =>
+    `<button type="button" class="seg-item${s.id === current ? ' is-on' : ''}" data-act="set-style" data-style="${esc(s.id)}">${esc(s.name)}</button>`
+  ).join('');
+  const hint = $('style-hint');
+  if (hint) hint.textContent = styleHint(current);
+}
+
+function setStyle(id, el) {
+  const next = normalizeStyle(id);
+  const changed = next !== (document.documentElement.dataset.style || DEFAULT_STYLE);
+  withCircleReveal(() => applyStyle(next), el);
+  // 分段胶囊和提示句在过渡外更新：它们在新旧两张快照里都在，顺手跟着动
+  renderStyleControls();
+  syncSegMarkers();
+  if (changed) toast(`风格：${STYLES.find((s) => s.id === next).name}`);
+}
+
+/* 设置页的明暗分段跟着侧栏圆钮走；两个入口改的是同一份状态 */
+function syncThemeControls(name) {
+  const now = name || 'auto';
+  for (const b of $('seg-theme')?.children || []) {
+    b.classList.toggle('is-on', b.dataset.themeChoice === now);
+  }
+  syncSegMarkers();
 }
 
 /* ---------------------------------------------------------------- 端点 */
@@ -1766,6 +1805,8 @@ const ACTIONS = {
 
   'toggle-theme': cycleTheme,
   'toggle-motion': () => { toggleMotion(); },
+  'set-theme': ({ themeChoice }, el) => setTheme(themeChoice, el),
+  'set-style': ({ style }, el) => setStyle(style, el),
 
   'close-dialog': (_d, el) => el.closest('dialog').close(),
 
@@ -2497,7 +2538,11 @@ setInterval(() => {
 
 /* ---------------------------------------------------------------- 启动 */
 
-applyTheme(localStorage.getItem('mg-theme') || 'auto');
+let savedTheme = 'auto';
+try { savedTheme = localStorage.getItem('mg-theme') || 'auto'; } catch { /* 隐私模式用默认 */ }
+applyTheme(savedTheme);
+applyStyle(loadStyle());
+renderStyleControls();
 initMotion();
 views.initRoutePad();   // 路由视图：内容变短时用留白兜住滚动位置，不把用户夹回去
 $('endpoint').textContent = `${location.origin}/v1`;
