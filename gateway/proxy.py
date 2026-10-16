@@ -170,8 +170,14 @@ def _observe_usage(proto: protocols.Protocol, head: bytes, tail: bytes) -> proto
         return NO_USAGE
 
 
+# 等响应头多久开始告警。慢站首字等一两分钟是常态（模型在算），所以只报警不动作；
+# 真出「发出去了但上游没回应」这类黑洞时，日志里能看到卡住的准确起点和持续时长。
+HEADER_WAIT_WARN_S = 60.0
+
+
 async def _send_until_headers(
-    request: Request, client: httpx.AsyncClient, prepared: httpx.Request
+    request: Request, client: httpx.AsyncClient, prepared: httpx.Request,
+    label: str = "",
 ) -> httpx.Response:
     """等待响应头，同时让下游断开能够取消尚未完成的发送。
 
@@ -179,8 +185,12 @@ async def _send_until_headers(
     Request.is_disconnected() 是非阻塞检查，短暂让出事件循环即可避免把下游断开拖到
     上游 read/connect timeout 才收尾。等响应头不设发呆超时 —— 慢站的首字可以等一两分钟，
     那是模型在算，不是卡住；真卡死了还有 httpx 的 600 秒 read 超时兜底。
+    超过 HEADER_WAIT_WARN_S 只写一条 WARN，配合抓包（dev/capture-net.ps1）定位
+    「请求出没出去、断在哪一跳」。
     """
     task = asyncio.create_task(client.send(prepared, stream=True))
+    began = time.monotonic()
+    next_warn = HEADER_WAIT_WARN_S
     try:
         while True:
             # 可被完成唤醒的等待：响应头一到就返回，不能让 50ms 的轮询节拍变成
@@ -193,6 +203,10 @@ async def _send_until_headers(
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
                 raise ClientDisconnected
+            waited = time.monotonic() - began
+            if waited >= next_warn:
+                log(f"  WARN {label}等响应头已 {waited:.0f}s，仍未取消（客户端在等）")
+                next_warn += HEADER_WAIT_WARN_S
         return await task
     except BaseException:
         # 取消恰好撞上响应头到达时，send 的任务可能已经完成，也要归还那条连接。
@@ -220,6 +234,14 @@ def _client_label(ua: str) -> str:
     if ua.startswith("claude-cli"):
         return "Claude Code"
     return ua.split("/")[0].strip()[:24] or "unknown"
+
+
+def _egress_label(egress: str) -> str:
+    """出口在日志里只说得出口类型：代理 URL 带账号密码，不能落盘。"""
+    egress = (egress or "").strip()
+    if egress == upstream_mod.EGRESS_DIRECT:
+        return "direct"
+    return "system" if egress == upstream_mod.EGRESS_SYSTEM else "proxy"
 
 
 def _build_headers(
@@ -629,6 +651,7 @@ async def forward(
                     request,
                     client,
                     client.build_request("POST", url, content=sent_body, headers=headers),
+                    label=f"{label} 出口={_egress_label(route.upstream.egress)} ",
                 ),
             )
         except inflight.ManualAbort:
@@ -638,7 +661,8 @@ async def forward(
         except ClientDisconnected:
             elapsed = time.monotonic() - began
             log(
-                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} -> 499 "
+                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} "
+                f"出口={_egress_label(route.upstream.egress)} -> 499 "
                 f"(客户端在等待响应头时断开) after {elapsed:.1f}s req={len(sent_body)}B"
             )
             return abort_request("client_abort")
@@ -649,7 +673,8 @@ async def forward(
             fail, resp = exc, None
             elapsed = time.monotonic() - began
             log(
-                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} -> 502 "
+                f"POST {endpoint} model={requested!r} upstream={route.upstream.name} "
+                f"出口={_egress_label(route.upstream.egress)} -> 502 "
                 f"({exc.__class__.__name__}: {exc}) after {elapsed:.1f}s req={len(sent_body)}B"
                 f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
             )
@@ -709,7 +734,8 @@ async def forward(
         log(
             f"POST {endpoint} model={requested!r} upstream={route.upstream.name} remote={remote!r} "
             f"-> {resp.status_code} stream={stream_flag}{' 1m' if want_1m else ''}{detail} "
-            f"req={len(sent_body)}B ua={request.headers.get('user-agent', '')[:48]!r}"
+            f"headers={time.monotonic() - began:.1f}s req={len(sent_body)}B "
+            f"ua={request.headers.get('user-agent', '')[:48]!r}"
             f"{capture.capability_summary(payload)}"
             f"{'' if attempt == 1 else f' [第 {attempt} 次尝试]'}"
         )

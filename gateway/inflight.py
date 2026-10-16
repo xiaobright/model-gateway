@@ -119,6 +119,14 @@ async def wait_for_upstream(
 
     timeout 给了就是发呆超时：这段时间内没等到结果就取消等待并抛 UpstreamStall，
     由调用方决定是换候选还是切断这条流；None = 不限时（等响应头、等首字都用它）。
+
+    等待必须包在 asyncio.shield 里：直接 await 这个任务时，外层（relay）被取消会
+    顺着 _fut_waiter 把读取任务一起取消，httpx 的流迭代就在取消中收尾 —— httpcore
+    关流的 shield 挡不住 anyio 对同一任务的取消重投，连接既没归还也没关，还留下
+    「已关闭」的假标记让后面真正的 aclose 变成空操作。客户端每中途离开一次就泄漏
+    一条 ACTIVE 连接，占满 max_connections(64) 之后新请求全部 PoolTimeout 挂 600s。
+    shield 之后读取任务只被显式取消（手动中断/超时）或等 relay 收尾关流时自然结束，
+    两种情况下的收尾都不在取消Scope里，连接能正常归还。
     """
     pending = asyncio.ensure_future(operation)
     call.pending = pending
@@ -126,8 +134,8 @@ async def wait_for_upstream(
         pending.cancel()
     try:
         if timeout is not None:
-            return await asyncio.wait_for(pending, timeout)
-        return await pending
+            return await asyncio.wait_for(asyncio.shield(pending), timeout)
+        return await asyncio.shield(pending)
     except asyncio.CancelledError:
         if call.cancel_requested:
             raise ManualAbort from None

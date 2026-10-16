@@ -480,6 +480,29 @@ Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:8317/admin/api/capture-stre
 普通转发不递归扫描压缩条目；流式抓包只额外计数事件类型，压缩扫描仅在自己的开关开启时运行。
 这只能证明观察到相应条目，不能单凭它宣称客户端后续复用成功。
 
+### 网络层抓包（pktmon）
+
+上面的抓包证明“网关读到了什么”，证明不了“请求出没出去”。遇到「发出去了但上游没收到」
+「完全连不上」这类故障（走代理和直连都可能），用 `dev/capture-net.ps1` 抓网关出口方向的包，
+看 SYN 到底出没出去、有没有 SYN-ACK、数据发出去后对端有没有任何回应：
+
+```powershell
+# 管理员 PowerShell；开始前自动把已启用上游的 IP 加成过滤器
+pwsh -NoProfile -File dev\capture-net.ps1 -Start
+# ……复现问题（让 codex 发几次请求，等到卡住）……
+pwsh -NoProfile -File dev\capture-net.ps1 -Stop    # 停止并转成 pcapng
+```
+
+产出在 `dev/captures/PktMon-<时间戳>.pcapng`（已加入 .gitignore），用 Wireshark 打开，
+先看网关进程（`pythonw.exe`）到上游 IP 的 TCP 流：`ip.addr == <上游IP> && tcp.port == 443`。
+只看到出去的 SYN、没有 SYN-ACK = 链路黑洞；握手正常、请求包也有、就是没有回应 = 对端静默丢包。
+可选参数（只抓某家上游、加节点 IP、记录完整包体等）见脚本开头注释。抓包含未加密的元数据，分享前先检查。
+
+配合日志看：等响应头超过 60 秒会每条一分钟写一行 `WARN … 等响应头已 Ns`，成功时日志带
+`headers=N.Ns`（这次尝试拿到响应头用了多久），499/502 行带 `出口=direct/system/proxy`
+（只标类型，代理 URL 的凭据不落盘）。下次再出现「切 Clash 直连没用、切网关直连才好」时，
+对照抓包和这三处就能定位断在哪一跳。
+
 ## 请求文本替换
 
 管理页「上游站点 → 敏感词绕行」用于处理**已确认的固定文本误报**：

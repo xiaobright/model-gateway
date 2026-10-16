@@ -591,3 +591,55 @@ def test_anthropic_switch_and_disable_reuse_the_same_routing(gateway):
         gateway.post("/admin/api/models/switch", json={"route_id": r_b})
         seen = gateway.post("/v1/messages", json=msg("opus")).json()
         assert (seen["upstream"], seen["model"]) == ("siteB", "on-b")
+
+
+def _pooled_connection_states() -> list[str]:
+    """共享出口 client 的连接池里每条连接的状态（真实 socket 才有池）。"""
+    from gateway import upstream as upstream_mod
+
+    states = []
+    for client in upstream_mod._clients.values():
+        pool = getattr(client._transport, "_pool", None)
+        if pool is None:
+            continue
+        for conn in pool._connections:
+            inner = getattr(conn, "_connection", conn)
+            states.append(inner._state.name)
+    return states
+
+
+@pytest.mark.network
+def test_client_leaving_midstream_does_not_leak_pool_connections(gateway):
+    """客户端拿到完成事件就走、上游却挂着流不收：连接必须被收尾关掉，不能留在池里。
+
+    codex 的真实形态：响应发完 [DONE] 后上游并不收连接，客户端读完完成事件就离开。
+    这时 relay 的读取被取消——若取消顺着 await 把读取任务一起干掉，httpx 的流迭代会在
+    取消中收尾失败：连接既不归还也不关闭，还留下「已关闭」的假标记。客户端每离开一次
+    泄漏一条 ACTIVE 连接，占满 max_connections(64) 之后新请求全部 PoolTimeout 挂 600s。
+    """
+    from gateway import db
+
+    db.set_setting("stall_timeout_s", "0")
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA")
+        resp = gateway.put(
+            f"/admin/api/upstreams/{provider_id(gateway, 'siteA')}",
+            json={"name": "siteA", "base_url": a.base_url, "egress": "direct"},
+        )
+        assert resp.status_code == 200, resp.text
+        add_route(gateway, "gpt-test", g, "gpt-test")
+
+        for _ in range(12):
+            with gateway.stream(
+                "POST", "/v1/responses",
+                json={"model": "gpt-test", "stream": True, "mode": "lingering", "input": "hi"},
+            ) as stream:
+                for chunk in stream.iter_bytes():
+                    if b"[DONE]" in chunk:
+                        break  # 拿到完成事件就离开，不等上游收流
+        time.sleep(1.0)
+
+        states = _pooled_connection_states()
+        assert "ACTIVE" not in states, f"连接池泄漏了 ACTIVE 连接：{states}"
+        row = wait_for_row(gateway)
+        assert row["note"] in ("ok", "client_abort"), row["note"]
