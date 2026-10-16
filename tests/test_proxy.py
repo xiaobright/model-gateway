@@ -604,9 +604,9 @@ def _pooled_connection_states() -> list[str]:
             pool = getattr(transport, "_pool", None)
             if pool is None:
                 continue
-            for conn in pool._connections:
-                inner = getattr(conn, "_connection", conn)
-                states.append(inner._state.name)
+            for conn in pool.connections:
+                # 代理连接可能还有一层 HTTPConnection，info() 会沿包装取实际状态。
+                states.append(conn.info())
     return states
 
 
@@ -656,10 +656,16 @@ def test_client_leaving_midstream_does_not_leak_pool_connections(gateway, monkey
                 for chunk in stream.iter_bytes():
                     if b"[DONE]" in chunk:
                         break  # 拿到完成事件就离开，不等上游收流
-        time.sleep(1.0)
+        # 下游断开与上游关流跨两个事件循环，等待实际释放，不能假定 1 秒后已完成。
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if (not _pooled_connection_states()
+                    and not any(client.active for client in upstream_mod._clients.values())):
+                break
+            time.sleep(0.02)
 
         states = _pooled_connection_states()
-        assert "ACTIVE" not in states, f"连接池泄漏了 ACTIVE 连接：{states}"
+        assert not any("ACTIVE" in state for state in states), f"连接池泄漏了 ACTIVE 连接：{states}"
         assert sum(client.active for client in upstream_mod._clients.values()) == 0
         assert (len(px.seen) == 12) if egress != "direct" else (not px.seen)
         assert gateway.post("/v1/responses", json={"model": "gpt-test"}).status_code == 200

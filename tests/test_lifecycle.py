@@ -125,6 +125,128 @@ def test_completed_response_is_closed_when_waiter_loses_cancellation_race(app):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("path", ["inflight", "headers", "held_read", "close_response"])
+@pytest.mark.parametrize("late_result", [False, True])
+def test_repeated_task_cancellation_waits_for_cleanup_and_disposes_late_response(app, path, late_result):
+    async def run():
+        entered, closing, release, disposed = (asyncio.Event() for _ in range(4))
+        tasks = []
+        call = inflight.begin(client="test", protocol="openai", model="m", stream=True, req_bytes=0)
+
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"unused"
+
+            async def aclose(self):
+                if path == "close_response":
+                    entered.set()
+                    closing.set()
+                    await release.wait()
+                disposed.set()
+
+        response = httpx.Response(200, stream=Stream())
+
+        async def operation():
+            task = asyncio.current_task()
+            tasks.append(task)
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                closing.set()
+                await release.wait()
+                assert task.cancelling() == 1, "第二次取消不能进入子任务的收尾"
+                if late_result:
+                    return response
+                raise
+
+        class Request:
+            async def is_disconnected(self):
+                return False
+
+        class Client:
+            async def send(self, *args, **kwargs):
+                return await operation()
+
+        class Iterator:
+            def __anext__(self):
+                return operation()
+
+        if path == "inflight":
+            wait = inflight.wait_for_upstream(call, operation(), on_cancel=proxy._close_response)
+        elif path == "headers":
+            wait = proxy._send_until_headers(Request(), Client(), object())
+        elif path == "held_read":
+            wait = proxy._next_while_connected(Request(), Iterator())
+        else:
+            wait = proxy._close_response(response)
+        parent = asyncio.create_task(wait)
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            parent.cancel()
+            await asyncio.wait_for(closing.wait(), 2)
+            if path == "inflight":
+                assert inflight.cancel(call.id)
+                assert inflight.cancel(call.id)
+            for _ in range(3):
+                parent.cancel()
+                await asyncio.sleep(0)
+                assert not parent.done(), "资源没释放时不能提前退出"
+            if path == "inflight":
+                assert call.pending is tasks[0]
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(parent, 2)
+            assert all(task.done() for task in tasks)
+            if path == "close_response" or late_result and path in {"inflight", "headers"}:
+                assert response.is_closed and disposed.is_set()
+            assert call.pending is None
+        finally:
+            release.set()
+            await asyncio.gather(parent, *tasks, return_exceptions=True)
+            await response.aclose()
+            inflight.finish(call, status=499, note="test")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("details_first", [False, True])
+def test_large_structured_responses_usage_survives_chunks_and_tail_eviction(app, monkeypatch, stream, details_first):
+    configure_routes("openai")
+    totals = {"input_tokens": 4388, "output_tokens": 6, "input_tokens_details": {"cached_tokens": 4224}}
+    details = {"attribution": {"items": [{"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+                                         "echo": 'code { \\" braces }'}] * 1300,
+                               "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}}}
+    usage = {**details, **totals} if details_first else {**totals, **details}
+    raw = json.dumps({"type": "response.completed", "response": {"usage": usage},
+                      "tool_usage": {"input_tokens": 0, "output_tokens": 0}}).encode()
+    if stream:
+        raw = b"event: response.completed\ndata: " + raw + b"\n\ndata: [DONE]\n\n"
+    assert len(raw) > proxy.TAIL_KEEP
+
+    async def run():
+        async def chunks():
+            for start in range(0, len(raw), 4093):
+                yield raw[start:start + 4093]
+
+        body = Body(chunks())
+        content_type = "text/event-stream" if stream else "application/json"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, headers={"content-type": content_type}, stream=body)), trust_env=False) as upstream:
+            use_upstream(monkeypatch, upstream)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1") as client:
+                response = await client.post("/v1/responses", json={"model": "m", "stream": stream})
+                assert response.content == raw
+        assert body.closed
+        row = db.recent_requests(1)[0]
+        assert (row["input_tokens"], row["output_tokens"], row["cached_tokens"]) == (4388, 6, 4224)
+        recent = inflight.snapshot()["recent"][0]
+        assert (recent["tokens_in"], recent["tokens_out"]) == (4388, 6)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("spec", ["2.0", "2.4"])
 @pytest.mark.parametrize("stage", ["start", "body"])
 @pytest.mark.parametrize("failure", ["broken_pipe", "cancel"])
@@ -509,7 +631,7 @@ def test_observation_failures_do_not_break_response_or_cleanup(app, monkeypatch,
     elif failure == "usage_parser":
         def broken_usage(*args):
             raise ValueError("injected usage failure")
-        monkeypatch.setattr(type(protocols.OPENAI), "extract_usage", lambda *args: broken_usage())
+        monkeypatch.setattr(protocols, "openai_payload_usage", lambda *args, **kwargs: broken_usage())
     elif failure == "blob_scan":
         def broken_blob(*args):
             raise RuntimeError("injected request observation failure")
@@ -732,7 +854,7 @@ def test_retry_delay_is_cancellable_without_another_attempt(app, monkeypatch, fa
                     else:
                         task.cancel()
                         with pytest.raises(asyncio.CancelledError):
-                            await task
+                            await asyncio.wait_for(task, 2)
                     note = "manual_abort" if cancel_kind == "manual" else "client_abort"
                     assert calls == ["primary.example"], "取消间隔不能再同站重试或换站"
                     assert failover.snapshot() == [], "取消不是站级故障"

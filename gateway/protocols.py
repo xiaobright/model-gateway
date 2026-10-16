@@ -17,8 +17,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
-# 上游的 usage 是从字节流里正则捞的，不做完整 SSE 解析：只要认出数字就够记账，
-# 而任何一次解析失败都不该影响转发本身。
+# Responses 从完整 JSON / SSE 事件读取 usage，其它协议沿用有界字节窗。
+# 任何一次计量解析失败都不该影响转发本身。
 Usage = tuple[int | None, int | None, int | None, int | None]
 # (输入, 输出, 缓存读取, 缓存创建)
 
@@ -86,78 +86,57 @@ def _largest(pattern: re.Pattern[bytes], *bufs: bytes) -> int | None:
     return max(values) if values else None
 
 
-def _object_end(buf: bytes, start: int) -> int:
-    """buf[start] 指向 '{'；返回配对 '}' 之后的位置，没闭合就返回 len(buf)。
-
-    字符串里的括号不算：usage 的明细里会回显任意文本（标识符、提示词），
-    裸数括号一个就能让作用域整个错位。
-    """
-    depth = 0
-    in_string = False
-    escaped = False
-    for i in range(start, len(buf)):
-        ch = buf[i]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == 0x5C:  # 反斜杠转义
-                escaped = True
-            elif ch == 0x22:  # 引号收尾
-                in_string = False
-        elif ch == 0x22:
-            in_string = True
-        elif ch == 0x7B:
-            depth += 1
-        elif ch == 0x7D:
-            depth -= 1
-            if depth == 0:
-                return i + 1
-    return len(buf)
+def _token_value(value: object) -> int | None:
+    return value if type(value) is int and 0 <= value <= MAX_USAGE_TOKENS else None
 
 
-# usage 对象里按输入项 / 按请求字段 / 按工具拆的明细，每个明细内部又有同名的
-# token 数字；tool_usage 通常是 usage 的兄弟节点，括号配对后自然隔在外面
-_USAGE_DETAILS = (b'"attribution":{', b'"tool_usage":{')
-
-
-def _top_level_usage(tail: bytes) -> bytes:
-    """尾巴里最后一个 usage 对象的顶层字段，明细整体抠掉。
-
-    response.completed 的 usage 会带 attribution 这类按输入项、按请求字段拆的明细
-    （DDD 2026-10 起如此），明细里的数字不是整个请求的计量，却排在真数后面 ——
-    按「最后一次出现」取会把它们当成终值，记成 in=0/out=0。找不到 "usage":{ 就
-    原样返回，保持对不带这层包装的站的宽容。
-    """
-    pos = tail.rfind(b'"usage":{')
-    if pos < 0:
-        return tail
-    start = pos + len(b'"usage":')
-    end = _object_end(tail, start)
-    inner = tail[start + 1 : end - 1] if end < len(tail) else tail[start + 1 :]
-    spans: list[tuple[int, int]] = []
-    for key in _USAGE_DETAILS:
-        at = inner.find(key)
-        while at >= 0:
-            stop = _object_end(inner, at + len(key) - 1)
-            spans.append((at, stop))
-            at = inner.find(key, stop)
-    if not spans:
-        return inner
-    kept = bytearray()
-    cursor = 0
-    for begin, stop in sorted(spans):
-        if begin < cursor:
-            continue  # 嵌在已抠掉的明细里
-        kept += inner[cursor:begin]
-        cursor = stop
-    kept += inner[cursor:]
-    return bytes(kept)
+def openai_payload_usage(payload: object, *, allow_flat: bool = False) -> Usage | None:
+    """只读取 response.usage / usage 的指定字段，不搜索正文、工具或 attribution。"""
+    if not isinstance(payload, dict):
+        return None
+    response = payload.get("response")
+    usage = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(usage, dict):
+        usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        if not allow_flat or not any(k in payload for k in ("input_tokens", "output_tokens")):
+            return None
+        usage = payload
+    details = usage.get("input_tokens_details", usage.get("input_token_details"))
+    cached = details.get("cached_tokens") if isinstance(details, dict) else usage.get("cached_tokens")
+    return (
+        _token_value(usage.get("input_tokens")), _token_value(usage.get("output_tokens")),
+        _token_value(cached), None,
+    )
 
 
 def openai_usage(head: bytes, tail: bytes) -> Usage:
-    """Responses API 只在最后的 response.completed 里报一次 usage，看尾巴就够。"""
-    scope = _top_level_usage(tail)
-    return _last(_IN, scope), _last(_OUT, scope), _last(_CACHED, scope), None
+    """完整 JSON / SSE 的结构化提取；残缺尾窗不能把明细当成总用量。"""
+    missing: Usage = (None, None, None, None)
+
+    def parse(raw: bytes) -> object:
+        return json.loads(raw, parse_int=lambda n: _usage_number(n.encode()))
+
+    try:
+        return openai_payload_usage(parse(tail), allow_flat=True) or missing
+    except (ValueError, UnicodeError):
+        pass
+    result = missing
+    for frame in re.split(rb"\r?\n\r?\n", tail):
+        data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
+        if not data or data == b"[DONE]":
+            continue
+        try:
+            payload = parse(data)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("type", "response.completed") in {
+            "response.completed", "response.failed", "response.incomplete",
+        }:
+            usage = openai_payload_usage(payload)
+            if usage is not None:
+                result = usage
+    return result
 
 
 def chat_usage(head: bytes, tail: bytes) -> Usage:
@@ -537,6 +516,8 @@ class SSEObserver:
         self._collect_compaction = collect_compaction
         self._buffer = bytearray()
         self.ended = False
+        # 从完整事件提取，只留总量；完成事件自身可超过转发的 64KB 尾窗。
+        self.usage: Usage | None = None
         self.protocol_error = False
         self.text_bytes = 0
         self.thinking = False
@@ -629,6 +610,16 @@ class SSEObserver:
         kind = event or (payload.get("type", "") if isinstance(payload, dict) else "")
         if not isinstance(kind, str):
             kind = ""
+        if self.proto.name == "openai" and kind in {
+            "", "response.completed", "response.failed", "response.incomplete",
+        }:
+            try:
+                usage = openai_payload_usage(payload)
+                if usage is not None:
+                    self.usage = usage
+            except Exception:
+                # 计量失败不能阻断同一事件里的结束标记识别。
+                self._notify("observation_error", 0)
         malformed = bool(
             self._on_event is not None and data_text and payload is None
             and data_text not in self.proto.end_data_markers

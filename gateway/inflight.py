@@ -28,8 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import anyio
-
+from .async_cleanup import finish_cleanup
 from .reqlog import log
 
 # 结束的请求再留这么久 / 最多留几条
@@ -93,6 +92,7 @@ class Call:
     cancel_requested: bool = False
     # 只取消这条请求正在等的上游操作，不碰服务任务或其它请求。
     pending: asyncio.Future | None = field(default=None, repr=False)
+    pending_cancelled: bool = field(default=False, repr=False)
 
     @property
     def elapsed_ms(self) -> int:
@@ -115,6 +115,14 @@ class UpstreamStall(Exception):
     """上游开始输出内容后，超过发呆超时没有再吐新内容。"""
 
 
+def _cancel_pending(call: Call) -> None:
+    # Task.cancelling() 也包括 Request.is_disconnected 的临时自取消，不能用它
+    # 判断网关是否已投过取消；手动中断与外层取消必须共用同一份标记。
+    if call.pending is not None and not call.pending.done() and not call.pending_cancelled:
+        call.pending_cancelled = True
+        call.pending.cancel()
+
+
 async def wait_for_upstream(
     call: Call, operation: Awaitable[Any], timeout: float | None = None,
     *, on_cancel: Callable[[Any], Awaitable[None]] | None = None,
@@ -130,8 +138,9 @@ async def wait_for_upstream(
     """
     pending = asyncio.ensure_future(operation)
     call.pending = pending
+    call.pending_cancelled = False
     if call.cancel_requested:
-        pending.cancel()
+        _cancel_pending(call)
     delivered = False
     try:
         if timeout is not None:
@@ -147,17 +156,20 @@ async def wait_for_upstream(
     except (asyncio.TimeoutError, TimeoutError):
         raise UpstreamStall from None
     finally:
+        async def cleanup() -> None:
+            if delivered:
+                return
+            # 手动中断已经 cancel 过；不要在它关流时再投一次取消。
+            _cancel_pending(call)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await pending
+            if (on_cancel is not None and not pending.cancelled()
+                    and pending.exception() is None):
+                await on_cancel(pending.result())
+
         try:
             if not delivered:
-                # 手动中断已经 cancel 过；不要在它关流时再投一次取消。
-                if not pending.done() and not getattr(pending, "cancelling", lambda: 0)():
-                    pending.cancel()
-                with anyio.CancelScope(shield=True):
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await asyncio.shield(pending)
-                    if (on_cancel is not None and not pending.cancelled()
-                            and pending.exception() is None):
-                        await on_cancel(pending.result())
+                await finish_cleanup(cleanup())
         finally:
             call.pending = None
 
@@ -170,9 +182,7 @@ def cancel(call_id: int) -> bool:
             return False
         if not call.cancel_requested:
             call.cancel_requested = True
-            if (call.pending is not None
-                    and not getattr(call.pending, "cancelling", lambda: 0)()):
-                call.pending.cancel()
+            _cancel_pending(call)
         return True
 
 

@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
-import anyio
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -27,6 +26,7 @@ from . import (
     upstream as upstream_mod,
 )
 from .reqlog import log
+from .async_cleanup import finish_cleanup
 from .upstream import endpoint as upstream_endpoint
 
 # 上游发呆超时：开始输出内容后这么久没有新内容，就按「卡住」打断这条请求，
@@ -140,15 +140,8 @@ RESPONSE_POLL = 0.05
 
 
 async def _close_response(response: httpx.Response) -> None:
-    # 作用域取消和直接 task.cancel 都不能中途打断关流。
-    with anyio.CancelScope(shield=True):
-        task = asyncio.create_task(response.aclose())
-        try:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(task)
-        finally:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(task)
+    with contextlib.suppress(Exception):
+        await finish_cleanup(response.aclose())
 
 
 class _UpstreamResponse(StreamingResponse):
@@ -162,8 +155,7 @@ class _UpstreamResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            with anyio.CancelScope(shield=True):
-                await self.cleanup()
+            await finish_cleanup(self.cleanup())
 
 
 async def _next_while_connected(request: Request, iterator: AsyncIterator[bytes]) -> bytes:
@@ -171,16 +163,20 @@ async def _next_while_connected(request: Request, iterator: AsyncIterator[bytes]
     task = asyncio.ensure_future(anext(iterator))
     try:
         while True:
+            if asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
             done, _ = await asyncio.wait({task}, timeout=RESPONSE_POLL)
             if task in done:
                 return task.result()
             if await request.is_disconnected():
                 raise ClientDisconnected
     finally:
-        if not task.done() and not task.cancelling():
-            task.cancel()
-        with anyio.CancelScope(shield=True), contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+        async def cleanup() -> None:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        await finish_cleanup(cleanup())
 
 
 def _observe_usage(proto: protocols.Protocol, head: bytes, tail: bytes) -> protocols.Usage:
@@ -215,6 +211,8 @@ async def _send_until_headers(
     delivered = False
     try:
         while True:
+            if asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
             # 可被完成唤醒的等待：响应头一到就返回，不能让 50ms 的轮询节拍变成
             # 每个请求的关键路径延迟（断开检测仍是每 RESPONSE_POLL 一次）
             done, _ = await asyncio.wait({task}, timeout=RESPONSE_POLL)
@@ -230,13 +228,14 @@ async def _send_until_headers(
                 next_warn += HEADER_WAIT_WARN_S
     finally:
         if not delivered:
-            if not task.done() and not task.cancelling():
-                task.cancel()
-            with anyio.CancelScope(shield=True):
+            async def cleanup() -> None:
+                if not task.done():
+                    task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await asyncio.shield(task)
+                    await task
                 if not task.cancelled() and task.exception() is None:
                     await _close_response(task.result())
+            await finish_cleanup(cleanup())
 
 
 def _error(proto: protocols.Protocol, status: int, message: str) -> JSONResponse:
@@ -585,6 +584,9 @@ async def forward(
         async def pause() -> bool:
             end = time.monotonic() + delay_s
             while time.monotonic() < end:
+                # Request.is_disconnected 的临时取消作用域可能吞掉直接取消。
+                if asyncio.current_task().cancelling():
+                    raise asyncio.CancelledError
                 if await request.is_disconnected():
                     return False
                 await asyncio.sleep(min(RESPONSE_POLL, max(0.0, end - time.monotonic())))
@@ -1114,8 +1116,11 @@ async def forward(
                 log(f"  done status={upstream_resp.status_code} resp={sent}B {time.monotonic() - started:.1f}s")
         finally:
             usage = NO_USAGE
+            structured_usage: protocols.Usage | None = None
             try:
                 if observer is not None:
+                    if proto.name == "openai":
+                        structured_usage = observer.usage or NO_USAGE
                     if (observer.protocol_error and upstream_resp.status_code < 300
                             and note in ("ok", "truncated")):
                         note = "protocol_error"
@@ -1140,6 +1145,8 @@ async def forward(
                     try:
                         json_payload = json.loads(json_body)
                         if isinstance(json_payload, dict):
+                            if proto.name == "openai":
+                                structured_usage = protocols.openai_payload_usage(json_payload, allow_flat=True)
                             if (json_payload.get("error") is not None
                                     or json_payload.get("status") in ("failed", "incomplete")):
                                 trace.event("protocol_error")
@@ -1186,7 +1193,11 @@ async def forward(
                         response_payload_types=response_payload_types,
                     )
                 # usage 抽一次给两处用：「实时」页要拿真数替掉按字节估的，转发记录要落库
-                usage = _observe_usage(proto, bytes(head), bytes(tail))
+                if proto.name == "openai":
+                    # 明细自身可能超过尾窗；不要再扫描残缺尾巴猜总用量。
+                    usage = structured_usage or NO_USAGE
+                else:
+                    usage = _observe_usage(proto, bytes(head), bytes(tail))
                 trace.end_attempt(status=upstream_resp.status_code, note=note, usage=usage)
                 trace.result(upstream_resp.status_code, note)
                 # 先落库（纯同步，即使外层在取消也能跑完），再还连接

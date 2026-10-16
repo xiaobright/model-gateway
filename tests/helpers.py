@@ -446,12 +446,14 @@ class MockProxy:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     async def _pump(self, reader, writer) -> None:
-        with contextlib.suppress(Exception):
-            while data := await reader.read(65536):
-                writer.write(data)
-                await writer.drain()
-        with contextlib.suppress(Exception):
-            writer.close()
+        try:
+            with contextlib.suppress(Exception):
+                while data := await reader.read(65536):
+                    writer.write(data)
+                    await writer.drain()
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
 
     async def _handle(self, reader, writer) -> None:
         try:
@@ -472,11 +474,9 @@ class MockProxy:
         await asyncio.gather(self._pump(reader, up_w), self._pump(up_r, writer))
 
     def _run(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._stop = asyncio.Event()
-
         async def serve() -> None:
+            self._loop = asyncio.get_running_loop()
+            self._stop = asyncio.Event()
             server = await asyncio.start_server(self._handle, "127.0.0.1", self.port, ssl=self._tls)
             self._ready.set()
             await self._stop.wait()
@@ -484,10 +484,8 @@ class MockProxy:
             with contextlib.suppress(Exception):
                 await server.wait_closed()
 
-        try:
-            self._loop.run_until_complete(serve())
-        finally:
-            self._loop.close()
+        # run() 会取消并等待连接处理任务，不能在 pump 尚未退出时直接关 loop。
+        asyncio.run(serve())
 
     def __enter__(self) -> "MockProxy":
         self._thread.start()

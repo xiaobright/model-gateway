@@ -1,4 +1,6 @@
 """畸形配置、极端计量和长时间失败的有界处理。"""
+import json
+
 import pytest
 
 from gateway import config, failover, protocols
@@ -90,3 +92,35 @@ def test_openai_usage_ignores_details_when_completed_sits_past_the_tail_window()
     ) * 2000
     tail = (filler + _completed_event(_REAL_FIELDS + b"," + _NESTED_DETAILS))[-65536:]
     assert protocols.openai_usage(b"", tail) == (4388, 6, 4224, None)
+
+
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", ": "), (",", " : \t")])
+@pytest.mark.parametrize("details_first", [False, True])
+def test_openai_usage_uses_paths_with_json_whitespace_and_nested_usage(separators, details_first):
+    fields = json.loads(b"{" + _REAL_FIELDS + b"}")
+    details = {"attribution": {"usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}},
+               "unknown_detail": {"input_tokens": 1, "output_tokens": 2}}
+    usage = {**details, **fields} if details_first else {**fields, **details}
+    payload = {"type": "response.completed", "response": {"usage": usage},
+               "tool_usage": {"input_tokens": 0, "output_tokens": 0}}
+    raw = json.dumps(payload, separators=separators).encode()
+    assert protocols.openai_usage(b"", raw) == (4388, 6, 4224, None)
+    assert protocols.openai_usage(b"", b"data: " + raw + b"\n\n") == (4388, 6, 4224, None)
+
+
+def test_partial_usage_window_does_not_mistake_details_for_totals():
+    raw = _completed_event(_REAL_FIELDS + b',"attribution":{"padding":"' + b"x" * 70000
+                           + b'","input_tokens":0,"output_tokens":0,"cached_tokens":0}')
+    assert protocols.openai_usage(b"", raw[-65536:]) == (None, None, None, None)
+    observer = protocols.SSEObserver(protocols.OPENAI)
+    for start in range(0, len(raw), 4093):
+        observer.feed(raw[start:start + 4093])
+    assert observer.ended
+    assert observer.usage == (4388, 6, 4224, None)
+
+
+def test_openai_usage_never_reads_body_text_or_arbitrary_nested_objects():
+    raw = json.dumps({"output": [{"usage": {"input_tokens": 123, "output_tokens": 9}}]}).encode()
+    assert protocols.openai_usage(b"", raw) == (None, None, None, None)
+    assert protocols.openai_payload_usage({"usage": {"input_tokens": True, "output_tokens": -1,
+                                                   "input_tokens_details": {"cached_tokens": 1.5}}}) == (None, None, None, None)
