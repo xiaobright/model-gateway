@@ -4,6 +4,9 @@
 
 - 扫描是**只读**的，而且一个站挂了不能拖垮整轮（那个分组单独报错，其余照常出结果）；
 - 提交是**幂等**的：同一批勾选点两次不该报错，也不该产生第二条候选。
+
+「默认勾选 exact / alias」的规则只实现在前端（web/app.js 按 level 判断），后端
+扫描接口只吐 level 字符串，没有对应的勾选函数 —— 那条规则由 Web 测试守着。
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import pytest
 
 from helpers import MockUpstream, add_group, add_upstream, cands, provider_id
 from gateway import model_batch
-from gateway.model_batch import ALIAS, EXACT, FUZZY, PARTIAL, is_exact, score
+from gateway.model_batch import ALIAS, EXACT, FUZZY, PARTIAL, score
 
 
 # ---------------------------------------------------------------- 匹配
@@ -38,12 +41,6 @@ def test_score_levels(model, query, level):
 def test_unrelated_or_too_short_queries_score_zero(model, query):
     """一个字符的查询会把整个站的模型都拉进来，等于没查。"""
     assert score(model, query) == 0
-
-
-def test_only_near_names_are_preselected():
-    """默认勾选只给「就是它」的那些 —— 部分匹配要人自己认。"""
-    assert is_exact(EXACT) and is_exact(ALIAS)
-    assert not is_exact(PARTIAL) and not is_exact(FUZZY)
 
 
 def test_strip_vendor_keeps_the_last_segment():

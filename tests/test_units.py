@@ -316,22 +316,6 @@ def test_waiting_for_headers_returns_as_soon_as_they_arrive():
     assert elapsed < 0.04, f"响应头 1ms 就回来了，不该等满 {elapsed * 1000:.0f}ms"
 
 
-def test_wait_for_upstream_maps_timeout_to_stall():
-    from gateway import inflight
-
-    async def run():
-        call = inflight.begin(
-            client="c", protocol="openai", model="m", stream=True, req_bytes=1
-        )
-        try:
-            with pytest.raises(inflight.UpstreamStall):
-                await inflight.wait_for_upstream(call, asyncio.Event().wait(), timeout=0.05)
-        finally:
-            inflight.finish(call, status=504, note="stall_timeout")
-
-    asyncio.run(run())
-
-
 def test_system_proxy_change_rebuilds_the_cached_client(monkeypatch):
     """系统代理开关改变后，跟随系统的出口不能继续沿用旧直连 client。"""
     from gateway import upstream

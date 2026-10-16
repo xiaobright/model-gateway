@@ -104,11 +104,6 @@ def match_level(value: float) -> str:
     return LEVELS.get(value, "")
 
 
-def is_exact(value: float) -> bool:
-    """默认勾选只给「就是它」的那些：完全同名，或去掉厂商前缀后同名。"""
-    return value >= ALIAS
-
-
 def enabled_groups() -> tuple[db.Group, ...]:
     """所有启用供应商下启用的分组。停用的站/分组不打扰 —— 扫描不替人做启用决定。"""
     rows = db.list_upstreams()
@@ -142,10 +137,6 @@ class GroupMatch:
     @property
     def best(self) -> float:
         return self.matches[0][1] if self.matches else 0.0
-
-    @property
-    def exacts(self) -> tuple[str, ...]:
-        return tuple(name for name, value in self.matches if is_exact(value))
 
     def is_registered(self, name: str) -> bool:
         return name in self.registered

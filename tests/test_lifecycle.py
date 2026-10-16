@@ -125,8 +125,13 @@ def test_completed_response_is_closed_when_waiter_loses_cancellation_race(app):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("path", ["inflight", "headers", "held_read", "close_response"])
-@pytest.mark.parametrize("late_result", [False, True])
+# late_result 只在有 on_cancel 的两条 path 上会产生差异：held_read 直接丢弃迟到的
+# 结果，close_response 根本不调用 operation，那两个分支是同一次运行的重复。
+@pytest.mark.parametrize("path,late_result", [
+    ("inflight", False), ("inflight", True),
+    ("headers", False), ("headers", True),
+    ("held_read", False), ("close_response", False),
+])
 def test_repeated_task_cancellation_waits_for_cleanup_and_disposes_late_response(app, path, late_result):
     async def run():
         entered, closing, release, disposed = (asyncio.Event() for _ in range(4))
@@ -210,15 +215,17 @@ def test_repeated_task_cancellation_waits_for_cleanup_and_disposes_late_response
     asyncio.run(run())
 
 
+# 字段顺序不影响结构化取值，这条不变量由 test_backend_boundaries 的参数化钉住；
+# 这里只留两条真实不同的解析入口（流式观察器 / 非流式整包 JSON），明细刻意排在
+# 真数前面——历史上按位置或按「最后一次出现」取的实现就是在这里栽的。
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("details_first", [False, True])
-def test_large_structured_responses_usage_survives_chunks_and_tail_eviction(app, monkeypatch, stream, details_first):
+def test_large_structured_responses_usage_survives_chunks_and_tail_eviction(app, monkeypatch, stream):
     configure_routes("openai")
     totals = {"input_tokens": 4388, "output_tokens": 6, "input_tokens_details": {"cached_tokens": 4224}}
     details = {"attribution": {"items": [{"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
                                          "echo": 'code { \\" braces }'}] * 1300,
                                "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}}}
-    usage = {**details, **totals} if details_first else {**totals, **details}
+    usage = {**details, **totals}
     raw = json.dumps({"type": "response.completed", "response": {"usage": usage},
                       "tool_usage": {"input_tokens": 0, "output_tokens": 0}}).encode()
     if stream:
@@ -297,7 +304,9 @@ def test_response_send_failure_closes_even_an_unstarted_relay(app, monkeypatch, 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("old_mode", ["", "direct", "http://127.0.0.1:7890"])
+# "" 是跟随系统出口：缓存键是 tuple，get_client 里还要按系统代理快照退役其它池，
+# 是唯一的不同代码路径；direct 作为 other_mode 在两条分支里都已跑到。
+@pytest.mark.parametrize("old_mode", ["", "http://127.0.0.1:7890"])
 def test_supplier_egress_update_retires_pool_without_cutting_active_stream(app, monkeypatch, old_mode):
     provider = db.create_upstream("primary", "https://primary.example", egress=old_mode)
 

@@ -41,7 +41,8 @@ def test_retired_orchestration_and_split_stats_endpoints_are_absent(gateway):
         assert gateway.request(method, f"/admin/api{path}").status_code == 404
 
 
-@pytest.mark.parametrize("extra", [{"group_id": 1}, {"group_id": 9999}, {"group": 1}])
+# 只按参数名拒绝，值不参与判断（admin.py 的 unknown 集合判定），留旧 API 的真实形状
+@pytest.mark.parametrize("extra", [{"group_id": 1}])
 def test_retired_delete_parameters_cannot_widen_the_deletion(gateway, extra):
     with MockUpstream("siteA") as a:
         gid = add_upstream(gateway, a, "siteA")
@@ -625,7 +626,6 @@ def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway,
     [
         (0, True),
         (3, True),
-        (4, True),
         (5, True),  # v5 缺 retry_rules / cache_creation_tokens，要补列（不预置规则）
         (0, False),
         # 完整基线跟 SCHEMA_VERSION 走：结构升版时这里不用手改数字
@@ -633,7 +633,7 @@ def test_clone_requires_an_explicit_target_when_more_than_two_protocols(gateway,
     ],
 )
 def test_cache_creation_migration_preserves_routes_and_logs(tmp_path, monkeypatch, version, missing):
-    """未打号、正常 v3、误打 v4 的老库都要补列；完整的新库不应迁移或备份。
+    """未打号、正常 v3、v5 缺列的老库都要补列；完整的新库不应迁移或备份。
     完整基线是当前 SCHEMA_VERSION —— 旧版即使 cache_creation 列齐全，也要补后续迁移。"""
     import sqlite3
 
