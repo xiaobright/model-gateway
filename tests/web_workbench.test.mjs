@@ -91,7 +91,7 @@ test('批量添加新模型时保留旧气泡位置，新气泡寻找空位', ()
 /* 路由视图的滚动钉死：内容长度变化不许把用户的视口夹回去。
    文档高度用变量模拟：get scrollHeight 时按浏览器规则把 scrollTop 夹到
    「总高 - 视口」内，替换 innerHTML 后的强制布局就会走到这条夹紧逻辑。 */
-function routePadHarness({ desktop = true } = {}) {
+function routePadHarness({ desktop = true, reduced = false } = {}) {
   const source = readFileSync(new URL('../web/route-view.js', import.meta.url), 'utf8')
     .replace(/^import [\s\S]*? from '[^']+';\r?\n/gm, '').replace(/^export /gm, '');
   Object.assign(util.state, {
@@ -128,7 +128,7 @@ function routePadHarness({ desktop = true } = {}) {
   const context = vm.createContext({
     ...util, ...canvasModel, routeKey: canvasModel.modelKey, fadeIn: () => {},
     enterStagger: () => {}, animateDetailSwap: () => {}, captureRects: () => new Map(),
-    flipElements: () => {}, pulse: () => {},
+    flipElements: () => {}, pulse: () => {}, reduceMotion: () => reduced,
     requestAnimationFrame: (fn) => fn(),
     $: element, document: { documentElement, activeElement: null }, window: win,
   });
@@ -198,11 +198,24 @@ test('窄屏不留白，点选后照旧 scrollIntoView 到详情', () => {
   const h = routePadHarness({ desktop: false });
   h.routes([tallRow(), shortRow()]);
   let intoView = 0;
-  h.element('route-detail').scrollIntoView = () => { intoView++; };
+  h.element('route-detail').scrollIntoView = options => { intoView++; assert.equal(options.behavior, 'smooth'); };
   h.setNatural(1000);
   h.win.scrollY = 700;
   vm.runInContext("selectRouteWorkspace('short', 'openai')", h.context);
   assert.equal(intoView, 1, '窄屏仍把详情滚进视口');
   assert.equal(h.pad.style.height, undefined, '窄屏整个跳过钉高度');
   assert.equal(h.win.scrollY, 700, 'pin 没跑，滚动交给浏览器');
+});
+
+test('窄屏跟随系统减少动态效果，立即定位详情且不启动平滑滚动', () => {
+  const h = routePadHarness({ desktop: false, reduced: true });
+  h.routes([tallRow(), shortRow()]);
+  let calls = 0;
+  h.element('route-detail').scrollIntoView = options => {
+    calls++;
+    assert.equal(options.behavior, 'instant');
+    assert.equal(options.block, 'start');
+  };
+  vm.runInContext("selectRouteWorkspace('short', 'openai')", h.context);
+  assert.equal(calls, 1);
 });

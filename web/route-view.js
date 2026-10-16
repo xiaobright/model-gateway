@@ -3,7 +3,7 @@
    选中模型按「名字 + 接口」保存，刷新、筛选和删除后重新校验。 */
 import { $, state, esc, fmtInt, fmtSec, fmtLeft, protocolOn, PROTO_LABEL, splitOneM } from './util.js';
 import { modelKey as routeKey, orderedCandidates, forwardPath, usable } from './canvas-model.js';
-import { fadeIn, enterStagger, animateDetailSwap, captureRects, flipElements, pulse } from './motion.js';
+import { fadeIn, enterStagger, animateDetailSwap, captureRects, flipElements, pulse, reduceMotion } from './motion.js';
 
 let selectedRouteKey = null;
 let lastFilterSig = null;
@@ -143,7 +143,9 @@ export function selectRouteWorkspace(model, protocol) {
     const selectedRow = $('route-list')?.querySelector('.route.is-selected');
     if (selectedRow) pulse(selectedRow, { duration: 360 });
   }
-  if (window.matchMedia?.('(max-width: 1100px)').matches) $('route-detail')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  if (window.matchMedia?.('(max-width: 1100px)').matches) {
+    $('route-detail')?.scrollIntoView({ block: 'start', behavior: reduceMotion() ? 'instant' : 'smooth' });
+  }
 }
 
 export function renderRouteWorkspace() {

@@ -10,7 +10,7 @@ import {
 import { orderedCandidates, attemptOrder, forwardPath, forwardTargets, moveCandidate } from './canvas-model.js';
 import {
   enterStagger, slideIn, captureRects, flipElements,
-  animateCanvasCamera, animateBubbleSelect, animateMenuOpen, springAnimate, SPRING,
+  animateCanvasCamera, animateBubbleSelect, animateMenuOpen, springAnimate, SPRING, openDialog, closeDialog,
 } from './motion.js';
 
 /* ---------------------------------------------------------------- 注入 */
@@ -701,7 +701,7 @@ export function openForwardDialog(model, proto) {
   if (row.forward_to) $('cv-fwd-target').value = row.forward_to;
   $('cv-fwd-clear').hidden = !row.forward_to;
   $('cv-fwd-save').textContent = row.forward_to ? '改指' : '交接';
-  $('cv-fwd-dialog').showModal();
+  openDialog($('cv-fwd-dialog'));
 }
 
 export async function saveForward() {
@@ -710,14 +710,14 @@ export async function saveForward() {
   if (!target) return toast('先选一个目标模型', 'err');
   const pending = fwdEditing;
   await setForward(pending.model, pending.proto, target);
-  if (fwdEditing === pending) $('cv-fwd-dialog').close();
+  if (fwdEditing === pending) await closeDialog($('cv-fwd-dialog'));
 }
 
 export async function clearForwardFromDialog() {
   if (!fwdEditing) return;
   const pending = fwdEditing;
   await clearForward(pending.model, pending.proto);
-  if (fwdEditing === pending) $('cv-fwd-dialog').close();
+  if (fwdEditing === pending) await closeDialog($('cv-fwd-dialog'));
 }
 
 /* ---------------------------------------------------------------- 手势 */

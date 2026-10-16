@@ -5,7 +5,7 @@
    - vector-effect="non-scaling-stroke" 锁定线宽 */
 
 import { esc } from './util.js';
-import { SPRING } from './motion.js';
+import { SPRING, springAnimate } from './motion.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 const VW = 300;   // 虚拟坐标系宽
@@ -119,15 +119,19 @@ export function donut(pct, { size = 66, thickness = 7 } = {}) {
   label.className = 'donut-label';
   shell.append(label);
 
+  let lastValue = null;
   const set = (value) => {
     const p = Math.max(0, Math.min(100, Number(value) || 0));
+    if (p === lastValue) return;
+    lastValue = p;
     label.textContent = Math.round(p) + '%';
     const offset = c * (1 - p / 100);
-    if (reduce() || typeof arc.animate !== 'function') { arc.setAttribute('stroke-dashoffset', offset); return; }
-    arc.animate(
-      [{ strokeDashoffset: arc.getAttribute('stroke-dashoffset') || c }, { strokeDashoffset: offset }],
-      { duration: 680, easing: SPRING.bouncy, fill: 'forwards' },
-    ).finished.catch(() => {}).finally(() => arc.setAttribute('stroke-dashoffset', offset));
+    const from = (typeof getComputedStyle === 'function' && getComputedStyle(arc).strokeDashoffset)
+      || arc.getAttribute('stroke-dashoffset') || c;
+    // 最终值先落在 SVG 上；动画结束或被系统减弱/后台取消后自然显示最新值。
+    arc.setAttribute('stroke-dashoffset', offset);
+    springAnimate(arc, [{ strokeDashoffset: from }, { strokeDashoffset: offset }],
+      { duration: 680, easing: SPRING.bouncy });
   };
   set(pct);
   return { node: shell, set };
@@ -231,7 +235,7 @@ export function areaChart(points, bucket, { onHover } = {}) {
     lineTok.setAttribute('d', splinePath(coordsTok));
 
     if (changed && !reduce() && typeof plotG.animate === 'function' && plotG.getClientRects?.().length) {
-      plotG.animate(
+      springAnimate(plotG,
         [
           { opacity: 0.45, transform: 'scaleY(0.86)' },
           { opacity: 1, transform: 'scaleY(1)' },

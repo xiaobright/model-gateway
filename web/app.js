@@ -14,7 +14,7 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import * as views from './views.js';
-import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition, animateViewEnter, syncSegMarkers, enterStagger, springAnimate, SPRING } from './motion.js';
+import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition, animateViewEnter, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog } from './motion.js';
 import { STYLES, DEFAULT_STYLE, normalizeStyle, loadStyle, applyStyle, styleHint } from './theme.js';
 import {
   initCanvas, renderCanvas, renderPool, setCanvasFilter, setCanvasIface,
@@ -262,22 +262,23 @@ function showView(name) {
   state.view = name;
   // 换视图会改文档高度，浏览器可能把滚动位置夹回去；同一次任务里补回来，过渡期间
   // 视口是冻结的，用户看不见这一下。没套上过渡（减弱动效 / 不支持）时退回淡入。
-  const moved = withViewTransition(dir, () => {
+  const viewEl = document.querySelector(`.view[data-view="${name}"]`);
+  withViewTransition(dir, () => {
     const y = window.scrollY;
     paintView(name);
+    if (name === 'canvas') { renderCanvas(); renderPool(); }
+    if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
+    if (name === 'routes') views.renderRoutes();
+    if (name === 'settings') views.renderPolicies();
     if (window.scrollY !== y) window.scrollTo(0, y);
+  }, (moved) => {
+    if (currentView !== name) return;
+    if (!moved) slideIn(viewEl);
+    animateViewEnter(viewEl, dir, { withVt: moved });
   });
   history.replaceState(null, '', '#' + name);
   if (name === 'log' && state.protocolsReady) run(null, refreshLog);
   if (name === 'live') run(null, refreshInflight);
-  // 画布的坐标是第一次进来才拉的，别拖慢启动；进来之后每次刷新都会重画
-  if (name === 'canvas') { renderCanvas(); renderPool(); }
-  if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
-  if (name === 'routes') views.renderRoutes();
-  if (name === 'settings') views.renderPolicies();
-  const viewEl = document.querySelector(`.view[data-view="${name}"]`);
-  if (!moved) slideIn(viewEl);
-  animateViewEnter(viewEl, dir, { withVt: moved });
 }
 
 /* ---------------------------------------------------------------- 时间窗 */
@@ -496,7 +497,7 @@ function showAccess() {
       Anthropic 接口下的模型，反之同理。没配过的名字会 404（只有认得出档位关键字的才会被兜到
       同接口、同档位那条配置上）。fable 档没有对应的环境变量，在 Claude Code 里用 <code>/model</code> 选。
     </p>`;
-  $('access-dialog').showModal();
+  openDialog($('access-dialog'));
 }
 
 /* ---------------------------------------------------------------- 两级选择器 */
@@ -638,7 +639,7 @@ async function openUpstream(id) {
   hint.hidden = Boolean(u);
   if (!u) hint.innerHTML = '保存后就能在这里加第一个分组：选接口（Anthropic Messages / OpenAI Responses / Chat Completions）＋ 填那把 key。';
   $('up-dialog').dataset.upstreamSession = String(seq);
-  $('up-dialog').showModal();
+  openDialog($('up-dialog'));
   views.renderUpGroups();      // 已有的供应商在这儿直接管分组，不用回列表里展开
   $('up-name').focus();
 }
@@ -857,7 +858,7 @@ async function openGroup(upstreamId, gid) {
   $('grp-import').hidden = !g;
   renderPicker();
   $('group-dialog').dataset.groupSession = String(token.seq);
-  $('group-dialog').showModal();
+  openDialog($('group-dialog'));
   if (g) {
     // 编辑已有分组：核心操作是勾选上游模型，而字段区较高、列表在下方，
     // 打开就把列表带进视野，别让用户以为「拉到的模型显示不出来」。
@@ -1284,7 +1285,7 @@ function openRoute(model, rid, proto) {
   // 顺序只在「改某个候选」时能调：新增的那条还不在链上
   $('rt-order-wrap').hidden = !cand;
   orderHint();
-  $('route-dialog').showModal();
+  openDialog($('route-dialog'));
   (model ? $('rt-remote') : $('rt-model')).focus();
 }
 
@@ -1381,7 +1382,7 @@ async function saveRoute() {
   // and reopened while it was in flight, its result must not close or toast
   // the newer editor session.
   if (routeRemoteSeq !== seq) return;
-  $('route-dialog').close();
+  closeDialog($('route-dialog'));
   toast(cand ? '已保存' : '已添加', 'ok');
 }
 
@@ -1448,7 +1449,7 @@ function openSearch() {
   fillSearchGroups(up ? up.id : '', gid);
   $('sr-model').value = target.model || '';
   syncSearchFields();
-  $('search-dialog').showModal();
+  openDialog($('search-dialog'));
 }
 
 async function saveSearch() {
@@ -1470,7 +1471,7 @@ async function saveSearch() {
   await refreshConfig();
   // 请求在途时弹窗被关掉又重开：旧响应不能去关新会话的弹窗
   if (seq !== searchDialogSeq) return;
-  $('search-dialog').close();
+  closeDialog($('search-dialog'));
   toast(message, 'ok');
 }
 
@@ -1620,7 +1621,7 @@ function openBatchAdd() {
   $('batch-count').textContent = '';
   $('batch-picker').innerHTML = '';
   syncBatchSelection();
-  $('batch-dialog').showModal();
+  openDialog($('batch-dialog'));
   $('batch-model').focus();
 }
 
@@ -1808,7 +1809,7 @@ const ACTIONS = {
   'set-theme': ({ themeChoice }, el) => setTheme(themeChoice, el),
   'set-style': ({ style }, el) => setStyle(style, el),
 
-  'close-dialog': (_d, el) => el.closest('dialog').close(),
+  'close-dialog': (_d, el) => closeDialog(el.closest('dialog')),
 
   'new-upstream': () => openUpstream(null),
   'edit-upstream': ({ uid }) => openUpstream(Number(uid)),
@@ -1819,9 +1820,7 @@ const ACTIONS = {
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed && sel.toString().trim()) return;
     const id = Number(uid);
-    if (state.openUpstreams.has(id)) state.openUpstreams.delete(id);
-    else state.openUpstreams.add(id);
-    views.renderUpstreams();
+    return views.toggleUpstreamGroups(id);
   },
 
   'toggle-upstream': async ({ uid }, el) => {

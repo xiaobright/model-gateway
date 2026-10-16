@@ -49,6 +49,7 @@
   --spring-smooth: cubic-bezier(.16, 1, .3, 1);
   --spring-bouncy: cubic-bezier(.22, 1.36, .36, 1);
   --spring-gentle: cubic-bezier(.2, .96, .28, 1);
+  --spring-exit: cubic-bezier(.32, 0, .67, 0);
   --mono: "SF Mono", Consolas, "Liberation Mono", monospace;
 }
 @supports (transition-timing-function: linear(0, 1)) {
@@ -405,6 +406,8 @@ dialog::backdrop {
   backdrop-filter: blur(4px);
   animation: backdrop-in .32s var(--spring-smooth);
 }
+dialog[data-closing]::backdrop { animation: backdrop-out .18s var(--spring-exit) forwards; }
+@keyframes backdrop-out { to { opacity: 0; backdrop-filter: blur(0px); } }
 :root[data-theme="dark"] dialog::backdrop { background: rgba(0, 0, 0, .6); }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) dialog::backdrop { background: rgba(0, 0, 0, .6); }

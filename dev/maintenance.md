@@ -594,7 +594,7 @@ uv run .venv\Scripts\python.exe -m pytest --full -q -p no:cacheprovider --durati
 
 ### 前端检查
 
-动效生命周期与帧合并单跑 `node --test tests/web_motion.test.mjs`；涉及页面切换或路由选择时，同时检查 `tests/web_app.test.mjs` 与 `tests/web_workbench.test.mjs`。
+动效生命周期与帧合并单跑 `node --test tests/web_motion.test.mjs`；涉及页面切换或路由选择时，同时检查 `tests/web_app.test.mjs` 与 `tests/web_workbench.test.mjs`。真实动画与布局用 `node dev/check-motion.mjs 8341`，先启动下文的隔离工作台；脚本使用临时 Chrome 配置，不连接正式端口。
 
 没有 npm 构建步骤，直接检查原生 JavaScript：
 
@@ -684,11 +684,13 @@ node dev/verify-batch-add.mjs 8399
 
 明暗（`data-theme`：auto/light/dark）与风格（`data-style`）是两个正交的轴，选择分别记在本机 `mg-theme`、`mg-style`，不随网关配置走，也不进数据库。控件在设置页「外观」卡片，侧栏保留明暗圆钮做快捷切换；两个入口改同一份状态，`applyTheme` 会顺手同步分段选中。风格皮肤只重新声明 `style.css` `:root` 里的同一批 token（契约注释在文件开头），两套明暗值各自用 `light-dark()` 给，`color-scheme` 仍由 `data-theme` 决定；没声明的 token 继承默认值，所以皮肤可以只写自己要改的那几个。新增风格 = `web/theme.js` 的 `STYLES` 登记一行 + `style.css` 加一段 `:root[data-style="id"]`，JS 不用动；id 只用小写字母、数字和连字符（会拼进属性选择器）。`canvas.css` 用同一批 token，画布跟着风格走。明暗和风格切换共用 `app.js` 的 `withCircleReveal` 圆形揭开，与视图过渡互斥、dpr 非 1 时用百分比半径这些规则不变。
 
-侧栏提供「标准 / 轻量」动效切换并本地记忆：标准包含环境流动与单个悬停面板的光感，轻量保留短交互动画。系统减少动态效果优先；页面隐藏暂停环境动画并取消动效模块待执行的帧。鼠标光感按帧合并，只更新一个当前容器，离开、滚动、打开弹窗、切入后台时清除，无常驻 JS 动画循环。
+侧栏提供「标准 / 轻量」动效切换并本地记忆：标准包含环境流动与单个悬停面板的光感，轻量保留短交互动画。系统减少动态效果优先；页面隐藏暂停环境动画并取消动效模块待执行的帧。窄屏路由定位在系统减弱时使用立即滚动。JS 弹簧曲线读取 CSS 的 `--spring-*` token，有限动画通过 `springAnimate` 登记；环形图先写最新 SVG 数值，再过渡，完成或取消后都显示最新值。鼠标光感按帧合并，只更新一个当前容器，离开、滚动、打开弹窗、切入后台时清除，无常驻 JS 动画循环。
 
-视图切换用 View Transitions 把 `.main` 的新旧两块横向错开推过来（`style.css` 的 `data-vt-dir`，`motion.js` 的 `withViewTransition`），侧栏不参与。它和明暗切换的圆形揭开互斥：圆形要摘掉所有 `view-transition-name`，两条路同时跑会互相抢名字把页面撕开，所以在 `app.js` 里互相挡着；`.main` 上的 `will-change: filter` 让它在名字被临时摘掉时仍是 backdrop root，收尾才不会整块跳色。换视图会改文档高度，`paintView` 包在过渡回调里、同一次任务内把 `scrollY` 夹回来。`withViewTransition` 返回是否真套上了过渡，没套上时调用方自己补淡入。连点导航会打断上一次过渡，靠序号保证旧过渡的收尾不擦掉新方向。
+视图切换用 View Transitions 把 `.main` 的新旧两块横向错开推过来（`style.css` 的 `data-vt-dir`，`motion.js` 的 `withViewTransition`），侧栏不参与。它和明暗切换的圆形揭开互斥：圆形要摘掉所有 `view-transition-name`，两条路同时跑会互相抢名字把页面撕开，所以在 `app.js` 里互相挡着；`.main` 上的 `will-change: filter` 让它在名字被临时摘掉时仍是 backdrop root，收尾才不会整块跳色。换视图会改文档高度，显示和渲染包在过渡回调里、同一次任务内把 `scrollY` 夹回来。内部级联在 `ready` 后通过第三个回调启动，避免目标页尚未显示时跳过；过渡不支持或被跳过则补淡入。连点导航靠序号保证旧过渡不播放过时入场，也不擦掉新方向。
 
-健康度与热度这两处条形列表换数据时，`motion.js` 的 `readBarWidths` / `morphBars` 按 `data-key` 把旧宽度还给新条、下一帧放开，让条从旧值长到新值（重建 DOM 的话新元素一插进来就是目标宽度，CSS 过渡没有起点就不触发）。其余零碎动效——toast 进场、侧栏活跃指示灯呼吸、标签页下划线、分段选中微弹——都是有限时长的 CSS，不占 JS 帧。
+健康度与热度这两处条形列表换数据时，`motion.js` 的 `readBarWidths` / `morphBars` 按 `data-key` 把旧宽度还给新条、提交样式后下一帧放开，让条从旧值长到新值；只给新增条目播放入场。冷却列表按分组复用节点，倒计时只改文字。新日志的淡入和高亮使用一条组合动画，避免互相取消。
+
+弹窗统一用 `openDialog` / `closeDialog`，关闭时保留 top layer 到 180ms 退场完成，Esc 和确认框提交也走此入口；关闭途中重开会取消旧关闭。分组展开和收起过渡单元格内容高度及内边距，动画结束清除临时壳，保留原有控件。
 侧栏高度锁在 `100vh - 72`（`min/max-height` 成对，超出在栏内滚动）：sticky 的约束矩形是所在 grid 行，行底比文档底高出一个 shell 下内边距，侧栏高于 `100vh - 72` 时滚到底会被行底顶着上移。改这两个值或 shell 的上下内边距时保持「下内边距 - 上内边距 = 48」的关系，否则位移会回来；760px 以下的堆叠布局已解除锁定。
 画布隐藏时不加载布局、不重建节点，也不循环请求动画帧；可见后通过尺寸观察器完成首次适配。
 路由视图（宽于 1100px）钉死滚动位置：右卡或列表变短时，浏览器布局后会把 `scrollTop` 夹回可用范围，看起来就是「闪回去」。`route-view.js` 用视图尾部一块留白把文档兜到「当前滚动位置 + 视口」高，同一次任务内补齐（抓 `scrollY` 必须在改 DOM 之前），用户往上滑、内容再次变高或缩到窄屏时按需收回；改变窗口高度按记住的位置重新兜住。切换模型的入场动画只用淡入，不带位移。

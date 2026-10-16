@@ -86,15 +86,16 @@ function harness(t) {
     setCanvasFilter: noop, setCanvasIface: noop, saveForward: async () => {},
     toast: (...args) => h.toasts.push(args), run: (_el, fn) => fn(), confirmBox: async () => true,
     requestAnimationFrame: (fn) => fn(), setInterval: (fn, ms) => h.timers.push({ fn, ms }),
-    withViewTransition: (dir, fn) => {
-      if (!h.vt.runs) { fn(); return false; }
-      h.vt.calls.push(dir); fn(); return true;
+    withViewTransition: (dir, fn, afterPaint) => {
+      if (!h.vt.runs) { fn(); afterPaint?.(false); return false; }
+      h.vt.calls.push(dir); fn(); afterPaint?.(true); return true;
     },
     reduceMotion: () => motionReduced,
     moveNavMarker: noop, slideIn: (el) => h.slides.push(el), fadeIn: noop, toggleMotion: noop,
     readBarWidths: () => new Map(), morphBars: noop,
     enterStagger: noop, springAnimate: noop, SPRING: { bouncy: 'ease', smooth: 'ease', snappy: 'ease' },
     animateViewEnter: noop, syncSegMarkers: noop,
+    openDialog: dlg => dlg.showModal(), closeDialog: dlg => { dlg.close(); return Promise.resolve(); },
     captureRects: () => new Map(), flipElements: noop, animateDetailSwap: noop, pulse: noop,
     updateNumber: (el, value) => { if (el) el.textContent = value; },
     refreshForTest: () => {

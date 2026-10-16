@@ -22,15 +22,20 @@ function surface() {
     getBoundingClientRect() { node.reads++; return { left: 10, top: 20 }; },
     getClientRects: () => [{}],
     animate(frames, options) {
+      let resolve, reject;
+      const finished = new Promise((yes, no) => { resolve = yes; reject = no; });
+      finished.catch(() => {});
       const animation = events({ frames, options, cancelled: false,
-        cancel() { this.cancelled = true; this.emit('cancel'); } });
+        finished,
+        finish() { this.emit('finish'); resolve(); },
+        cancel() { this.cancelled = true; this.emit('cancel'); reject(new Error('cancelled')); } });
       node.animated.push(animation);
       return animation;
     },
   };
   return node;
 }
-function harness(stored = null) {
+function harness(stored = null, { autoReady = true, springTokens = {}, dialogs = [] } = {}) {
   let serial = 0;
   const frames = new Map();
   const reduced = events({ matches: false });
@@ -44,24 +49,30 @@ function harness(stored = null) {
   const document = events({ documentElement: root, visibilityState: 'visible', modal: false,
     getElementById: id => ({ nav, 'nav-marker': marker, 'motion-toggle': toggle })[id],
     querySelector() { return this.modal ? {} : null; },
+    querySelectorAll: selector => selector === 'dialog' ? dialogs : [],
     startViewTransition(fn) {
-      fn();
-      let settle;
+      let settle, markReady, rejectReady, updateDone;
       const finished = new Promise((resolve) => { settle = resolve; });
-      transitions.push({ settle });
-      return { finished };
+      const ready = new Promise((resolve, reject) => { markReady = resolve; rejectReady = reject; });
+      const updateCallbackDone = new Promise((resolve) => { updateDone = resolve; });
+      const paint = () => { fn(); updateDone(); };
+      transitions.push({ settle, paint, markReady, rejectReady });
+      if (autoReady) Promise.resolve().then(() => { paint(); markReady(); });
+      return { finished, ready, updateCallbackDone };
     },
   });
   const window = events({ matchMedia: query => query.includes('reduced-motion') ? reduced : pointer });
   const storage = { value: stored, getItem() { return this.value; }, setItem(_key, value) { this.value = value; } };
   const context = vm.createContext({ window, document, localStorage: storage,
+    getComputedStyle: el => ({ opacity: '1', transform: 'none',
+      getPropertyValue: key => el === root ? springTokens[key] || '' : '' }),
     ResizeObserver: class { observe() {} disconnect() {} },
     requestAnimationFrame: fn => { frames.set(++serial, fn); return serial; },
     cancelAnimationFrame: id => frames.delete(id),
   });
   vm.runInContext(source, context);
   const api = vm.runInContext('({ initMotion, toggleMotion, moveNavMarker, slideIn, updateNumber,'
-    + ' withViewTransition, readBarWidths, morphBars })', context);
+    + ' withViewTransition, readBarWidths, morphBars, enterHighlight, closeDialog, openDialog, springAnimate })', context);
   const control = api.initMotion();
   const flush = () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(fn => fn()); };
   flush();
@@ -173,16 +184,120 @@ test('导航尺寸变化合并更新，支持移动端两行位置', () => {
   assert.equal(h.frames.size, 0);
 });
 
-test('视图切换：挂上方向、同步改 DOM，收尾后摘掉', async () => {
+test('视图切换：挂上方向，在异步更新回调中改 DOM，收尾后摘掉', async () => {
   const h = harness();
   const order = [];
   assert.equal(h.api.withViewTransition('down', () => order.push('painted')), true);
   assert.equal(h.root.dataset.vtDir, 'down');
+  assert.deepEqual(order, [], '真实 API 在捕获旧快照后异步更新 DOM');
+  await tick();
   assert.deepEqual(order, ['painted'], 'DOM 变更必须在挂上方向之后、过渡之内完成');
   assert.equal(h.transitions.length, 1);
   h.transitions[0].settle();
   await tick();
   assert.equal(h.root.dataset.vtDir, undefined);
+});
+
+test('级联等待新快照 ready；被取代的旧过渡不能播放入场', async () => {
+  const h = harness(null, { autoReady: false });
+  const events = [];
+  h.api.withViewTransition('down', () => events.push('paint A'), moved => events.push(`enter A ${moved}`));
+  h.transitions[0].paint();
+  assert.deepEqual(events, ['paint A'], 'DOM 更新完成仍不能在捕获新快照前播放');
+  h.api.withViewTransition('up', () => events.push('paint B'), moved => events.push(`enter B ${moved}`));
+  h.transitions[0].markReady();
+  h.transitions[1].paint();
+  h.transitions[1].markReady();
+  await tick();
+  assert.deepEqual(events, ['paint A', 'paint B', 'enter B true']);
+});
+
+test('过渡 ready 被跳过时，在更新完成后补入场；减少动效同步显示', async () => {
+  const h = harness(null, { autoReady: false });
+  const calls = [];
+  h.api.withViewTransition('down', () => calls.push('paint'), moved => calls.push(moved));
+  h.transitions[0].rejectReady(new Error('skipped'));
+  await tick();
+  assert.deepEqual(calls, []);
+  h.transitions[0].paint();
+  await tick();
+  assert.deepEqual(calls, ['paint', false]);
+  h.reduced.matches = true;
+  h.api.withViewTransition('up', () => calls.push('reduced paint'), moved => calls.push(moved));
+  assert.deepEqual(calls, ['paint', false, 'reduced paint', false]);
+});
+
+test('JS 动画采用 CSS 的实际弹簧 token，默认曲线也在初始化后更新', () => {
+  const curve = 'linear(0, 0.42 9%, 0.82 19%, 1.07 41%, 1)';
+  const h = harness(null, { springTokens: { '--spring-bouncy': curve, '--spring-smooth': 'linear(0, 0.5 25%, 1)' } });
+  const a = surface();
+  h.api.slideIn(a);
+  assert.equal(a.animated[0].options.easing, curve);
+  h.api.springAnimate(a, [{ opacity: 0 }, { opacity: 1 }]);
+  assert.equal(a.animated[1].options.easing, 'linear(0, 0.5 25%, 1)');
+});
+
+test('新记录的淡入和高亮同时执行，只有一条未取消的动画', () => {
+  const h = harness(), a = surface();
+  h.api.enterHighlight(a);
+  assert.equal(a.animated.length, 1);
+  assert.equal(a.animated[0].cancelled, false);
+  assert.ok(a.animated[0].frames[0].opacity < 1);
+  assert.match(a.animated[0].frames[0].transform, /translateY/);
+  assert.equal(a.animated[0].frames[0].backgroundColor, 'var(--accent-wash)');
+  assert.equal(a.animated[0].frames.at(-1).transform, 'none');
+});
+
+function dialogSurface() {
+  return Object.assign(surface(), events({ open: true, inert: false, dataset: {}, closes: 0,
+    close(value) { this.open = false; this.returnValue = value; this.closes++; },
+    showModal() { this.open = true; }, getAnimations: () => [] }));
+}
+
+test('弹窗退场完成再关闭，重复关闭只执行一次，并保留确认结果', async () => {
+  const h = harness(), dlg = dialogSurface();
+  const closing = h.api.closeDialog(dlg, 'ok');
+  assert.equal(h.api.closeDialog(dlg, 'cancel'), closing);
+  assert.equal(dlg.open, true);
+  assert.equal(dlg.inert, true);
+  dlg.animated[0].finish();
+  await closing;
+  assert.equal(dlg.open, false);
+  assert.equal(dlg.inert, false);
+  assert.equal(dlg.dataset.closing, undefined);
+  assert.equal(dlg.closes, 1);
+  assert.equal(dlg.returnValue, 'ok');
+});
+
+test('关闭未完成就重开弹窗，旧动画结束不能关掉新窗口', async () => {
+  const h = harness(), dlg = dialogSurface();
+  const closing = h.api.closeDialog(dlg);
+  h.api.openDialog(dlg);
+  await closing;
+  dlg.animated[0].finish();
+  await tick();
+  assert.equal(dlg.open, true);
+  assert.equal(dlg.inert, false);
+  assert.equal(dlg.closes, 0);
+  assert.equal(dlg.animated[0].cancelled, true);
+});
+
+test('Esc 与确认框提交共用退场；切换系统减弱时直接完成关闭', async () => {
+  const dlg = dialogSurface();
+  const h = harness(null, { dialogs: [dlg] });
+  let prevented = 0;
+  dlg.emit('cancel', { preventDefault: () => prevented++ });
+  h.reduced.matches = true;
+  h.reduced.emit('change');
+  await tick();
+  assert.equal(dlg.open, false);
+  assert.equal(prevented, 1);
+  h.api.openDialog(dlg);
+  h.document.emit('submit', { target: { method: 'dialog', closest: () => dlg },
+    submitter: { value: 'ok' }, preventDefault: () => prevented++ });
+  assert.equal(dlg.open, false);
+  assert.equal(dlg.returnValue, 'ok');
+  assert.equal(prevented, 2);
 });
 
 test('连点导航：被打断的旧过渡收尾不能擦掉新方向', async () => {

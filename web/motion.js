@@ -11,19 +11,29 @@ export const reduceMotion = () => Boolean(window.matchMedia?.('(prefers-reduced-
 export const SPRING = {
   snappy: 'cubic-bezier(0.22, 1.18, 0.36, 1)',
   smooth: 'cubic-bezier(0.16, 1, 0.3, 1)',
-  bouncy: 'cubic-bezier(0.22, 1.34, 0.36, 1)',
+  bouncy: 'cubic-bezier(0.22, 1.36, 0.36, 1)',
   gentle: 'cubic-bezier(0.2, 0.96, 0.28, 1)',
   exit: 'cubic-bezier(0.32, 0, 0.67, 0)',
 };
 
 const animations = new Map();
-const spring = SPRING.smooth;
+
+// CSS token 是页面实际使用的曲线（包括 linear() 回弹）；JS 动画沿用同一套值。
+function syncSpringCurves() {
+  if (typeof getComputedStyle !== 'function') return;
+  const style = getComputedStyle(document.documentElement);
+  for (const name of Object.keys(SPRING)) {
+    SPRING[name] = style.getPropertyValue(`--spring-${name}`).trim() || SPRING[name];
+  }
+}
+syncSpringCurves();
 
 export function springAnimate(el, frames, options = {}) {
-  if (!el || reduceMotion() || document.visibilityState === 'hidden' || typeof el.animate !== 'function') return null;
-  if (el.getClientRects && !el.getClientRects().length) return null;
+  if (!el) return null;
   animations.get(el)?.cancel();
-  const animation = el.animate(frames, { duration: 360, easing: spring, ...options });
+  if (reduceMotion() || document.visibilityState === 'hidden' || typeof el.animate !== 'function') return null;
+  if (el.getClientRects && !el.getClientRects().length) return null;
+  const animation = el.animate(frames, { duration: 360, easing: SPRING.smooth, ...options });
   animations.set(el, animation);
   const done = () => { if (animations.get(el) === animation) animations.delete(el); };
   animation.addEventListener?.('finish', done, { once: true });
@@ -82,6 +92,15 @@ export function slideIn(el, { duration = 360, distance = 10, axis = 'y' } = {}) 
     ],
     { duration, easing: SPRING.bouncy },
   );
+}
+
+/** 新记录的入场和高亮放在同一条动画里，避免后者取消前者。 */
+export function enterHighlight(el) {
+  animate(el, [
+    { opacity: 0.28, transform: 'translateY(10px) scale(0.985)', backgroundColor: 'var(--accent-wash)' },
+    { opacity: 1, transform: 'scale(1.008)', backgroundColor: 'var(--accent-wash)', offset: 0.55 },
+    { opacity: 1, transform: 'none', backgroundColor: 'transparent' },
+  ], { duration: 520, easing: SPRING.bouncy });
 }
 
 /* 只做轻量丝滑过渡、不大幅位移外框：给「内容换了但视口不许跳动」的场景用（如路由详情切换模型）。 */
@@ -236,18 +255,105 @@ export function flipElements(host, selector, keyOf, prevRects, { duration = 420,
 
 /* ---------------------------------------------------------------- 表格分组展开与折叠面板 */
 
+const rowMotions = new Map();
+
+function animateRowHeights(rows, opening) {
+  const running = [], wrappers = [];
+  if (!rows?.length || reduceMotion() || document.visibilityState === 'hidden') {
+    return { finished: Promise.resolve(), cancel() {} };
+  }
+  const list = [...rows], current = new Map();
+  // 快速展开后立即收起时，先记住可见高度再拆掉上一轮临时壳，避免壳互相嵌套。
+  for (const row of list) {
+    if (!rowMotions.has(row)) continue;
+    for (const cell of row.cells) {
+      const style = getComputedStyle(cell);
+      current.set(cell, { height: `${cell.firstElementChild.getBoundingClientRect().height}px`,
+        padding: { paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, borderBottomWidth: style.borderBottomWidth } });
+    }
+  }
+  for (const previous of new Set(list.map(row => rowMotions.get(row)))) previous?.cancel();
+  for (const [i, row] of list.entries()) {
+    for (const cell of row.cells) {
+      const wrap = document.createElement('div');
+      wrap.style.overflow = 'hidden';
+      while (cell.firstChild) wrap.append(cell.firstChild);
+      cell.append(wrap);
+      wrappers.push({ cell, wrap });
+      const style = getComputedStyle(cell);
+      const full = { paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, borderBottomWidth: style.borderBottomWidth };
+      const zero = { paddingTop: '0px', paddingBottom: '0px', borderBottomWidth: '0px' };
+      const height = `${wrap.offsetHeight}px`;
+      const bodyFull = { height, opacity: 1 }, bodyZero = { height: '0px', opacity: 0 };
+      const start = current.get(cell);
+      const options = { duration: opening ? 300 : 180, delay: opening ? Math.min(i, 8) * 18 : 0,
+        easing: opening ? SPRING.smooth : SPRING.exit, fill: 'both' };
+      running.push(animate(cell, [start?.padding || (opening ? zero : full), opening ? full : zero], options));
+      running.push(animate(wrap, [start ? { height: start.height, opacity: 1 } : (opening ? bodyZero : bodyFull), opening ? bodyFull : bodyZero], options));
+    }
+  }
+  const clean = () => {
+    for (const { cell, wrap } of wrappers) {
+      while (wrap.firstChild) cell.insertBefore(wrap.firstChild, wrap);
+      wrap.remove();
+    }
+    wrappers.length = 0;
+    for (const animation of running) animation?.cancel();
+    for (const row of list) if (rowMotions.get(row) === control) rowMotions.delete(row);
+  };
+  const finished = Promise.all(running.map(a => a?.finished.catch(() => {}))).then(clean);
+  const control = { finished, cancel: clean };
+  for (const row of list) rowMotions.set(row, control);
+  return control;
+}
+
 export function animateExpandRows(rows) {
-  if (!rows || !rows.length || reduceMotion()) return;
-  [...rows].slice(0, 12).forEach((row, i) => {
-    animate(
-      row,
-      [
-        { opacity: 0, transform: 'translate3d(0, -8px, 0)' },
-        { opacity: 1, transform: 'none' },
-      ],
-      { duration: 340, delay: i * 24, easing: SPRING.bouncy, fill: 'backwards' },
-    );
-  });
+  return animateRowHeights(rows, true);
+}
+
+export function animateCollapseRows(rows) {
+  return animateRowHeights(rows, false);
+}
+
+/* 弹窗关闭保留 top layer 到退场结束；重开时取消旧关闭，避免延迟收尾关掉新会话。 */
+const closingDialogs = new Map();
+
+export function openDialog(dialog) {
+  closingDialogs.get(dialog)?.cancel();
+  dialog.showModal();
+}
+
+export function closeDialog(dialog, returnValue) {
+  if (!dialog?.open) return Promise.resolve();
+  if (closingDialogs.has(dialog)) return closingDialogs.get(dialog).finished;
+  const inert = dialog.inert;
+  let resolve;
+  const finished = new Promise(done => { resolve = done; });
+  const pending = { finished, cancel: () => finish(false) };
+  let animation;
+  const finish = (close) => {
+    if (closingDialogs.get(dialog) !== pending) return;
+    closingDialogs.delete(dialog);
+    delete dialog.dataset.closing;
+    dialog.inert = inert;
+    if (close && dialog.open) {
+      if (returnValue === undefined) dialog.close();
+      else dialog.close(returnValue);
+    }
+    animation?.cancel();
+    resolve();
+  };
+  closingDialogs.set(dialog, pending);
+  const style = typeof getComputedStyle === 'function' ? getComputedStyle(dialog) : null;
+  const from = { opacity: style?.opacity || 1, transform: style?.transform || 'none' };
+  for (const current of dialog.getAnimations?.() || []) current.cancel();
+  dialog.dataset.closing = '1';
+  dialog.inert = true;
+  animation = animate(dialog, [from, { opacity: 0, transform: 'translateY(8px) scale(0.98)' }],
+    { duration: 180, easing: SPRING.exit, fill: 'forwards' });
+  if (animation) animation.finished.catch(() => {}).then(() => finish(true));
+  else finish(true);
+  return finished;
 }
 
 /* ---------------------------------------------------------------- 画布与弹窗/Toast 专用弹簧动效 */
@@ -383,16 +489,22 @@ export function animateToastOut(el, onDone) {
    返回是否真的套上了过渡，没套上时调用方自己补一个淡入。 */
 let vtSeq = 0;
 
-export function withViewTransition(dir, mutate) {
+export function withViewTransition(dir, mutate, afterPaint) {
   const root = document.documentElement;
+  const seq = ++vtSeq;
   if (reduceMotion() || typeof document.startViewTransition !== 'function' || root.dataset.vtTheme) {
+    delete root.dataset.vtDir;
     mutate();
+    afterPaint?.(false);
     return false;
   }
   root.dataset.vtDir = dir;
   // 连点导航会把上一次的过渡打断，它的收尾不能把新过渡的方向擦掉
-  const seq = ++vtSeq;
   const vt = document.startViewTransition(mutate);
+  // ready 在新快照捕获之后才兑现；此时目标页已显示，内部 WAAPI 动画能实际播放。
+  vt.ready.then(() => { if (seq === vtSeq) afterPaint?.(true); }).catch(() => {
+    vt.updateCallbackDone.then(() => { if (seq === vtSeq) afterPaint?.(false); }).catch(() => {});
+  });
   vt.finished
     .catch(() => { /* 切换被打断不算错误 */ })
     .finally(() => { if (seq === vtSeq) delete root.dataset.vtDir; });
@@ -452,6 +564,7 @@ export function morphBars(host, prev, fillOf) {
     pending.push({ fill, target });
   }
   if (!pending.length) return;
+  void host.offsetWidth; // 提交旧宽度，避免同一帧的目标值把过渡起点合并掉。
   requestAnimationFrame(() => {
     for (const { fill, target } of pending) {
       fill.style.transition = '';
@@ -505,6 +618,7 @@ export function toggleMotion() { return controller?.toggle(); }
 
 export function initMotion() {
   controller?.dispose();
+  syncSpringCurves();
   const root = document.documentElement;
   const nav = document.getElementById('nav');
   const marker = document.getElementById('nav-marker');
@@ -582,6 +696,11 @@ export function initMotion() {
   }, { passive: true });
   on(document, 'pointerdown', clearLight, { passive: true });
   on(document, 'keydown', clearLight);
+  on(document, 'submit', (event) => {
+    if (event.target?.method !== 'dialog') return;
+    event.preventDefault();
+    closeDialog(event.target.closest('dialog'), event.submitter?.value);
+  });
   on(document, 'toggle', (event) => {
     clearLight();
     // <details class="adv"> 展开时为内部内容播放物理弹簧展开动效
@@ -636,6 +755,9 @@ export function initMotion() {
       dlgObserver.observe(dlg, { attributes: true, attributeFilter: ['open'] });
     }
   }
+  for (const dlg of document.querySelectorAll?.('dialog') || []) {
+    on(dlg, 'cancel', (event) => { event.preventDefault(); closeDialog(dlg); });
+  }
 
   controller = {
     moveMarker,
@@ -648,6 +770,7 @@ export function initMotion() {
     dispose() {
       clearLight();
       stopAnimations();
+      for (const pending of closingDialogs.values()) pending.cancel();
       if (navFrame) cancelAnimationFrame(navFrame);
       observer.disconnect();
       dlgObserver?.disconnect();

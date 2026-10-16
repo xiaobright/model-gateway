@@ -2,7 +2,7 @@
    这个模块会被 views/charts/app 都 import，所以只放无副作用的纯逻辑
    和 DOM 小工具，不碰业务状态以外的东西。 */
 
-import { animateToastOut } from './motion.js';
+import { animateToastOut, openDialog } from './motion.js';
 
 export const $ = (id) => document.getElementById(id);
 
@@ -148,7 +148,7 @@ export function confirmBox({ title, body, ok = '确定', danger = true }) {
   btn.textContent = ok;
   btn.className = 'btn ' + (danger ? 'btn-danger-solid' : '');
   dlg.returnValue = '';
-  dlg.showModal();
+  openDialog(dlg);
   return new Promise((resolve) => {
     dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), { once: true });
   });

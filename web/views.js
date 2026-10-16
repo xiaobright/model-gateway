@@ -6,8 +6,8 @@ import {
   catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import {
-  enterStagger, slideIn, pulse, reduceMotion, updateNumber,
-  readBarWidths, morphBars, animateExpandRows, SPRING, springAnimate,
+  enterStagger, slideIn, pulse, reduceMotion, updateNumber, enterHighlight,
+  readBarWidths, morphBars, animateExpandRows, animateCollapseRows, SPRING, springAnimate, openDialog,
 } from './motion.js';
 import { renderRouteWorkspace, selectRouteWorkspace, initRoutePad as bindRoutePad } from './route-view.js';
 import { requestResult } from './request-result.js';
@@ -166,7 +166,7 @@ export function renderHealth() {
   const widths = readBarWidths(host, (el) => el.querySelector('.h-bar > i'));
   host.innerHTML = next;
   morphBars(host, widths, (el) => el.querySelector('.h-bar > i'));
-  enterStagger(host.children);
+  enterStagger([...host.children].filter(el => !widths.has(el.dataset.key)));
 }
 
 export function renderHot() {
@@ -202,7 +202,7 @@ export function renderHot() {
   host.append(frag);
 
   morphBars(host, prev, (el) => el.querySelector('.bar-fill'));
-  enterStagger(host.children, { step: 22 });
+  enterStagger([...host.children].filter(el => !prev.has(el.dataset.key)), { step: 22 });
 }
 
 /* ================================================================ 模型路由 */
@@ -445,23 +445,40 @@ export function renderBreakers(data) {
     }
     return;
   }
-  const nextHtml = rows.map((b) => {
+  // 按分组复用外层节点；倒计时只改文字，入场仅用于新出现的分组。
+  const existing = new Map([...host.children].filter(el => el.dataset.groupId)
+    .map(el => [el.dataset.groupId, el]));
+  for (const el of [...host.children]) if (!el.dataset.groupId) el.remove();
+  const fresh = [];
+  const retained = new Set();
+  rows.forEach((b, i) => {
+    const key = String(b.group_id);
+    retained.add(key);
+    let el = existing.get(key);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'brk-row';
+      el.dataset.groupId = key;
+      fresh.push(el);
+    }
     const left = b.cooling_ms > 0
-      ? `<span class="tag tag-warn"><span class="dot dot-warn"></span>冷却 ${fmtLeft(b.cooling_ms)}</span>`
+      ? '<span class="tag tag-warn"><span class="dot dot-warn"></span><span data-cooling-label></span></span>'
       : '<span class="tag">冷却期满 · 会放它试一次</span>';
-    return `<div class="brk-row">
+    const html = `
       <span class="brk-name">${esc(groupLabel(b.group_id))}</span>
       ${left}
       <span class="dim">连续失败 ${b.fails} 次${b.last_status ? `，最近 ${b.last_status}` : ''}</span>
       <span class="grow"></span>
       ${b.cooled > 1 ? `<span class="dim">进过 ${b.cooled} 次冷却</span>` : ''}
-    </div>`;
-  }).join('');
-  if (host.__html !== nextHtml) {
-    host.innerHTML = nextHtml;
-    host.__html = nextHtml;
-    enterStagger(host.children, { step: 24, duration: 340, distance: 6 });
-  }
+    `;
+    if (el.__html !== html) { el.innerHTML = html; el.__html = html; }
+    const label = el.querySelector('[data-cooling-label]');
+    if (label) label.textContent = `冷却 ${fmtLeft(b.cooling_ms)}`;
+    if (host.children[i] !== el) host.insertBefore(el, host.children[i] || null);
+  });
+  for (const [key, el] of existing) if (!retained.has(key)) el.remove();
+  host.__html = null;
+  enterStagger(fresh, { step: 24, duration: 340, distance: 6 });
 }
 
 /* ================================================================ 上游站点 */
@@ -573,6 +590,31 @@ function egressTag(u) {
 }
 
 let lastOpenUpstreams = new Set();
+const closingGroups = new Map();
+
+export function toggleUpstreamGroups(id) {
+  const pending = closingGroups.get(id);
+  if (pending) {
+    closingGroups.delete(id);
+    pending.cancel();
+    renderUpstreams();
+    return pending.finished;
+  }
+  if (!state.openUpstreams.has(id)) {
+    state.openUpstreams.add(id);
+    renderUpstreams();
+    return Promise.resolve();
+  }
+  const rows = $('upstream-body').querySelectorAll(`.grp-row[data-parent-uid="${id}"]`);
+  const closing = animateCollapseRows(rows);
+  closingGroups.set(id, closing);
+  return closing.finished.then(() => {
+    if (closingGroups.get(id) !== closing) return;
+    closingGroups.delete(id);
+    state.openUpstreams.delete(id);
+    renderUpstreams();
+  });
+}
 let upstreamsInitialized = false;
 
 export function renderUpstreams() {
@@ -582,6 +624,8 @@ export function renderUpstreams() {
   $('badge-upstreams').textContent = `${on}/${list.length}`;
   renderUpGroups();
 
+  // 关闭只持续 180ms；这期间保留正在收缩的节点，完成后用最新配置重画。
+  if (closingGroups.size) return;
   const tbody = $('upstream-body');
   if (!list.length) {
     tbody.innerHTML =
@@ -692,7 +736,7 @@ export function showRequestDetails(id) {
   $('request-detail-body').innerHTML = resultTag(r) + '<dl class="request-facts">'
     + fields.map(([key, v]) => `<div><dt>${key}</dt><dd>${value(v)}</dd></div>`).join('')
     + '</dl><p class="detail-note">历史记录按尝试保存。完整的请求内重试经过可在实时页查看；这里不推断缺失的轨迹。</p>';
-  $('request-dialog').showModal();
+  openDialog($('request-dialog'));
   const facts = $('request-detail-body').querySelectorAll('.request-facts > div');
   if (facts.length) enterStagger(facts, { step: 18, duration: 320, distance: 6 });
 }
@@ -767,8 +811,7 @@ function insertRows(list, cap) {
   for (const tr of [...tmp.children]) {
     body.prepend(tr);
     known.add(Number(tr.dataset.id));
-    slideIn(tr);
-    pulse(tr);
+    enterHighlight(tr);
   }
   while (body.children.length > cap) {
     const last = body.lastElementChild;
