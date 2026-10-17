@@ -1260,8 +1260,9 @@ def resolve_chain(model_name: str, protocol: str) -> tuple[Route, ...]:
     第一个就是 resolve_route 的答案（生效的那个候选排最前），后面是自动降级的退路，
     顺序由 priority 决定（小的先试）。停用的供应商 / 分组不在里面。
 
-    同一个分组可以出现多次（各指一个不同的上游真名）。站级失败时 proxy 会把整个分组
-    跳掉，只有模型级的 404 才会去试同分组的下一条 —— 见 proxy.forward。
+    同一个分组可以出现多次（各指一个不同的上游真名）。连接失败时 proxy 会把整个分组
+    跳掉（同组共用一个站根、一把 key、一种接口）；站级 HTTP 错误只跳那个真名自己，
+    同分组的其它真名照样试 —— 见 proxy.forward 和 failover.next_index。
 
     档位关键字兜底和 resolve_route 是同一套：先定下实际命中的模型名，再取它的整条链。
     """

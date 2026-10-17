@@ -528,10 +528,14 @@ async def forward(
     fail: Exception | None = None
     # 最后一次真正发出去的候选（不是「下一个要试的」）：502 文案只能怪它
     last_route: db.Route | None = None
-    # 这个请求里站级失败过的分组。整个跳掉（含它下面同模型的其它候选）：同一个站
-    # 绝不在一次请求里立刻重试。候选级的失败（404 / 400 / 422）不进这里 ——
-    # 那是「这个候选不认这条请求」，站本身不一定有毛病
+    # 这个请求里**连接**就没打通过的分组，整个跳掉（含它下面同分组的其它真名）：
+    # 同组候选共用一个站根、一把 key、一种接口，连不上时换个模型名也白费。
+    # 候选级的失败（404 / 400 / 422）不进这里 —— 那是「这个候选不认这条请求」，
+    # 站本身不一定有毛病
     dead_groups: set[int] = set()
+    # 这个请求里拿到响应但状态很差的那个「分组 + 上游真名」，只跳它自己：站是通的，
+    # 同分组的其它真名不一定跟着坏，同一次请求里还该给它机会
+    dead_routes: set[tuple[int, str]] = set()
     # 「实时」那一页的数据来源。record=False 的元数据请求（count_tokens）照样登记 ——
     # 它也会走降级、也会踩断路器，「这个站为什么在被打」的答案有时就是它 —— 但打个
     # meta 标，不计入「进行中」的数字
@@ -555,7 +559,7 @@ async def forward(
         候选顺序就是用户排的，配了几个就试几个 —— 不设尝试次数上限。总时长由
         START_DEADLINE 和每次尝试前的客户端断开检查兜底。
         """
-        return failover.next_index(candidates, index + 1, dead_groups)
+        return failover.next_index(candidates, index + 1, dead_groups, dead_routes)
 
     def abort_request(note: str, *, record_attempt: bool = True) -> JSONResponse:
         """首字前中断：发送等待、重试间隔共用收尾，不把手动取消记成上游故障。"""
@@ -751,7 +755,7 @@ async def forward(
                 fail = None
                 same_mode = True
                 continue
-            failover.note_fail(route.group_id, 502, label)
+            failover.note_fail(route.group_id, route.remote_model, 502, f"{label} {remote}")
             dead_groups.add(route.group_id)
             inflight.failed(call, status=502, note="connect_failed", ms=int(elapsed * 1000))
             if record:
@@ -848,7 +852,7 @@ async def forward(
                 index = nxt
                 continue
         if not site_bad and not candidate_bad:
-            failover.note_ok(route.group_id)
+            failover.note_ok(route.group_id, route.remote_model)
             # 200 截断守卫：这个站的这个模型已经连着几次拿回「没有正文的 200」时，先把
             # 这次响应扣在网关里读完再决定 —— 还是那种空响应就原站原样重发，客户端连
             # 「被截断」都看不到；是正常流式就立刻放行（见 truncation.py）。
@@ -923,8 +927,10 @@ async def forward(
                 won_prelude, won_iter = probe.chunks, chunks_iter
             break
         if site_bad:
-            failover.note_fail(route.group_id, resp.status_code, label)
-            dead_groups.add(route.group_id)
+            # 只记这个「分组 + 上游真名」的失败、只跳它自己：站是通的，同分组的其它
+            # 真名不一定跟着坏，同一次请求里还该给它机会
+            failover.note_fail(route.group_id, route.remote_model, resp.status_code, f"{label} {remote}")
+            dead_routes.add((route.group_id, route.remote_model))
         # 候选级的失败（404 名字没了；400/422 这站不认请求里的某个参数）既不算失败也
         # 不算成功：站是通的、key 是好的。所以不碰断路器，让同组的其它真名和后面的
         # 候选都还有机会

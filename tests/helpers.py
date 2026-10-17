@@ -133,6 +133,17 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
             status_code=404,
         )
 
+    def model_sick(model: str) -> JSONResponse | None:
+        """只有这一个真名回指定状态码，同站的其它真名不受影响 —— 演「一个模型俩名字、
+        不一定同时挂」：冷却和跳过都按上游真名记，不能误伤兄弟真名。"""
+        code = (sick.get("model_status") or {}).get(model)
+        if not code:
+            return None
+        return JSONResponse(
+            {"error": {"message": f"{name} model {model} is sick", "code": code}},
+            status_code=code,
+        )
+
     @app.get("/v1/models")
     def models(request: Request) -> dict:
         # 按 key / 按接口返回不同的模型列表 —— 同一个站的两把 key 能看到的东西常常不一样，
@@ -161,6 +172,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         sick["last_responses"] = body
         if (gone := unknown(body.get("model", ""))) is not None:
             return gone
+        if (bad := model_sick(body.get("model", ""))) is not None:
+            return bad
         if request.url.path.endswith("/responses/compact"):
             return JSONResponse(
                 {
@@ -292,6 +305,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         body = json.loads((await request.body()) or b"{}")
         if (gone := unknown(body.get("model", ""))) is not None:
             return gone
+        if (bad := model_sick(body.get("model", ""))) is not None:
+            return bad
         if body.get("fail"):
             return JSONResponse({"error": {"message": "quota exhausted"}}, status_code=429)
         if body.get("stream"):
@@ -341,6 +356,8 @@ def build_upstream_app(name: str, sick: dict | None = None) -> FastAPI:
         body = json.loads(raw or b"{}")
         if (gone := unknown(body.get("model", ""))) is not None:
             return gone
+        if (bad := model_sick(body.get("model", ""))) is not None:
+            return bad
         echo = {
             "upstream": name,
             "model": body.get("model", ""),
@@ -505,8 +522,9 @@ class MockUpstream:
         # 站根：/v1 由网关按接口自己补，两种接口的路径都在它底下
         self.base_url = f"http://127.0.0.1:{self.port}"
         # 运行中可翻转的「病历」：设了 status 就一律回那个码，用来演故障与恢复；
-        # missing 里的模型名一律回 404，用来演「这个站把某个模型 id 下掉了」
-        self.sick: dict = {"status": None, "missing": set()}
+        # missing 里的模型名一律回 404，用来演「这个站把某个模型 id 下掉了」；
+        # model_status 里的真名只回各自那个码，演「同站一个真名坏、兄弟真名好」
+        self.sick: dict = {"status": None, "missing": set(), "model_status": {}}
         self.app = build_upstream_app(name, self.sick)
         self._server = uvicorn.Server(
             uvicorn.Config(
@@ -527,6 +545,14 @@ class MockUpstream:
         """这个站不再认这几个模型 id（带日期后缀的那种最常被下掉）。"""
         self.sick["missing"].update(names)
 
+    def fail_model(self, name: str, status: int) -> None:
+        """只有这一个上游真名回指定状态码，同站的其它真名照常工作。
+
+        中转站常把同一个模型放在几个别名后面，挂一个不代表挂全部 —— 冷却和跳过
+        候选都按「分组 + 真名」记，这条病历就是演那个场面的。
+        """
+        self.sick["model_status"][name] = status
+
     def set_models(self, *names: str) -> None:
         """这个站 /v1/models 返回的清单。默认给的是 gpt-test / claude-test 那两条。
 
@@ -538,6 +564,7 @@ class MockUpstream:
     def heal(self) -> None:
         self.sick["status"] = None
         self.sick["missing"] = set()
+        self.sick["model_status"] = {}
         self.sick.pop("models", None)
         self.sick.pop("script", None)
 

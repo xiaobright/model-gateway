@@ -17,11 +17,23 @@ def test_invalid_port_shape_uses_the_default(tmp_path, monkeypatch, raw):
 def test_cooldown_stays_capped_after_thousands_of_failures(monkeypatch):
     monkeypatch.setattr(failover, "_states", {})
     monkeypatch.setattr(failover, "log", lambda *args: None)
-    spans = [failover.note_fail(1, 502) for _ in range(2000)]
+    spans = [failover.note_fail(1, "m", 502) for _ in range(2000)]
     assert spans[:6] == [0, 90, 180, 360, 600, 600]
     assert all(span == failover.COOL_MAX for span in spans[4:])
-    failover.note_ok(1)
-    assert failover.note_fail(1, 502) == 0
+    failover.note_ok(1, "m")
+    assert failover.note_fail(1, "m", 502) == 0
+
+
+def test_cooldown_is_per_upstream_model_within_a_group(monkeypatch):
+    """同一个分组下，一个真名连败进冷却，兄弟真名必须毫发无伤。"""
+    monkeypatch.setattr(failover, "_states", {})
+    monkeypatch.setattr(failover, "log", lambda *args: None)
+    for _ in range(failover.COOL_AFTER):
+        failover.note_fail(7, "sick-name", 503)
+    assert failover.cooling(7, "sick-name") > 0
+    assert failover.cooling(7, "healthy-name") == 0, "同组的兄弟真名不该被连带冷却"
+    failover.note_ok(7, "healthy-name")
+    assert failover.cooling(7, "sick-name") > 0, "兄弟真名成功不该清掉别人的冷却"
 
 
 @pytest.mark.parametrize("number", [b"9" * 4400, b"1000000000001"])

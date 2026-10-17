@@ -740,8 +740,8 @@ def test_failover_snapshot_is_safe_while_records_change(monkeypatch):
     def write():
         i = counter["i"]
         counter["i"] = i + 1
-        failover.note_fail(i % 40, 503, "g")
-        failover.note_ok(i % 40)
+        failover.note_fail(i % 40, f"m{i % 7}", 503, "g")
+        failover.note_ok(i % 40, f"m{i % 7}")
 
     def work(out):
         for _ in range(300):

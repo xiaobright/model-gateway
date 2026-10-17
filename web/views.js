@@ -434,7 +434,7 @@ export function renderBreakers(data) {
   const rows = data.breakers || [];
   const total = state.upstreams.reduce((n, u) => n + (u.groups || []).length, 0);
   $('brk-count').textContent = rows.length
-    ? `${rows.length} / ${total} 个分组有状态` : `${total} 个分组`;
+    ? `${rows.length} 个上游模型有状态 · 共 ${total} 个分组` : `${total} 个分组`;
 
   const host = $('brk-list');
   if (!rows.length) {
@@ -445,27 +445,28 @@ export function renderBreakers(data) {
     }
     return;
   }
-  // 按分组复用外层节点；倒计时只改文字，入场仅用于新出现的分组。
-  const existing = new Map([...host.children].filter(el => el.dataset.groupId)
-    .map(el => [el.dataset.groupId, el]));
-  for (const el of [...host.children]) if (!el.dataset.groupId) el.remove();
+  // 一条记录 = 一个「分组 + 上游真名」：同一个分组可以坏一个真名而不坏另一个，
+  // 所以按这两者复用外层节点；倒计时只改文字，入场仅用于新出现的记录。
+  const existing = new Map([...host.children].filter(el => el.dataset.brkKey)
+    .map(el => [el.dataset.brkKey, el]));
+  for (const el of [...host.children]) if (!el.dataset.brkKey) el.remove();
   const fresh = [];
   const retained = new Set();
   rows.forEach((b, i) => {
-    const key = String(b.group_id);
+    const key = `${b.group_id}:${b.remote_model}`;
     retained.add(key);
     let el = existing.get(key);
     if (!el) {
       el = document.createElement('div');
       el.className = 'brk-row';
-      el.dataset.groupId = key;
+      el.dataset.brkKey = key;
       fresh.push(el);
     }
     const left = b.cooling_ms > 0
       ? '<span class="tag tag-warn"><span class="dot dot-warn"></span><span data-cooling-label></span></span>'
       : '<span class="tag">冷却期满 · 会放它试一次</span>';
     const html = `
-      <span class="brk-name">${esc(groupLabel(b.group_id))}</span>
+      <span class="brk-name">${esc(groupLabel(b.group_id))}<span class="dim"> · ${esc(b.remote_model || '')}</span></span>
       ${left}
       <span class="dim">连续失败 ${b.fails} 次${b.last_status ? `，最近 ${b.last_status}` : ''}</span>
       <span class="grow"></span>

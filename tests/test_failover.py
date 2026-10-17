@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from helpers import (
-    MockUpstream, add_upstream, add_route, two_anthropic_sites, route_id, msg,
+    MockUpstream, add_group, add_upstream, add_route, cands, two_anthropic_sites, route_id, msg,
     parse_sse_events, wait_rows, rows_on,
 )
 
@@ -132,7 +132,9 @@ def test_breaker_stops_paying_for_a_dead_site(gateway):
             assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
 
         breakers = gateway.get("/admin/api/failover").json()["breakers"]
-        assert [(x["group_id"], x["fails"], x["cooling_ms"] > 0) for x in breakers] == [(g_a, 2, True)]
+        assert [
+            (x["group_id"], x["remote_model"], x["fails"], x["cooling_ms"] > 0) for x in breakers
+        ] == [(g_a, "claude-opus-4-1", 2, True)]
 
         hits = rows_on(gateway, "siteA")
         assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
@@ -140,18 +142,34 @@ def test_breaker_stops_paying_for_a_dead_site(gateway):
 
 
 def test_manual_switch_clears_the_cooldown(gateway):
-    """手动点了那个圆片就是明确指定，之前的连续失败不该继续把它挡在外面。"""
+    """手动点了那个圆片就是明确指定，之前的连续失败不该继续把它挡在外面。
+
+    只清被切的那一条：同分组其它真名的冷却是它们自己连失败挣来的，不跟着沾光。
+    """
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
-        g_a, _ = two_anthropic_sites(gateway, a, b)
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1")
+        add_route(gateway, "opus", g_a, "claude-opus-4-1-sibling")
+        add_route(gateway, "opus", g_b, "claude-opus-4-5")
         a.fail_with(503)
         for _ in range(2):
             gateway.post("/v1/messages", json=msg("opus"))
-        assert gateway.get("/admin/api/failover").json()["breakers"], "先让它进冷却"
+        breakers = gateway.get("/admin/api/failover").json()["breakers"]
+        assert sorted(x["remote_model"] for x in breakers) == [
+            "claude-opus-4-1", "claude-opus-4-1-sibling",
+        ], "两个真名各自进冷却"
 
         assert gateway.post(
-            "/admin/api/models/switch", json={"route_id": route_id(gateway, "opus", g_a)}
+            "/admin/api/models/switch",
+            json={"route_id": next(
+                c["route_id"] for c in cands(gateway, "opus")
+                if c["group_id"] == g_a and c["remote_model"] == "claude-opus-4-1"
+            )},
         ).json() == {"ok": True}
-        assert gateway.get("/admin/api/failover").json()["breakers"] == []
+        left = gateway.get("/admin/api/failover").json()["breakers"]
+        assert [x["remote_model"] for x in left] == ["claude-opus-4-1-sibling"], \
+            "只清被切候选的冷却，兄弟真名的留着"
 
         hits = rows_on(gateway, "siteA")
         assert gateway.post("/v1/messages", json=msg("opus")).json()["upstream"] == "siteB"
@@ -239,8 +257,12 @@ def test_model_level_404_tries_the_sibling_in_the_same_group(gateway):
             "模型名没了不该让整把 key 进冷却"
 
 
-def test_site_level_failure_skips_the_rest_of_that_group(gateway):
-    """站级失败（503）时同分组的兄弟候选一起跳掉 —— 站都连不上，换个模型名没用。"""
+def test_site_level_failure_tries_the_sibling_upstream_model(gateway):
+    """站级失败（503）时同组的兄弟真名照样试 —— 站是通的，坏的可能只是这一个真名。
+
+    中转站常把同一个模型放在几个别名后面（xxs 的 deepseek-v4.1-flash 就有俩名字），
+    挂一个不代表挂全部。两个真名都坏了才离开这个站，各记各的失败。
+    """
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
         g_a = add_upstream(gateway, a, "siteA", "anthropic")
         g_b = add_upstream(gateway, b, "siteB", "anthropic")
@@ -251,9 +273,79 @@ def test_site_level_failure_skips_the_rest_of_that_group(gateway):
 
         resp = gateway.post("/v1/messages", json=msg("opus"))
         assert resp.status_code == 200 and resp.json()["upstream"] == "siteB"
+        rows = wait_rows(gateway, 3)
+        assert [(r["upstream"], r["remote_model"], r["attempt"], r["note"]) for r in rows] == [
+            ("siteA", "opus-a1", 1, "failed_over"),
+            ("siteA", "opus-a2", 2, "failed_over"),
+            ("siteB", "opus-b", 3, "ok"),
+        ], "a1 坏了先把同组的 a2 试掉，都坏才换站"
+        breakers = gateway.get("/admin/api/failover").json()["breakers"]
+        assert sorted((x["group_id"], x["remote_model"], x["fails"]) for x in breakers) == [
+            (g_a, "opus-a1", 1), (g_a, "opus-a2", 1),
+        ], "两个真名各记各的失败"
+
+
+def test_connect_failure_skips_the_rest_of_that_group(gateway):
+    """连接就没打通时同组真名一起跳：共用一个站根、一把 key、一种接口，
+    TCP 层的事故和路径里的模型名无关，换真名只会让每次失败再多等一遍超时。"""
+    with MockUpstream("siteB") as b:
+        dead = gateway.post(
+            "/admin/api/upstreams", json={"name": "dead", "base_url": "http://127.0.0.1:1"}
+        ).json()
+        g_dead = add_group(gateway, int(dead["id"]), "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_dead, "opus-dead-1")
+        add_route(gateway, "opus", g_dead, "opus-dead-2")
+        add_route(gateway, "opus", g_b, "opus-b")
+
+        resp = gateway.post("/v1/messages", json=msg("opus"))
+        assert resp.status_code == 200 and resp.json()["upstream"] == "siteB"
         rows = wait_rows(gateway, 2)
-        assert [(r["upstream"], r["attempt"]) for r in rows] == [("siteA", 1), ("siteB", 2)]
-        assert rows_on(gateway, "siteA") == 1, "同一个站不该在一次请求里被打两遍"
+        assert [(r["upstream"], r["status"], r["attempt"], r["note"]) for r in rows] == [
+            ("dead", 502, 1, "connect_failed"),
+            ("siteB", 200, 2, "ok"),
+        ]
+        assert rows_on(gateway, "dead") == 1, "连不上时不该换个模型名再打一遍"
+
+
+def test_cooldown_is_per_upstream_model(gateway):
+    """一个站的两把真名不一定同时挂：坏一个只冷它自己，兄弟真名接着当起点用。
+
+    真库里的样子：xxs 同一个分组下 deepseek-v4.1-flash 有俩名字，代表不同上游，
+    挂一个不代表挂全部。按分组冷却会让一个真名的故障把另一个能用的候选一起毙掉。
+    """
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA", "anthropic")
+        g_b = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "opus", g_a, "opus-a1")
+        add_route(gateway, "opus", g_a, "opus-a2")
+        add_route(gateway, "opus", g_b, "opus-b")
+        a.fail_model("opus-a1", 503)
+
+        # 前两发：a1 回 503，同一次请求里 a2 顶上，客户端拿到的是 a2 的结果
+        for _ in range(2):
+            resp = gateway.post("/v1/messages", json=msg("opus"))
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["upstream"] == "siteA"
+            assert resp.json()["model"] == "opus-a2"
+
+        breakers = gateway.get("/admin/api/failover").json()["breakers"]
+        assert [
+            (x["group_id"], x["remote_model"], x["fails"], x["cooling_ms"] > 0) for x in breakers
+        ] == [(g_a, "opus-a1", 2, True)], "只有坏的那个真名进冷却"
+
+        # a1 冷却期间：起点变成 a2，根本不再打 a1
+        hits = rows_on(gateway, "siteA")
+        again = gateway.post("/v1/messages", json=msg("opus"))
+        assert again.json()["model"] == "opus-a2"
+        rows = wait_rows(gateway, 5)
+        assert rows[-1]["remote_model"] == "opus-a2"
+        assert rows_on(gateway, "siteA") == hits + 1, "冷却期内一次都不该再打 a1"
+
+        # 管理页按候选各自显示冷却：a1 冷着，a2 干净
+        by_remote = {c["remote_model"]: c for c in cands(gateway, "opus")}
+        assert by_remote["opus-a1"]["cooling_ms"] > 0
+        assert by_remote["opus-a2"]["cooling_ms"] == 0
 
 
 def test_deleting_a_group_clears_its_breaker(gateway):
@@ -264,7 +356,9 @@ def test_deleting_a_group_clears_its_breaker(gateway):
         for _ in range(2):
             gateway.post("/v1/messages", json=msg("opus"))
         breakers = gateway.get("/admin/api/failover").json()["breakers"]
-        assert any(x["group_id"] == g_a for x in breakers), "先确认它真的进了冷却"
+        assert [(x["group_id"], x["remote_model"]) for x in breakers] == [
+            (g_a, "claude-opus-4-1"),
+        ], "先确认它真的进了冷却"
 
         assert gateway.delete(f"/admin/api/groups/{g_a}").status_code == 200
         assert gateway.get("/admin/api/failover").json()["breakers"] == []

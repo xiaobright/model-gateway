@@ -533,7 +533,7 @@ def set_upstream_enabled(upstream_id: int, payload: EnabledIn) -> dict[str, bool
 def remove_upstream(upstream_id: int) -> dict[str, bool]:
     # 分组随供应商级联删除；先把它们的断路器状态清掉，不然管理页会一直挂着幽灵条目
     for group in db.list_groups(upstream_id):
-        failover.clear(group.id)
+        failover.clear_group(group.id)
     if not db.delete_upstream(upstream_id):
         raise HTTPException(404, f"供应商 {upstream_id} 不存在")
     return {"ok": True}
@@ -733,7 +733,7 @@ def remove_group(group_id: int) -> dict[str, bool]:
     _require_group(group_id)
     if not db.delete_group(group_id):
         raise HTTPException(404, f"分组 {group_id} 不存在")
-    failover.clear(group_id)
+    failover.clear_group(group_id)
     return {"ok": True}
 
 
@@ -821,7 +821,7 @@ def post_group_models_plan(group_id: int, payload: GroupModelsPlanIn) -> dict[st
 @router.get("/models")
 def get_model_routes() -> list[dict[str, Any]]:
     disabled = db.disabled_protocols()
-    cooling = {b["group_id"]: b for b in failover.snapshot()}
+    cooling = {(b["group_id"], b["remote_model"]): b for b in failover.snapshot()}
     forwards = {
         (row["model_name"], row["protocol"]): row["target_model"]
         for row in db.list_forwards()
@@ -849,7 +849,7 @@ def get_model_routes() -> list[dict[str, Any]]:
         is_active = bool(row["is_active"])
         upstream_on = bool(row["upstream_enabled"])
         group_on = bool(row["group_enabled"])
-        breaker = cooling.get(row["group_id"])
+        breaker = cooling.get((row["group_id"], row["remote_model"]))
         group["candidates"].append(
             {
                 "route_id": row["route_id"],
@@ -864,8 +864,8 @@ def get_model_routes() -> list[dict[str, Any]]:
                 "is_active": is_active,
                 # 候选按 priority 排好了；圆片从左到右就是自动降级的尝试顺序
                 "priority": row["priority"],
-                # 断路器是按**分组**记的（坏的是那个站和那把 key），所以同分组的
-                # 几条候选会显示同一个冷却
+                # 断路器是按「分组 + 上游真名」记的，所以同分组的几条候选各自显示
+                # 自己的冷却 —— 一个真名坏了不连累同组的兄弟真名
                 "cooling_ms": breaker["cooling_ms"] if breaker else 0,
                 "fails": breaker["fails"] if breaker else 0,
             }
@@ -1034,8 +1034,9 @@ def post_switch(payload: SwitchIn) -> dict[str, bool]:
     route = db.get_route(payload.route_id)
     if route is None or not db.switch_route(payload.route_id):
         raise HTTPException(404, "切换目标不存在")
-    # 手动指定了就立刻给它机会：之前的连续失败不该继续把它挡在外面
-    failover.clear(route["group_id"])
+    # 手动指定了就立刻给它机会：之前的连续失败不该继续把它挡在外面。只清这一条候选
+    # 的冷却 —— 同分组其它真名的状态是它们自己挣来的，不动
+    failover.clear(route["group_id"], route["remote_model"])
     log(
         f"SWITCH model={route['model_name']!r} -> {route['upstream_name']}/{route['group_name']}"
         f" remote={route['remote_model']!r}"
@@ -1187,7 +1188,7 @@ def put_rewrite_rules(payload: RewriteRulesIn) -> dict[str, Any]:
 
 @router.get("/failover")
 def get_failover() -> dict[str, Any]:
-    """自动降级开关 + 两张内存状态表：分组冷却、200 截断守卫。
+    """自动降级开关 + 两张内存状态表：上游模型冷却、200 截断守卫。
 
     守卫那部分是给排查用的（页面上没有位置），形状见 truncation.snapshot()。
     """
@@ -1234,9 +1235,14 @@ def remove_model_route(
     if unknown:
         raise HTTPException(400, f"不支持的删除参数：{', '.join(sorted(unknown))}；请使用 route_id 或模型名与接口")
     if route_id is not None:
+        # 先取到这条候选的分组和真名：删成功就把它的断路器清掉，不然管理页会一直
+        # 挂着一条再也回不来的幽灵记录（和删分组清状态同一个道理）
+        gone = db.get_route(route_id)
         name = db.delete_model_route(route_id)
         if not name:
             raise HTTPException(404, "该候选不存在")
+        if gone is not None:
+            failover.clear(gone["group_id"], gone["remote_model"])
         return {"ok": True, "removed": 1, "model_name": name}
     if not model_name:
         raise HTTPException(400, "要么给 route_id，要么给 model_name")

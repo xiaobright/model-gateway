@@ -24,7 +24,7 @@ from .reqlog import log
 # ---------------------------------------------------------------- 策略参数
 
 START_DEADLINE = 180.0  # 已经耗了这么久就不再开新尝试（另外每次重试前还会查客户端还在不在）
-COOL_AFTER = 2          # 同一个分组连续失败几次进冷却。1 次可能只是抖动
+COOL_AFTER = 2          # 同一个「分组 + 上游真名」连续失败几次进冷却。1 次可能只是抖动
 COOL_SECONDS = 90.0     # 首次冷却时长
 COOL_MAX = 600.0        # 每多失败一次翻倍，封顶。60 连击那种会稳定在 10 分钟
 
@@ -72,8 +72,10 @@ def all_enabled() -> dict[str, bool]:
 # ---------------------------------------------------------------- 断路器
 
 # 只放内存：重启该忘掉（干净起步是对的默认），也省掉每个请求一次写库。
-# 键是 group_id —— 坏的是那个站和那把 key，不是某个模型，所以一个模型踩到的坑
-# 能顺带保护其它模型。
+# 键是「分组 + 上游真名」—— 坏的是那个站、那把 key 上的**那个上游模型**，不是整把
+# key。中转站常把同一个模型放在几个别名/真名后面，挂一个不代表挂全部；按分组记会
+# 让一个真名的故障把同组的兄弟真名一起冷却掉，用户白丢一条能用的候选。
+# 分组仍然在键里：同站两把 key 看到的模型常常不一样，坏在 key1 上不该连坐 key2。
 
 
 @dataclass
@@ -84,27 +86,29 @@ class _State:
     cooled: int = 0             # 一共进过几次冷却，只用来展示
 
 
-_states: dict[int, _State] = {}
+BreakerKey = tuple[int, str]    # (group_id, remote_model)
+
+_states: dict[BreakerKey, _State] = {}
 # 写发生在转发（事件循环线程），读发生在管理接口（FastAPI 对同步端点用线程池）——
 # 一边迭代、一边增删会让 /models、/inflight、/failover 随机 500。RLock 是因为
 # snapshot 拿锁后还会调 cooling()。
 _lock = threading.RLock()
 
 
-def note_ok(group_id: int) -> None:
+def note_ok(group_id: int, remote_model: str) -> None:
     with _lock:
-        st = _states.get(group_id)
+        st = _states.get((group_id, remote_model))
         if st is None:
             return
         if st.fails or st.until:
-            log(f"  failover: g{group_id} 恢复正常，清掉冷却")
-        _states.pop(group_id, None)
+            log(f"  failover: g{group_id}/{remote_model} 恢复正常，清掉冷却")
+        _states.pop((group_id, remote_model), None)
 
 
-def note_fail(group_id: int, status: int, label: str = "") -> float:
+def note_fail(group_id: int, remote_model: str, status: int, label: str = "") -> float:
     """记一次失败，返回这次要冷却多少秒（0 = 还没到阈值）。"""
     with _lock:
-        st = _states.setdefault(group_id, _State())
+        st = _states.setdefault((group_id, remote_model), _State())
         st.fails += 1
         st.last_status = status
         if st.fails < COOL_AFTER:
@@ -114,14 +118,17 @@ def note_fail(group_id: int, status: int, label: str = "") -> float:
         span = min(COOL_MAX, COOL_SECONDS * (2 ** exponent))
         st.until = time.monotonic() + span
         st.cooled += 1
-        log(f"  failover: {label or f'g{group_id}'} 连续失败 {st.fails} 次（{status}），冷却 {span:.0f}s")
+        log(
+            f"  failover: {label or f'g{group_id}/{remote_model}'} 连续失败 {st.fails} 次"
+            f"（{status}），冷却 {span:.0f}s"
+        )
         return span
 
 
-def cooling(group_id: int) -> float:
+def cooling(group_id: int, remote_model: str) -> float:
     """还要冷却多少秒；0 = 可以用。"""
     with _lock:
-        st = _states.get(group_id)
+        st = _states.get((group_id, remote_model))
         if st is None or not st.until:
             return 0.0
         left = st.until - time.monotonic()
@@ -132,11 +139,21 @@ def cooling(group_id: int) -> float:
         return left
 
 
-def clear(group_id: int) -> None:
+def clear(group_id: int, remote_model: str) -> None:
     """手动切到这个候选时调用 —— 用户明确指定了，就立刻给它机会。"""
     with _lock:
-        if _states.pop(group_id, None) is not None:
-            log(f"  failover: g{group_id} 的冷却被手动切换清掉了")
+        if _states.pop((group_id, remote_model), None) is not None:
+            log(f"  failover: g{group_id}/{remote_model} 的冷却被手动切换清掉了")
+
+
+def clear_group(group_id: int) -> None:
+    """分组没了（删分组 / 删供应商）—— 它下面所有真名的断路器一起清掉。"""
+    with _lock:
+        gone = [key for key in _states if key[0] == group_id]
+        for key in gone:
+            _states.pop(key, None)
+        if gone:
+            log(f"  failover: g{group_id} 的 {len(gone)} 个上游模型冷却随分组删除一起清掉")
 
 
 def reset() -> None:
@@ -145,23 +162,24 @@ def reset() -> None:
 
 
 def snapshot() -> list[dict]:
-    """给管理接口用：当前有状态的分组。冷却剩余毫秒 + 连续失败次数。"""
+    """给管理接口用：当前有状态的「分组 + 上游真名」。冷却剩余毫秒 + 连续失败次数。"""
     with _lock:
         out = []
-        for gid, st in list(_states.items()):
-            left = cooling(gid)
+        for (gid, remote), st in list(_states.items()):
+            left = cooling(gid, remote)
             if not left and not st.fails:
                 continue
             out.append(
                 {
                     "group_id": gid,
+                    "remote_model": remote,
                     "cooling_ms": int(left * 1000),
                     "fails": st.fails,
                     "last_status": st.last_status,
                     "cooled": st.cooled,
                 }
             )
-        return sorted(out, key=lambda r: -r["cooling_ms"])
+        return sorted(out, key=lambda r: (-r["cooling_ms"], r["group_id"], r["remote_model"]))
 
 
 # ---------------------------------------------------------------- 同站重试
@@ -229,20 +247,36 @@ def order_chain(chain: tuple[db.Route, ...]) -> list[db.Route]:
 
     不是「剔掉」而是「挪后」：60 连击那种故障期里可能所有候选都在冷却，
     这时候还是得挑一个打，不能因为「大家都冷着」就直接给客户端一个 503。
+    冷的是单个「分组 + 上游真名」—— 同分组的兄弟真名冷不着，会留在前面。
     """
-    warm = [r for r in chain if not cooling(r.group_id)]
-    cold = [r for r in chain if cooling(r.group_id)]
+    warm: list[db.Route] = []
+    cold: list[db.Route] = []
+    for route in chain:
+        (cold if cooling(route.group_id, route.remote_model) else warm).append(route)
     return warm + cold
 
 
-def next_index(candidates: Sequence[db.Route], start: int, dead_groups: set[int]) -> int:
+def next_index(
+    candidates: Sequence[db.Route],
+    start: int,
+    dead_groups: set[int],
+    dead_routes: set[BreakerKey],
+) -> int:
     """从 start 往后找下一个「打了还有意义」的候选，返回下标；没有就 -1。
 
-    这个请求里已经站级失败过的分组整个跳掉：同一个站绝不在一次请求里立刻重试
-    （客户端自己已经在重试了，再叠一层只是让每次失败变长）。同分组的兄弟候选
-    一起跳 —— 站都连不上，换个模型名也没用。
+    两本账分管两种失败，都在**这一次请求**里有效：
+
+    - dead_groups：连接就没打通过的分组，整个跳掉。同组所有候选共用一个站根、
+      一把 key、一种接口，连不上时换个模型名也白费，还让每次失败变更长。
+    - dead_routes：拿到了响应但状态很差的那个「分组 + 上游真名」，只跳它自己。
+      站是通的，同分组的其它真名不一定跟着坏（中转站常把同一个模型放在几个别名
+      后面，挂一个不代表挂全部），所以同一次请求里还该给它机会。
     """
     for i in range(start, len(candidates)):
-        if candidates[i].group_id not in dead_groups:
-            return i
+        route = candidates[i]
+        if route.group_id in dead_groups:
+            continue
+        if (route.group_id, route.remote_model) in dead_routes:
+            continue
+        return i
     return -1
