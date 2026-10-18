@@ -81,7 +81,7 @@ function harness(stored = null, { autoReady = true, springTokens = {}, dialogs =
   vm.runInContext(source, context);
   const api = vm.runInContext('({ initMotion, toggleMotion, moveNavMarker, slideIn, updateNumber,'
     + ' initViewStage, showViewLayer, createIndicator, syncSegMarkers, readBarWidths, morphBars,'
-    + ' enterHighlight, closeDialog, openDialog, springAnimate })', context);
+    + ' enterHighlight, closeDialog, openDialog, springAnimate, morphDialog })', context);
   const control = api.initMotion();
   const flush = (step = 16) => {
     clock += step;
@@ -424,4 +424,85 @@ test('条形形变：没有对得上的条就不排帧，减弱动效下直接�
   h.api.morphBars(again, prev, (el) => el._fill);
   assert.equal(again.children[1]._fill.style.width, '80%');
   assert.equal(h.frames.size, 0);
+});
+
+/* ---------------------------------------------------------------- 弹窗换挡 */
+
+/* 假弹窗：有内联宽度时以它为准（和真实布局一致 —— 钉住之后量到的是当前动画值），
+   否则用 CSS 交出来的尺寸。apply() 只改 _w/_h，模拟换尺寸类之后的目标。
+   offset* 才是布局尺寸：真实实现刻意不用 getBoundingClientRect，免得把 pop 的缩放算进去。 */
+function frameSurface(width, height) {
+  const classes = new Set();
+  const dim = (key, fallback) => {
+    const value = parseFloat(node.style[key]);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  const node = {
+    open: true, _w: width, _h: height, style: {}, classes,
+    classList: {
+      add: (key) => classes.add(key),
+      remove: (key) => classes.delete(key),
+      contains: (key) => classes.has(key),
+    },
+    get offsetWidth() { return dim('width', node._w); },
+    get offsetHeight() { return dim('height', node._h); },
+  };
+  return node;
+}
+
+test('弹窗换挡：宽度从起点弹簧推到目标，落位后把尺寸交还给 CSS', () => {
+  const h = harness();
+  const dlg = frameSurface(420, 470);
+  h.api.morphDialog(dlg, () => { dlg._w = 740; dlg._h = 600; });
+  assert.equal(dlg.style.width, '420.00px', '起点钉在原宽度，不许瞬移');
+  assert.equal(dlg.style.height, '470.00px');
+  const room = parseFloat(dlg.style.maxWidth.match(/([\d.]+)px/)[1]);
+  assert.ok(room > 740, `换挡期间要给回弹留余量，否则过冲被 max-width 切平（${dlg.style.maxWidth}）`);
+  assert.equal(dlg.classes.has('is-morphing'), true, '途中收起正文滚动条');
+
+  h.flush();
+  const mid = parseFloat(dlg.style.width);
+  assert.ok(mid > 420 && mid < 740, `中途应在两者之间，实际 ${mid}`);
+  assert.equal(parseFloat(dlg.style.height) > 470, true, '高度一起走');
+
+  h.settle();
+  assert.equal(dlg.style.width, '');
+  assert.equal(dlg.style.height, '');
+  assert.equal(dlg.style.maxWidth, '');
+  assert.equal(dlg.classes.has('is-morphing'), false);
+});
+
+test('弹窗换挡：中途点另一段，从当前宽度继续，不回到起点', () => {
+  const h = harness();
+  const dlg = frameSurface(420, 470);
+  h.api.morphDialog(dlg, () => { dlg._w = 740; dlg._h = 600; });
+  h.flush(); h.flush(); h.flush();
+  const mid = parseFloat(dlg.style.width);
+  assert.ok(mid > 420 && mid < 740);
+
+  h.api.morphDialog(dlg, () => { dlg._w = 420; dlg._h = 470; });
+  assert.ok(Math.abs(parseFloat(dlg.style.width) - mid) < 1.5,
+    `新起点应该是刚才那个中间值 ${mid}，实际 ${dlg.style.width}`);
+  // 重定向保留速度：先带着原来的冲劲再往外走一点，然后才被拉回来
+  let peak = parseFloat(dlg.style.width);
+  for (let i = 0; i < 10; i++) { h.flush(); peak = Math.max(peak, parseFloat(dlg.style.width)); }
+  assert.ok(peak > mid, `应该带着原速度继续外扩，mid=${mid} peak=${peak}`);
+  h.settle();
+  assert.equal(dlg.style.width, '');
+});
+
+test('弹窗换挡：减弱动效直接落位，弹窗没开时不碰尺寸', () => {
+  const h = harness();
+  h.reduced.matches = true;
+  const dlg = frameSurface(420, 470);
+  h.api.morphDialog(dlg, () => { dlg._w = 740; dlg._h = 600; });
+  assert.equal(dlg.style.width, '');
+  assert.equal(dlg.classes.has('is-morphing'), false);
+  assert.equal(h.frames.size, 0);
+
+  h.reduced.matches = false;
+  const closed = frameSurface(420, 470);
+  closed.open = false;
+  h.api.morphDialog(closed, () => { closed._w = 740; });
+  assert.equal(closed.style.width, undefined, '没打开的弹窗不需要量也不需要动');
 });

@@ -180,14 +180,19 @@ async def _ask_one(
     return GroupMatch(group, "", _group_names((*models, *known), query), "", known)
 
 
-async def scan(query: str) -> tuple[GroupMatch, ...]:
+async def scan(query: str, protocol: str = "") -> tuple[GroupMatch, ...]:
     """并发问每个启用的分组「有没有这个模型」，结果按相似度和分组顺序排好。
 
     同一个分组在每个协议下各有一条记录（分组本身是「一把 key + 一种接口」），
-    所以返回的条数 = 启用分组的条数，前端按协议分组展示。
+    所以不限定接口时返回的条数 = 启用分组的条数，前端按协议分组展示。
+
+    ``protocol`` 非空时只问这个接口的分组：给已有模型加候选时，别的接口下同名的
+    模型是另一条链，扫出来也用不上，白白等那些站。
     """
     q = query.strip()
     groups = enabled_groups()
+    if protocol:
+        groups = tuple(g for g in groups if g.protocol == protocol)
     if not groups or not q:
         return ()
     by_id = {u.id: u for u in db.list_upstreams()}

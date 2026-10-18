@@ -211,6 +211,8 @@ h3 { font-size: 14px; }
   box-shadow: inset 0 1px 3px light-dark(#526a9b09, #00000020);
   flex-wrap: wrap;
 }
+/* 自己写了 display:inline-flex，UA 的 [hidden]{display:none} 压不住它（作者样式优先） */
+.seg[hidden] { display: none; }
 .seg::before {
   content: '';
   position: absolute;
@@ -408,6 +410,9 @@ dialog.sm { max-width: 420px; }
 /* 分组弹窗字段多（组名/接口/Key/供应商 + 模型勾选列表），给宽一点，
    字段两列更舒展，纵向少占一些高度，列表也能多露几行 */
 dialog.wide { max-width: 740px; }
+/* 换挡途中（见 motion.js 的 morphDialog）：框还在长/缩，正文先别出滚动条 ——
+   内容超出就先裁掉，框长大时自然露出来；等落位再恢复 auto。 */
+dialog.is-morphing .dlg-body { overflow: hidden; }
 .dlg-head {
   padding: 16px 20px 14px; border-bottom: 1px solid var(--hair);
   display: flex; align-items: center; gap: 8px;

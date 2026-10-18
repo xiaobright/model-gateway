@@ -14,7 +14,7 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import * as views from './views.js';
-import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, showViewLayer, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog } from './motion.js';
+import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, showViewLayer, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog, fadeIn, morphDialog } from './motion.js';
 import { STYLES, DEFAULT_STYLE, normalizeStyle, loadStyle, applyStyle, styleHint } from './theme.js';
 import {
   initForwardDialog, saveForward, forwardActions,
@@ -1235,11 +1235,14 @@ function openRoute(model, rid, proto) {
     ? row.protocol
     : (proto || (row ? row.protocol : null) || state.iface || defaultProtocol());
   const pool = upstreamsFor(iface);
-  if (!pool.length) {
+  // 新开一个模型可以先不管接口（查找会问遍所有站）；改候选和加候选得有个分组能落
+  if (!pool.length && (cand || model)) {
     return toast(`没有 ${PROTO_LABEL[iface]} 接口的分组，先去「上游站点」给某个站加一个`, 'err');
   }
   state.editingCand = cand ? { model, rid, proto: row.protocol } : null;
   routeRemoteSeq += 1;
+  // 加候选只在这条链的接口里找；新增模型两种接口都问（同名在两种接口下是两条链）
+  scanProto = model ? (row ? row.protocol : (proto || iface)) : '';
 
   $('route-title').textContent = cand ? `改候选：${model}` : (model ? `给「${model}」加候选` : '新增模型');
   $('rt-save').textContent = cand ? '保存' : '添加';
@@ -1268,8 +1271,18 @@ function openRoute(model, rid, proto) {
   // 顺序只在「改某个候选」时能调：新增的那条还不在链上
   $('rt-order-wrap').hidden = !cand;
   orderHint();
+
+  // 查找那一段：提示随入口变，结果一律从空开始（上一次的勾选对不上这次的链）
+  $('rt-mode').hidden = Boolean(cand);   // 改候选就一条，没有「去哪找」的选择
+  $('rt-scan-lede').innerHTML = cand ? '' : (model
+    ? `问一遍 ${esc(PROTO_LABEL[scanProto] || scanProto)} 接口的分组有没有同名模型；勾中即给「${esc(model)}」加候选。`
+    : '问一遍每个启用的上游分组有没有这个名字；勾中即登记目录 + 建候选，可以一次挂好几个站。');
+  resetScan();
+  setRouteMode(cand ? 'manual' : 'scan');
   openDialog($('route-dialog'));
-  (model ? $('rt-remote') : $('rt-model')).focus();
+  if (cand) $('rt-remote').focus();
+  else if (model) $('rt-scan-go').focus();
+  else $('rt-model').focus();
 }
 
 /** 「第 2 / 5 位」以及两个按钮该不该禁用 */
@@ -1342,6 +1355,8 @@ function takenRemotes(model, gid, proto = '') {
 }
 
 async function saveRoute() {
+  // 查找那一屏的提交是「把勾中的都加上」，走批量接口；手动那屏还是单条
+  if (routeMode === 'scan') return commitPicks();
   const seq = routeRemoteSeq;
   const cand = state.editingCand ? { ...state.editingCand } : null;
   const model = $('rt-model').value.trim();
@@ -1507,58 +1522,60 @@ async function saveSearch() {
   toast(message, 'ok');
 }
 
-/* ------------------------------------------------- 批量添加模型
+/* ------------------------------------------------- 在各站查找上游
 
-   加一个新模型的常规做法要在好几个站里各进一次分组弹窗、各拉一次列表、各勾一下，
-   再去「模型路由」一条条建候选。这里把它收成两步：扫描（只读，问每个启用的分组有
-   没有这个模型）+ 提交（把勾中的分组一次性登记并暴露）。
+   新增模型时最常问的是「这个模型哪些站有」。这里问一遍所有启用的分组，把命中的
+   （分组，上游真名）列出来勾选，提交时一次登记目录 + 建候选 —— 完全同名的默认勾上，
+   只沾一部分的排后面、默认不勾：上游的 id 往往带日期后缀或厂商前缀，什么算「就是它」
+   得人来认。匹配规则（什么算完全匹配）在后端 model_batch.score，前端只认 level。
 
-   勾选默认值的规则来自实际用法：上游的 id 常带日期后缀和厂商前缀，**完全同名**的
-   那批基本就是同一个模型，默认勾上；只沾一部分的排后面、默认不勾，由人自己认。
-   规则本身（什么算完全匹配）在后端 model_batch.score 里，前端只认 level。 */
+   给已有模型加候选时只问这条链的接口（scanProto）：另一种接口下同名的是另一条链，
+   扫出来也用不上，还让那些慢站把整轮拖长。 */
 
-let batchResult = null;        // 最近一次扫描的结果
-let batchQuery = '';           // 它对应的模型名：对不上的结果不能拿来提交
-let batchScanning = false;
-let batchBusy = false;         // 正在提交
-let batchSeq = 0;              // 关掉弹窗 / 换关键字之后，旧响应作废
+let scanResult = null;         // 最近一次扫描的结果
+let scanQuery = '';            // 它对应的模型名：对不上的结果不能拿来提交
+let scanProto = '';            // 非空 = 只问这个接口的分组（加候选时锁住）
+let scanBusy = false;          // 正在问
+let commitBusy = false;        // 正在提交
+let scanSeq = 0;               // 换名字 / 关弹窗之后，旧响应作废
 // 本轮已经加过的（分组, 上游真名）。放在状态里而不是只写进 DOM 属性：
 // 提交后的 refreshConfig 会把整个列表重画一遍，行的 dataset 跟着新元素一起没了。
-let batchAdded = new Set();
+let scanAdded = new Set();
+let routeMode = 'scan';        // 'scan' 在各站查找 / 'manual' 手动指定
 
-const BATCH_LEVEL = { exact: '完全同名', alias: '同名（去掉前缀）', partial: '部分匹配' };
-const BATCH_LEVEL_TAG = { exact: 'tag-good', alias: 'tag-good', partial: 'tag-warn' };
+const MATCH_LEVEL = { exact: '完全同名', alias: '同名（去掉前缀）', partial: '部分匹配' };
+const MATCH_TAG = { exact: 'tag-good', alias: 'tag-good', partial: 'tag-warn' };
 
-const batchKey = (gid, remote) => `${Number(gid)}\u0000${remote}`;
+const pickKey = (gid, remote) => `${Number(gid)}\u0000${remote}`;
 
-function batchRows() {
-  return batchResult ? [...$('batch-picker').querySelectorAll('input[data-act="batch-pick"]')] : [];
+function pickRows() {
+  return scanResult ? [...$('rt-picker').querySelectorAll('input[data-act="rt-pick"]')] : [];
 }
 
 /* 已经对下游暴露过这个真名的行：加是幂等的，但先说清楚，免得看起来像白点了一下 */
-function batchExposed(gid, remote) {
+function pickExposed(gid, remote) {
   return state.routes.some((r) => r.candidates.some(
     (c) => c.group_id === gid && c.remote_model === remote));
 }
 
-function batchRow(row, match) {
+function scanPickRow(row, match) {
   const exact = match.level === 'exact' || match.level === 'alias';
-  const exposed = batchExposed(row.group_id, match.remote_model);
-  const added = batchAdded.has(batchKey(row.group_id, match.remote_model));
+  const exposed = pickExposed(row.group_id, match.remote_model);
+  const added = scanAdded.has(pickKey(row.group_id, match.remote_model));
   const notes = [];
   if (match.from_catalog) notes.push('目录里已登记');
   if (exposed) notes.push('已暴露给下游');
-  const level = BATCH_LEVEL[match.level] || match.level;
+  const level = MATCH_LEVEL[match.level] || match.level;
   const where = `${row.upstream_name} · ${row.group_name}`;
   // 同一个站的两把 key（两个分组）可能都叫「默认」，光看名字分不清 —— 悬停给出接口全名
   const whereTip = `${where}（${PROTO_LABEL[row.protocol] || row.protocol}）`;
   return `<label class="pick-row${exact ? '' : ' is-partial'}${added ? ' busy' : ''}"
       data-search="${esc(`${where} ${match.remote_model}`.toLowerCase())}">
-    <input type="checkbox" data-act="batch-pick" data-gid="${row.group_id}"
+    <input type="checkbox" data-act="rt-pick" data-gid="${row.group_id}"
            data-remote="${esc(match.remote_model)}" ${exact && !added ? 'checked' : ''}
            ${added ? 'disabled' : ''}>
     <span class="pick-name">${esc(match.remote_model)}</span>
-    <span class="tag ${added ? 'tag-good' : (BATCH_LEVEL_TAG[match.level] || '')}">${
+    <span class="tag ${added ? 'tag-good' : (MATCH_TAG[match.level] || '')}">${
       added ? '已加' : esc(level)}</span>
     <span class="pick-where" title="${esc(whereTip)}">
       ${esc(where)}${notes.length ? `（${esc(notes.join('，'))}）` : ''}</span>
@@ -1567,18 +1584,35 @@ function batchRow(row, match) {
 
 /* 这一行「最好有多像」：0 = 全是部分匹配，1 = 至少有一个是它。
    用来把段和段内的行都排成「先看完全同名的」。 */
-const batchGroupRank = (row) => ((row.matches || []).some(
+const pickGroupRank = (row) => ((row.matches || []).some(
   (m) => m.level === 'exact' || m.level === 'alias') ? 1 : 0);
 
-function renderBatchPicker() {
-  const host = $('batch-picker');
-  if (!batchResult) { host.innerHTML = ''; return; }
-  const rows = batchResult.groups || [];
+/* 列表空着的时候说清楚下一步做什么，别让人对着空白点来点去 */
+function paintScanIdle(text = '') {
+  const hint = text || (scanProto
+    ? `还没问过：点上面那个按钮，在 ${PROTO_LABEL[scanProto] || scanProto} 分组里找一遍。`
+    : '还没问过：点上面那个按钮问一遍所有上游站。');
+  $('rt-picker').innerHTML = `<div class="pick-note">${esc(hint)}</div>`;
+}
+
+function renderPicks() {
+  const host = $('rt-picker');
+  if (!scanResult) { paintScanIdle(); syncSubmit(); return; }
+  const rows = scanResult.groups || [];
   const hit = rows.filter((r) => (r.matches || []).length);
   const failed = rows.filter((r) => r.error);
   if (!hit.length && !failed.length) {
-    host.innerHTML = '<div class="pick-note">所有上游站都没有这个名字。'
-      + '上游不列全的时候可以在「上游站点」里手动填一个。</div>';
+    if (scanResult.scanned) {
+      host.innerHTML = `<div class="pick-note">问过的 ${scanResult.scanned} 个分组都没有这个名字。`
+        + '上游列表常是残的，可以 '
+        + '<button type="button" class="text-button" data-act="route-mode" data-mode="manual">切到手动指定</button>'
+        + ' 自己填一个。</div>';
+    } else {
+      host.innerHTML = `<div class="pick-note">${esc(scanProto
+        ? `没有启用的 ${PROTO_LABEL[scanProto] || scanProto} 分组，先去「上游站点」给某个站加一个。`
+        : '还没有启用的上游分组，先去「上游站点」加一个。')}</div>`;
+    }
+    syncSubmit();
     return;
   }
 
@@ -1590,7 +1624,7 @@ function renderBatchPicker() {
   }
   // 段的顺序 = 段里最好那一行有多像：完全同名的段排在只有部分匹配的段前面 ——
   // 不然「Messages 段里一个待确认的部分匹配」会把下面五条同名候选挤到屏幕外。
-  const protoWeight = (p) => Math.max(...byProto.get(p).map(batchGroupRank));
+  const protoWeight = (p) => Math.max(...byProto.get(p).map(pickGroupRank));
   const known = PROTOCOLS.filter((p) => byProto.has(p))
     .sort((a, b) => protoWeight(b) - protoWeight(a));
   const extra = [...byProto.keys()].filter((p) => !PROTOCOLS.includes(p));
@@ -1600,9 +1634,9 @@ function renderBatchPicker() {
     const label = PROTO_LABEL[proto] || proto;
     html += `<div class="pick-sep">${esc(label)}${off ? '（这个接口已停用）' : ''}</div>`;
     // 段内也先排完全同名的：一屏里先看到「就是它」的那批
-    const ranked = [...byProto.get(proto)].sort((a, b) => batchGroupRank(b) - batchGroupRank(a));
+    const ranked = [...byProto.get(proto)].sort((a, b) => pickGroupRank(b) - pickGroupRank(a));
     for (const row of ranked) {
-      html += (row.matches || []).map((match) => batchRow(row, match)).join('');
+      html += (row.matches || []).map((match) => scanPickRow(row, match)).join('');
     }
   }
   if (failed.length) {
@@ -1611,156 +1645,196 @@ function renderBatchPicker() {
       ${esc(row.group_name)}：${esc(row.error)}</div>`).join('');
   }
   host.innerHTML = html;
-  applyBatchFilter();
-  syncBatchSelection();
+  applyPickFilter();
+  syncSubmit();
   enterStagger(host.querySelectorAll('label.pick-row:not([hidden])'), { step: 18, limit: 14, duration: 320, distance: 7 });
 }
 
-/* 按钮那一侧的文案和可用性都由这里说了算。批量的 busy 也压在这里：run() 收尾会把
-   disabled 改回 false，而状态每次变化都会再调一次这个函数，所以它说了算。 */
-function syncBatchSelection() {
-  const boxes = batchRows().filter((b) => !b.disabled);
+/* 底部按钮的文案和可用性都由这里说了算。扫描/提交的 busy 也压在这里：run() 收尾
+   会把 disabled 改回 false，而状态每次变化都会再调一次这个函数，所以它说了算
+   （配合 dataset.locked）。 */
+function syncSubmit() {
+  if (routeMode !== 'scan') {
+    $('rt-count').textContent = '';
+    $('rt-save').textContent = state.editingCand ? '保存' : '添加';
+    $('rt-save').disabled = false;
+    return;
+  }
+  const boxes = pickRows().filter((b) => !b.disabled);
   const checked = boxes.filter((b) => b.checked).length;
-  const pending = (b) => b.checked && !batchAdded.has(batchKey(b.dataset.gid, b.dataset.remote));
+  const pending = (b) => b.checked && !scanAdded.has(pickKey(b.dataset.gid, b.dataset.remote));
   const fresh = boxes.filter(pending).length;
-  $('batch-count').textContent = boxes.length ? `共 ${boxes.length} 条候选，已勾 ${checked} 条` : '';
-  $('batch-save').disabled = batchScanning || batchBusy || fresh === 0;
-  if (batchScanning) $('batch-save').textContent = '正在扫描…';
-  else if (batchBusy) $('batch-save').textContent = '正在添加…';
-  else $('batch-save').textContent = fresh ? `添加选中的 ${fresh} 条` : '添加选中的分组';
+  $('rt-count').textContent = boxes.length ? `共 ${boxes.length} 条候选，已勾 ${checked} 条` : '';
+  $('rt-save').disabled = scanBusy || commitBusy || fresh === 0;
+  if (scanBusy) $('rt-save').textContent = '正在扫描…';
+  else if (commitBusy) $('rt-save').textContent = '正在添加…';
+  else $('rt-save').textContent = fresh ? `添加选中的 ${fresh} 条` : '添加选中的分组';
 }
 
-function applyBatchFilter() {
-  const kw = $('batch-filter').value.trim().toLowerCase();
-  for (const label of $('batch-picker').querySelectorAll('label.pick-row')) {
+function applyPickFilter() {
+  const kw = $('rt-pick-filter').value.trim().toLowerCase();
+  for (const label of $('rt-picker').querySelectorAll('label.pick-row')) {
     label.hidden = Boolean(kw) && !(label.dataset.search || '').includes(kw);
   }
 }
 
-function openBatchAdd() {
-  if ($('batch-dialog').open) return;   // 已经开着就别把填好的东西清掉重来
-  batchSeq += 1;
-  batchResult = null;
-  batchQuery = '';
-  batchScanning = false;
-  batchBusy = false;
-  batchAdded = new Set();
-  delete $('batch-save').dataset.locked;
-  $('batch-model').value = '';
-  $('batch-filter').value = '';
-  $('batch-status').textContent = '填个模型名，点「扫描所有上游站」';
-  $('batch-hint').textContent = '';
-  $('batch-count').textContent = '';
-  $('batch-picker').innerHTML = '';
-  syncBatchSelection();
-  openDialog($('batch-dialog'));
-  $('batch-model').focus();
+/* 打开弹窗 / 关掉弹窗都回到「还没问过」：留着的勾选会对不上后来改过的配置 */
+function resetScan() {
+  scanSeq += 1;
+  scanResult = null;
+  scanQuery = '';
+  scanAdded = new Set();
+  scanBusy = false;
+  commitBusy = false;
+  delete $('rt-save').dataset.locked;
+  $('rt-scan-status').textContent = '';
+  $('rt-pick-hint').textContent = '';
+  $('rt-pick-filter').value = '';
+  paintScanIdle();
+  syncSubmit();
 }
 
-function batchStatusText(data) {
+/* 两段切换。「改候选」没有这个选择（一条就是一条），加候选和新增都默认先找。
+   两套内容需要的宽度差很多（窄表单 ↔ 宽列表），框的尺寸交给弹簧带过去，不硬切。 */
+function setRouteMode(mode) {
+  routeMode = mode === 'manual' ? 'manual' : 'scan';
+  const scan = routeMode === 'scan';
+  morphDialog($('route-dialog'), () => {
+    $('rt-scan').hidden = !scan;
+    $('rt-manual').hidden = scan;
+    const dlg = $('route-dialog');
+    dlg.classList.toggle('wide', scan);
+    dlg.classList.toggle('sm', !scan);
+  });
+  // 新露出来的那一屏淡入：换挡途中它已经在最终布局里，直接出现会显得生硬
+  fadeIn(scan ? $('rt-scan') : $('rt-manual'));
+  for (const btn of $('rt-mode').querySelectorAll('[data-mode]')) {
+    const on = btn.dataset.mode === routeMode;
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  syncSubmit();
+  // 胶囊的底板按选中项的位置滑过去；弹窗刚打开时宽度还是 0，量不到就等下一帧
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => syncSegMarkers());
+}
+
+function scanStatusText(data) {
   const rows = data.groups || [];
   const hit = rows.filter((r) => (r.matches || []).length).length;
   const failed = rows.filter((r) => r.error).length;
-  const parts = [`扫描 ${data.scanned} 个上游分组，${hit} 个分组匹配`];
+  const scope = scanProto ? `${PROTO_LABEL[scanProto] || scanProto} 分组` : '上游分组';
+  const parts = [`问过 ${data.scanned} 个${scope}，${hit} 个有匹配`];
   if (failed) parts.push(`${failed} 个没问到`);
   parts.push(`${(data.ms / 1000).toFixed(1)} 秒`);
   if (data.budget_hit) parts.push('（有站太慢，这一轮没等它）');
   return parts.join(' · ');
 }
 
-async function scanModels() {
-  const name = $('batch-model').value.trim();
-  if (!name) return toast('先填一个模型名', 'err');
-  const seq = ++batchSeq;
-  batchScanning = true;
-  batchResult = null;
-  batchQuery = name;
-  // 交给 run() 收尾时别再无条件启用：这个按钮的可用性由 syncBatchSelection 说了算
-  $('batch-save').dataset.locked = '1';
-  $('batch-picker').innerHTML = '';
-  $('batch-status').textContent = '正在问所有上游站…慢的站要等一会儿';
-  $('batch-hint').textContent = '';
-  syncBatchSelection();
+async function scanUpstreams() {
+  const name = $('rt-model').value.trim();
+  if (!name) {
+    $('rt-model').focus();
+    return toast('先填一个模型名', 'err');
+  }
+  const seq = ++scanSeq;
+  scanBusy = true;
+  scanResult = null;
+  scanQuery = name;
+  scanAdded = new Set();          // 新的一轮，上一轮的「已加」不再适用
+  // 交给 run() 收尾时别再无条件启用：这个按钮的可用性由 syncSubmit 说了算
+  $('rt-save').dataset.locked = '1';
+  $('rt-picker').innerHTML = '<div class="pick-note">正在问上游站…</div>';
+  $('rt-scan-status').textContent = '正在问…慢的站要等一会儿';
+  $('rt-pick-hint').textContent = '';
+  syncSubmit();
   try {
-    const data = await api('POST', '/admin/api/models/scan', { model_name: name });
-    if (seq !== batchSeq) return;   // 弹窗关了，或者已经又扫了一次
-    batchResult = data;
-    $('batch-status').textContent = batchStatusText(data);
-    renderBatchPicker();
+    const data = await api('POST', '/admin/api/models/scan', {
+      model_name: name, protocol: scanProto,
+    });
+    if (seq !== scanSeq) return;   // 弹窗关了、名字改了，或者已经又扫了一次
+    scanResult = data;
+    $('rt-scan-status').textContent = scanStatusText(data);
+    renderPicks();
   } catch (e) {
-    if (seq !== batchSeq) return;
-    batchQuery = '';
-    $('batch-status').textContent = `扫描失败：${e.message}`;
+    if (seq !== scanSeq) return;
+    scanQuery = '';
+    $('rt-scan-status').textContent = `没问成：${e.message}`;
+    paintScanIdle('这次没问成，可以再点一次；也可以切到「手动指定」自己填。');
   } finally {
-    if (seq === batchSeq) {
-      batchScanning = false;
-      syncBatchSelection();
+    if (seq === scanSeq) {
+      scanBusy = false;
+      syncSubmit();
     }
   }
 }
 
-async function commitBatch() {
-  if (batchScanning || batchBusy) return;
-  const name = batchQuery;
-  if (!batchResult || !name) return toast('先点「扫描所有上游站」', 'err');
-  if ($('batch-model').value.trim() !== name) {
-    return toast('模型名改过了，先重新扫描再添加', 'err');
+async function commitPicks() {
+  if (scanBusy || commitBusy) return;
+  const name = scanQuery;
+  if (!scanResult || !name) return toast('先点「问一遍所有上游站」', 'err');
+  if ($('rt-model').value.trim() !== name) {
+    return toast('模型名改过了，先重新找一遍再添加', 'err');
   }
-  const picked = batchRows().filter((b) => b.checked && !b.disabled);
-  const picks = picked.filter((b) => !batchAdded.has(batchKey(b.dataset.gid, b.dataset.remote)));
+  const picked = pickRows().filter((b) => b.checked && !b.disabled);
+  const picks = picked.filter((b) => !scanAdded.has(pickKey(b.dataset.gid, b.dataset.remote)));
   if (!picks.length) {
     // run() 收尾时会把按钮重新启用（那是给「同样是这个按钮、但模式变了」的情况留的），
     // 所以「没有新勾的了」这一态要在这里重新摆回去，否则按钮看着能点、点了什么也不发生
-    syncBatchSelection();
+    syncSubmit();
     return toast('没有新的了：加过的那些已经置灰', 'ok');
   }
-  const seq = batchSeq;
+  const seq = scanSeq;
   const groups = picks.map((b) => ({
     group_id: Number(b.dataset.gid),
     remote_model: b.dataset.remote,
   }));
   // 先记账再发请求：提交后的 refreshConfig 会把整个列表重画，行的状态只存在这里的集合里
-  for (const box of picks) batchAdded.add(batchKey(box.dataset.gid, box.dataset.remote));
-  batchBusy = true;
-  $('batch-save').dataset.locked = '1';   // 同上：收尾时别把按钮无条件放开
-  syncBatchSelection();
+  for (const box of picks) scanAdded.add(pickKey(box.dataset.gid, box.dataset.remote));
+  commitBusy = true;
+  $('rt-save').dataset.locked = '1';   // 同上：收尾时别把按钮无条件放开
+  syncSubmit();
   let result;
   try {
     result = await api('POST', '/admin/api/models/batch', { model_name: name, groups });
   } catch (e) {
     // 失败了就把这几条放开，让人能再点一次；异常照旧往外抛（run() 负责弹提示）
-    for (const box of picks) batchAdded.delete(batchKey(box.dataset.gid, box.dataset.remote));
+    for (const box of picks) scanAdded.delete(pickKey(box.dataset.gid, box.dataset.remote));
     throw e;
   } finally {
-    batchBusy = false;
-    syncBatchSelection();
+    commitBusy = false;
+    syncSubmit();
   }
   // 「分组已停用 / 不存在」这类跳过的不能算加过，否则那一行会被置灰、再也没法重试。
   // 必须在 refreshConfig 之前释放：重画之后这些行就重新可勾可选了。
   // 其余的（加成功、以及后端说「已经加过了」）都留在集合里，一直显成已加。
   for (const item of result.skipped || []) {
     if (item.reason === '已经加过了') continue;
-    batchAdded.delete(batchKey(item.group_id, name));
+    for (const box of picks) {
+      if (Number(box.dataset.gid) === Number(item.group_id)) {
+        scanAdded.delete(pickKey(box.dataset.gid, box.dataset.remote));
+      }
+    }
   }
   await refreshConfig();
-  if (seq !== batchSeq) return;
-  // 再画一遍：加过的行要带上「已加」并置灰，而 refreshConfig 里那次重画不一定跑得到
-  // （它只在 batchResult 还在时重画，而且顺序上可能先于上面这个集合的最终状态）
-  renderBatchPicker();
+  if (seq !== scanSeq) return;
   const why = (result.skipped || []).map((s) => s.reason).filter(Boolean);
   const unique = [...new Set(why)];
-  $('batch-hint').textContent = (result.committed
+  if (result.committed && !unique.length) {
+    // 全都加上了：这一趟就结束了，把弹窗收掉，首选和顺序在路由里调
+    closeDialog($('route-dialog'));
+    toast(`已添加 ${result.committed} 条候选，首选和顺序在「模型路由」里调`, 'ok');
+    return;
+  }
+  // 再画一遍：加过的行要带上「已加」并置灰，而 refreshConfig 里那次重画不一定跑得到
+  renderPicks();
+  $('rt-pick-hint').textContent = (result.committed
     ? `已加 ${result.committed} 条候选（${(result.protocols || []).map(
         (p) => PROTO_LABEL[p] || p).join('、')}）。`
     : '这次没有新增。')
-    + (unique.length ? ` 跳过了 ${result.skipped.length} 条：${unique.join('、')}。` : '')
-    + ' 已加上的候选在「模型路由」里，首选和顺序都在那儿调。';
-  syncBatchSelection();
-  if (result.committed) {
-    toast(`已添加 ${result.committed} 条候选`, 'ok');
-  } else {
-    toast('这些已经加过了', 'ok');
-  }
+    + (unique.length ? ` 跳过了 ${result.skipped.length} 条：${unique.join('、')}。` : '');
+  syncSubmit();
+  if (result.committed) toast(`已添加 ${result.committed} 条候选`, 'ok');
+  else toast('这些已经加过了', 'ok');
 }
 
 /* ------------------------------------------------- 上游敏感词绕行（请求改写） */
@@ -2156,10 +2230,10 @@ const ACTIONS = {
   'edit-candidate': ({ model, rid, proto }) => openRoute(model, Number(rid), proto),
   'rename-model': ({ model, proto }) => openRename(model, proto),
 
-  /* 批量添加新模型：先扫描（只读），再按勾选提交 */
-  'batch-add': openBatchAdd,
-  'batch-scan': scanModels,
-  'batch-pick': syncBatchSelection,
+  /* 新增模型弹窗里的两段：在各站查找（扫描 → 勾选 → 批量提交）/ 手动指定 */
+  'route-mode': ({ mode }) => setRouteMode(mode),
+  'rt-scan': scanUpstreams,
+  'rt-pick': syncSubmit,
 
   /* 接口全局开关：停用后这种接口的模型 / 分组 / 只有它的站都隐藏，转发直接拒绝。
      只影响展示与转发，描述符和配置都留着，打开就回来。 */
@@ -2400,17 +2474,17 @@ $('search-form').addEventListener('submit', (ev) => {
   run($('sr-save'), saveSearch);
 });
 
-/* 批量添加：表单只有一个提交按钮，按「扫描过没有」分流 —— 没结果时它是扫描，
-   有结果时它是提交，和按钮上的字一致。 */
-$('batch-form').addEventListener('submit', (ev) => {
+/* 新增模型那屏：回车在「在各站查找」下是「问一遍」，不是提交表单；
+   手动那屏照旧回车提交。查找结果里的过滤框回车也不该提交。 */
+$('rt-model').addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter' || routeMode !== 'scan') return;
   ev.preventDefault();
-  run($('batch-save'), () => (batchResult && batchQuery ? commitBatch() : scanModels()));
+  run(null, scanUpstreams);
 });
-$('batch-model').addEventListener('keydown', (ev) => {
-  if (ev.key !== 'Enter') return;
-  ev.preventDefault();
-  run(null, scanModels);
+$('rt-pick-filter').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') ev.preventDefault();
 });
+$('rt-pick-filter').addEventListener('input', applyPickFilter);
 
 $('fwd-form').addEventListener('submit', (ev) => {
   ev.preventDefault();
@@ -2425,7 +2499,20 @@ $('rt-upstream').addEventListener('change', () => {
 
 // 分组定了才知道「上游真名」能填哪些
 $('rt-group').addEventListener('change', () => fillRemoteList(Number($('rt-group').value)));
-$('rt-model').addEventListener('input', () => fillRemoteList(Number($('rt-group').value)));
+// 模型名一改，手动那屏的上游真名候选跟着换；查找那屏上一次的扫描结果就作废了 ——
+// 留着它，勾选会对着一个已经改过的名字提交
+$('rt-model').addEventListener('input', () => {
+  fillRemoteList(Number($('rt-group').value));
+  if (routeMode !== 'scan' || (!scanResult && !scanQuery)) return;
+  scanSeq += 1;
+  scanResult = null;
+  scanQuery = '';
+  scanAdded = new Set();
+  $('rt-scan-status').textContent = '';
+  $('rt-pick-hint').textContent = '';
+  paintScanIdle('名字改了：重新问一遍才知道哪些站有。');
+  syncSubmit();
+});
 
 // 搜索上游：供应商换了就重填它的 OpenAI 分组
 $('sr-upstream').addEventListener('change', () => {
@@ -2487,30 +2574,12 @@ $('group-dialog').addEventListener('close', (ev) => {
   run(null, refreshConfig);
 });
 
-// route-dialog 的 editingCand 同理：也只由 openRoute 负责重设，close 时不动
+// route-dialog 的 editingCand 同理：也只由 openRoute 负责重设，close 时不动。
+// 扫描结果一并作废：关掉之后留着的勾选会对不上后来改过的配置。
 $('route-dialog').addEventListener('close', (ev) => {
-  if (!ev.target.open) routeRemoteSeq += 1;
-});
-
-/* 批量添加弹窗关掉之后，扫描结果一律作废：留着的勾选会对不上后来改过的配置，
-   下次打开该从空表单重新开始。 */
-$('batch-dialog').addEventListener('close', (ev) => {
   if (ev.target.open) return;
-  batchSeq += 1;
-  batchResult = null;
-  batchQuery = '';
-  batchScanning = false;
-});
-$('batch-filter').addEventListener('input', applyBatchFilter);
-// 模型名改过之后，上一次扫描的结果就不再对得上它 —— 提交会被后端/上面的检查拦住，
-// 这里顺手把按钮关掉，别让人点了才发现
-$('batch-model').addEventListener('input', () => {
-  if (batchResult && $('batch-model').value.trim() !== batchQuery) {
-    $('batch-hint').textContent = '模型名改过了，重新扫描一次再添加。';
-    $('batch-save').disabled = true;
-  } else {
-    syncBatchSelection();
-  }
+  routeRemoteSeq += 1;
+  resetScan();
 });
 
 $('route-filter').addEventListener('input', (ev) => {

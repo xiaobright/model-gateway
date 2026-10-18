@@ -65,7 +65,6 @@
       <header class="view-head">
         <div><span class="eyebrow">MODEL GATEWAY / ROUTING</span><h2>模型路由</h2><p class="view-description">每个模型的下一站，一目了然。</p></div>
         <span class="grow"></span>
-        <button class="btn btn-ghost" data-act="batch-add">批量添加模型</button>
         <button class="btn" data-act="new-route">＋ 新增模型</button>
       </header>
       <div class="workspace-status"><span id="route-summary">正在读取配置…</span><button class="text-button" id="route-live" data-act="go-live">查看实时请求</button><span class="grow"></span><span id="route-attention"></span></div>
@@ -425,7 +424,7 @@
   </form>
 </dialog>
 
-<!-- ============ 新增模型 / 追加候选 / 改候选 ============ -->
+<!-- ============ 新增模型 / 追加候选 / 改候选：去各站找，或者自己指定 ============ -->
 <dialog id="route-dialog" class="sm">
   <form id="route-form">
     <div class="dlg-head">
@@ -436,34 +435,57 @@
       <label class="field">模型名（下游按这个名字调用）
         <input type="text" id="rt-model" placeholder="如 gpt-5.6-luna" autocomplete="off" required>
       </label>
-      <label class="field" id="rt-iface-wrap" style="margin-top:11px">在哪种接口下暴露
-        <select id="rt-iface"></select>
-      </label>
-      <label class="field" style="margin-top:11px">供应商
-        <select id="rt-upstream"></select>
-      </label>
-      <label class="field" style="margin-top:11px">分组
-        <select id="rt-group"></select>
-      </label>
-      <div class="field" id="rt-order-wrap" style="margin-top:11px" hidden>
-        <span>尝试顺序（自动降级按这个顺序往下试，改了立刻生效）</span>
-        <div class="field-row">
-          <button type="button" class="btn btn-ghost btn-sm" data-act="move-cand" data-dir="-1">◂ 前移</button>
-          <button type="button" class="btn btn-ghost btn-sm" data-act="move-cand" data-dir="1">后移 ▸</button>
-          <span class="dim" id="rt-order-hint" style="font-size:12px"></span>
-        </div>
+      <!-- 两种填法：让程序去各站找（默认，一次能挂好几个站），或者自己指定分组和真名 -->
+      <div class="seg" id="rt-mode" role="tablist" aria-label="怎么挑上游" style="margin-top:12px;align-self:flex-start">
+        <button type="button" class="seg-item is-on" role="tab" aria-selected="true" data-act="route-mode" data-mode="scan">在各站查找</button>
+        <button type="button" class="seg-item" role="tab" aria-selected="false" data-act="route-mode" data-mode="manual">手动指定</button>
       </div>
-      <label class="field" style="margin-top:11px">上游那边的真实模型名
-        <input type="text" id="rt-remote" list="rt-remote-list" placeholder="留空 = 与模型名相同" autocomplete="off">
-        <datalist id="rt-remote-list"></datalist>
-        <span class="dim" id="rt-remote-hint" style="font-size:12px;margin-top:4px"></span>
-      </label>
-      <label class="checkline" id="rt-onem-wrap" style="margin-top:12px">
-        <input type="checkbox" id="rt-onem">
-        <span>按 1M 上下文请求（真名存成 <code>名字[1m]</code>，转发时摘掉后缀、补 beta 头）</span>
-      </label>
+
+      <div id="rt-scan">
+        <p class="card-hint" id="rt-scan-lede" style="margin:11px 0"></p>
+        <div class="field-row">
+          <button type="button" class="btn btn-ghost btn-sm" id="rt-scan-go" data-act="rt-scan">问一遍所有上游站</button>
+          <span class="grow"></span>
+          <span class="dim" id="rt-scan-status" style="font-size:12px"></span>
+        </div>
+        <div class="field-row" style="margin-top:9px">
+          <input type="search" class="search" id="rt-pick-filter" placeholder="在结果里过滤…" aria-label="过滤扫描结果" style="flex:1">
+        </div>
+        <div class="picker" id="rt-picker"></div>
+        <p class="dim" id="rt-pick-hint" style="font-size:12px;margin:9px 0 0"></p>
+      </div>
+
+      <div id="rt-manual" hidden>
+        <label class="field" id="rt-iface-wrap" style="margin-top:12px">在哪种接口下暴露
+          <select id="rt-iface"></select>
+        </label>
+        <label class="field" style="margin-top:11px">供应商
+          <select id="rt-upstream"></select>
+        </label>
+        <label class="field" style="margin-top:11px">分组
+          <select id="rt-group"></select>
+        </label>
+        <div class="field" id="rt-order-wrap" style="margin-top:11px" hidden>
+          <span>尝试顺序（自动降级按这个顺序往下试，改了立刻生效）</span>
+          <div class="field-row">
+            <button type="button" class="btn btn-ghost btn-sm" data-act="move-cand" data-dir="-1">◂ 前移</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-act="move-cand" data-dir="1">后移 ▸</button>
+            <span class="dim" id="rt-order-hint" style="font-size:12px"></span>
+          </div>
+        </div>
+        <label class="field" style="margin-top:11px">上游那边的真实模型名
+          <input type="text" id="rt-remote" list="rt-remote-list" placeholder="留空 = 与模型名相同" autocomplete="off">
+          <datalist id="rt-remote-list"></datalist>
+          <span class="dim" id="rt-remote-hint" style="font-size:12px;margin-top:4px"></span>
+        </label>
+        <label class="checkline" id="rt-onem-wrap" style="margin-top:12px">
+          <input type="checkbox" id="rt-onem">
+          <span>按 1M 上下文请求（真名存成 <code>名字[1m]</code>，转发时摘掉后缀、补 beta 头）</span>
+        </label>
+      </div>
     </div>
     <div class="dlg-foot">
+      <span class="dim" id="rt-count" style="font-size:12px"></span>
       <span class="grow"></span>
       <button type="submit" class="btn" id="rt-save">添加</button>
     </div>
@@ -486,39 +508,6 @@
     <div class="dlg-foot">
       <span class="grow"></span>
       <button type="submit" class="btn" id="rn-save">保存</button>
-    </div>
-  </form>
-</dialog>
-
-<!-- ============ 批量添加新模型：一次问遍所有上游站，勾选要加的分组 ============ -->
-<dialog id="batch-dialog" class="wide">
-  <form id="batch-form">
-    <div class="dlg-head">
-      <h2>批量添加新模型</h2><span class="grow"></span>
-      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
-    </div>
-    <div class="dlg-body">
-      <p class="card-hint" style="margin:0 0 12px">
-        填一个模型名，先看<b>哪些上游站有它</b>：<b>完全同名</b>的默认勾上，只沾一部分的排后面、
-        默认不勾 —— 上游的 id 往往带日期后缀或厂商前缀，得自己认一下再用。
-        勾中即意味着两件事一起做：把这个站登记进上游模型目录，并在「模型路由」里建一条候选。</p>
-      <div class="field-row">
-        <input type="search" class="search" id="batch-model" style="flex:1;min-width:200px"
-               placeholder="模型名，如 deepseek-v3 / gpt-5.2" autocomplete="off" aria-label="模型名">
-        <button type="button" class="btn" data-act="batch-scan">扫描所有上游站</button>
-      </div>
-      <div class="field-row" style="margin-top:10px">
-        <input type="search" class="search" id="batch-filter" style="flex:1;min-width:160px"
-               placeholder="在结果里过滤…" aria-label="过滤扫描结果">
-        <span class="dim" id="batch-status" style="font-size:12px"></span>
-      </div>
-      <div class="picker" id="batch-picker"></div>
-      <p class="dim" id="batch-hint" style="font-size:12px;margin:10px 0 0"></p>
-    </div>
-    <div class="dlg-foot">
-      <span class="dim" id="batch-count" style="font-size:12px"></span>
-      <span class="grow"></span>
-      <button type="submit" class="btn" id="batch-save" disabled>添加选中的分组</button>
     </div>
   </form>
 </dialog>

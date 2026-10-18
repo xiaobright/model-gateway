@@ -121,6 +121,8 @@ class ModelScanIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_name: str = Field(min_length=1, max_length=200)
+    # 只问这个接口的分组。给已有模型加候选时用：别的接口下同名的是另一条链
+    protocol: str = Field(default="", max_length=40)
 
 
 class BatchGroupIn(BaseModel):
@@ -967,12 +969,13 @@ async def scan_model(payload: ModelScanIn) -> dict[str, Any]:
 
     一个站连不上或超时不会让整轮失败 —— 那个分组单独带一条 error 回来，其余照常。
     前端据此把「精确命中」「部分匹配」「问不到」分三段展示。
+    带 ``protocol`` 时只问那个接口的分组（给已有模型加候选时锁在同一条链上）。
     """
     query = payload.model_name.strip()
     if not query:
         raise HTTPException(400, "要填一个模型名")
     started = time.monotonic()
-    found = await model_batch.scan(query)
+    found = await model_batch.scan(query, payload.protocol.strip())
     disabled = db.disabled_protocols()
     items = [_scan_row(item, disabled) for item in found]
     empty = sum(1 for item in items if not item["matches"] and not item["error"])

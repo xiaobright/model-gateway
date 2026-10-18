@@ -288,6 +288,81 @@ export function animateCollapseRows(rows) {
   return animateRowHeights(rows, false);
 }
 
+/* ---------------------------------------------------------------- 弹窗换挡：宽 ↔ 窄
+
+   同一个弹窗有两套内容：「在各站查找」要放得下按接口分段的列表，手动指定只是一张短
+   表单。直接换尺寸类，框是瞬移的；这里把框的宽高钉在起点，用弹簧推到目标 —— 中途再点
+   另一段会从当前尺寸和速度继续，和导航胶囊一个路子。
+
+   目标尺寸靠「把内联尺寸交还给 CSS、apply()、量一次」拿到：三步在同一个任务里，
+   中间画不出来，所以不会闪一下。换挡途中正文先不收滚动条（.is-morphing），
+   框还在长/缩的时候滚动条会闪。 */
+const dialogMorphs = new WeakMap();
+
+export function morphDialog(dlg, apply) {
+  if (!dlg) { apply(); return; }
+  if (!dlg.open || !dlg.offsetWidth) {
+    // 关着的时候没有布局可量；把上一轮可能还在跑的换挡收掉，
+    // 否则它的下一帧会写在重新打开的这个框上
+    dialogMorphs.get(dlg)?.finish();
+    apply();
+    return;
+  }
+  // 用 offsetWidth 而不是 getBoundingClientRect：打开时那一下 pop 是 scale 动画，
+  // rect 会把缩放算进去，量出来的是「被缩过的宽度」，落位就会偏
+  for (const animation of dlg.getAnimations?.() || []) {
+    // 真在放 pop 的话先收掉：缩放和换挡叠在一起，框会先被拽一下
+    if (animation.animationName === 'pop') animation.cancel();
+  }
+  const from = { w: dlg.offsetWidth, h: dlg.offsetHeight };
+  dlg.style.width = '';
+  dlg.style.height = '';
+  apply();
+  const to = { w: dlg.offsetWidth, h: dlg.offsetHeight };
+  const moving = Math.abs(to.w - from.w) > 1 || Math.abs(to.h - from.h) > 1;
+
+  if (!moving || !motionAllowed()) {
+    dialogMorphs.get(dlg)?.finish();
+    dlg.style.width = '';
+    dlg.style.height = '';
+    dlg.style.maxWidth = '';
+    return;
+  }
+
+  // 换挡期间自己管宽度：不写这一句，尺寸类的 max-width 会把起点直接夹到终点。
+  // 但要给回弹留余量 —— 卡在目标值上，过冲会被 max-width 一刀切平，看着就不弹了
+  const room = Math.max(from.w, to.w) * 1.1 + 2;
+  dlg.style.maxWidth = `min(94vw, ${room.toFixed(2)}px)`;
+  dlg.style.width = `${from.w.toFixed(2)}px`;
+  dlg.style.height = `${from.h.toFixed(2)}px`;
+  dlg.classList.add('is-morphing');
+
+  const rest = () => {
+    dlg.style.width = '';
+    dlg.style.height = '';
+    dlg.style.maxWidth = '';
+    dlg.classList.remove('is-morphing');
+    dialogMorphs.delete(dlg);
+  };
+
+  let group = dialogMorphs.get(dlg);
+  if (!group) {
+    group = createSpringGroup(
+      {
+        w: { ...MOTION.frame, value: from.w },
+        h: { ...MOTION.frame, value: from.h },
+      },
+      ({ w, h }) => {
+        dlg.style.width = `${Math.max(0, w).toFixed(2)}px`;
+        dlg.style.height = `${Math.max(0, h).toFixed(2)}px`;
+      },
+      { onRest: rest },
+    );
+    dialogMorphs.set(dlg, group);
+  }
+  group.set(to);
+}
+
 /* 弹窗关闭保留 top layer 到退场结束；重开时取消旧关闭，避免延迟收尾关掉新会话。 */
 const closingDialogs = new Map();
 

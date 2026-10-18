@@ -124,6 +124,30 @@ def test_scan_skips_disabled_upstreams_and_groups(gateway):
         assert body["scanned"] == 0
 
 
+def test_scan_can_be_limited_to_one_protocol(gateway):
+    """给已有模型加候选时锁在同一条链上：另一种接口下同名的是另一条链，扫出来也用不上。"""
+    with MockUpstream("siteA") as a:
+        g_openai = add_upstream(gateway, a, "siteA")
+        g_anthropic = add_group(
+            gateway, provider_id(gateway, "siteA"), "anthropic", name="claude", api_key="key-siteA"
+        )
+
+        body = gateway.post(
+            "/admin/api/models/scan",
+            json={"model_name": "claude-test", "protocol": "anthropic"},
+        ).json()
+        assert body["scanned"] == 1
+        assert [row["group_id"] for row in body["groups"]] == [g_anthropic]
+        # mock 的 anthropic 列表里还有 claude-haiku-test，它只是部分匹配，排在同名后面
+        assert _matches_of(body["groups"][0])[0] == "claude-test"
+        assert body["groups"][0]["matches"][0]["level"] == "exact"
+
+        # 不带 protocol 就两边都问（新增模型时走这条）
+        both = gateway.post("/admin/api/models/scan", json={"model_name": "claude-test"}).json()
+        assert both["scanned"] == 2
+        assert {row["group_id"] for row in both["groups"]} == {g_openai, g_anthropic}
+
+
 def test_scan_survives_one_broken_site(gateway, monkeypatch):
     """一个站连不上只是那一行带 error，别的站必须照常出结果。"""
     with MockUpstream("siteA") as a, MockUpstream("siteB") as b:

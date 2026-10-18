@@ -19,6 +19,9 @@ export const MOTION = {
   fade: { stiffness: 420, damping: 40, mass: 1, precision: 0.01 },
   // 视图交叉淡出比推拉快：两层半透明玻璃叠着时，慢淡出会看到两层文字
   viewFade: { stiffness: 1600, damping: 76, mass: 1, precision: 0.01 },
+  // 弹窗换挡（窄表单 ↔ 宽列表）：阻尼比和导航 / 分段同一档（0.61，约 9% 过冲），
+  // 刚度取它们中间偏上 —— 一次要走两三百像素，太软会显得拖。宽高共用一条，框不会歪
+  frame: { stiffness: 560, damping: 29, mass: 1, precision: 0.5 },
 };
 
 /* ---------------------------------------------------------------- 不依赖 DOM 的标量弹簧 */
