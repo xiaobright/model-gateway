@@ -5,7 +5,7 @@
    - vector-effect="non-scaling-stroke" 锁定线宽 */
 
 import { esc } from './util.js';
-import { SPRING, springAnimate } from './motion.js';
+import { SPRING, springAnimate, richMotion } from './motion.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 const VW = 300;   // 虚拟坐标系宽
@@ -130,6 +130,8 @@ export function donut(pct, { size = 66, thickness = 7 } = {}) {
       || arc.getAttribute('stroke-dashoffset') || c;
     // 最终值先落在 SVG 上；动画结束或被系统减弱/后台取消后自然显示最新值。
     arc.setAttribute('stroke-dashoffset', offset);
+    // 轻量档不播生长：上面已经把最终值落在 SVG 上了
+    if (!richMotion()) return;
     springAnimate(arc, [{ strokeDashoffset: from }, { strokeDashoffset: offset }],
       { duration: 680, easing: SPRING.bouncy });
   };

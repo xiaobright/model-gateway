@@ -405,6 +405,11 @@ dialog[data-closing]::backdrop { animation: backdrop-out .18s var(--spring-exit)
   from { opacity: 0; transform: translate3d(0, 16px, 0) scale(.94); }
   to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
 }
+/* 轻量档：弹窗不要缩放和模糊渐入，只留一截很短的淡入；
+   其余整块运动（视图推拉、换挡、列表重排、图表生长）由 richMotion() 直接关掉。 */
+:root[data-motion="light"] dialog[open] { animation: dialog-in-light .16s ease-out; }
+:root[data-motion="light"] dialog::backdrop { animation: none; }
+@keyframes dialog-in-light { from { opacity: 0 } to { opacity: 1 } }
 @keyframes backdrop-in {
   from { opacity: 0; backdrop-filter: blur(0px); }
   to   { opacity: 1; backdrop-filter: blur(4px); }

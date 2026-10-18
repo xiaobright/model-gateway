@@ -6,7 +6,7 @@ import {
   catalogOfGroup, catalogOfUpstream, groupLabel, splitOneM, PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTOCOLS,
 } from './util.js';
 import {
-  enterStagger, slideIn, pulse, reduceMotion, updateNumber, enterHighlight,
+  enterStagger, slideIn, pulse, reduceMotion, richMotion, updateNumber, enterHighlight,
   readBarWidths, morphBars, animateExpandRows, animateCollapseRows, SPRING, springAnimate, openDialog,
 } from './motion.js';
 import { renderRouteWorkspace, selectRouteWorkspace, initRoutePad as bindRoutePad } from './route-view.js';
@@ -952,7 +952,7 @@ let windowMotionSeq = 0;
 
 export function animateWindowChange(mutate) {
   const host = $('chart-series');
-  if (!host || reduceMotion() || typeof host.animate !== 'function') { mutate(); return; }
+  if (!host || !richMotion() || typeof host.animate !== 'function') { mutate(); return; }
 
   const seq = ++windowMotionSeq;
   const style = typeof getComputedStyle === 'function' ? getComputedStyle(host) : null;

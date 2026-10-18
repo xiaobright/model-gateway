@@ -6,9 +6,9 @@
    4. 列表 / 候选卡片 FLIP（First-Last-Invert-Play）物理重排过渡
    5. 详情面板切换、表格分组折叠展开、弹窗与折叠面板（<details>）、Toast 退场 */
 
-import { MOTION, createSpringGroup, motionAllowed, settleAllMotions } from './spring.js';
+import { MOTION, createSpringGroup, motionAllowed, richMotion, setMotionLevel, settleAllMotions } from './spring.js';
 
-export { MOTION } from './spring.js';
+export { MOTION, richMotion } from './spring.js';
 
 export const reduceMotion = () => Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
 
@@ -74,7 +74,7 @@ export function createIndicator(apply, spec) {
 /* ---------------------------------------------------------------- 基础元素动效 */
 
 export function enterStagger(els, options = {}) {
-  if (!els) return;
+  if (!els || !richMotion()) return;
   const {
     step = 26,
     limit = 14,
@@ -147,7 +147,7 @@ export function fadeIn(el, { duration = 260 } = {}) {
 
 /** 选中不同模型时，详情面板内部头部、摘要与候选卡片做物理弹簧级联过渡 */
 export function animateDetailSwap(detailEl) {
-  if (!detailEl || reduceMotion()) return;
+  if (!detailEl || !richMotion()) return;
   const head = detailEl.querySelector('.detail-head');
   const forward = detailEl.querySelector('.route-forward');
   const facts = detailEl.querySelector('.route-facts');
@@ -187,7 +187,7 @@ export function animateDetailSwap(detailEl) {
 /** 记录容器内一组带 key 元素的屏幕坐标，供 DOM 更新后执行 FLIP 弹簧位移动画 */
 export function captureRects(host, selector, keyOf) {
   const map = new Map();
-  if (!host || reduceMotion() || typeof host.querySelectorAll !== 'function') return map;
+  if (!host || !richMotion() || typeof host.querySelectorAll !== 'function') return map;
   for (const el of host.querySelectorAll(selector)) {
     if (el.hidden || !el.getClientRects?.().length) continue;
     const key = keyOf(el);
@@ -198,7 +198,7 @@ export function captureRects(host, selector, keyOf) {
 
 /** 在 DOM 更新后对比新旧坐标，对发生位置移动的元素播放物理弹簧平滑归位动画 */
 export function flipElements(host, selector, keyOf, prevRects, { duration = 420, staggerNew = false } = {}) {
-  if (!host || !prevRects || !prevRects.size || reduceMotion() || typeof host.querySelectorAll !== 'function') return;
+  if (!host || !prevRects || !prevRects.size || !richMotion() || typeof host.querySelectorAll !== 'function') return;
   const fresh = [];
   for (const el of host.querySelectorAll(selector)) {
     if (el.hidden || !el.getClientRects?.().length) continue;
@@ -232,7 +232,7 @@ const rowMotions = new Map();
 
 function animateRowHeights(rows, opening) {
   const running = [], wrappers = [];
-  if (!rows?.length || reduceMotion() || document.visibilityState === 'hidden') {
+  if (!rows?.length || !richMotion()) {
     return { finished: Promise.resolve(), cancel() {} };
   }
   const list = [...rows], current = new Map();
@@ -321,7 +321,7 @@ export function morphDialog(dlg, apply) {
   const to = { w: dlg.offsetWidth, h: dlg.offsetHeight };
   const moving = Math.abs(to.w - from.w) > 1 || Math.abs(to.h - from.h) > 1;
 
-  if (!moving || !motionAllowed()) {
+  if (!moving || !richMotion()) {
     dialogMorphs.get(dlg)?.finish();
     dlg.style.width = '';
     dlg.style.height = '';
@@ -558,7 +558,7 @@ export function createViewStage(stage, { distance = VIEW_DISTANCE } = {}) {
         return false;
       }
       if (el === current) return false;
-      if (!motionAllowed()) {
+      if (!richMotion()) {
         instant(el);
         return false;
       }
@@ -633,7 +633,7 @@ export function readBarWidths(host, fillOf) {
 }
 
 export function morphBars(host, prev, fillOf) {
-  if (!host?.children || reduceMotion()) return;
+  if (!host?.children || !richMotion()) return;
   if (!prev || !prev.size) {
     // 首次渲染时：保持 fill.style.width 同步不变，用 WAAPI 让条形从 0% 弹簧生长出来
     [...host.children].forEach((row, i) => {
@@ -758,6 +758,7 @@ export function initMotion() {
   const pointer = window.matchMedia('(hover: hover) and (pointer: fine)');
   let mode = 'standard';
   try { if (localStorage.getItem('mg-motion') === 'light') mode = 'light'; } catch { /* 隐私模式使用默认值。 */ }
+  setMotionLevel(mode);
   let active = null, point = null, glowFrame = 0, navFrame = 0;
   const listeners = [];
   const on = (target, type, fn, options) => {
@@ -824,6 +825,9 @@ export function initMotion() {
       settleAllMotions();
       if (navFrame) cancelAnimationFrame(navFrame);
       navFrame = 0;
+    } else if (mode === 'light') {
+      // 刚切到轻量：在跑的推拉/胶囊别播完，直接到位；短反馈的 WAAPI 不打断
+      settleAllMotions();
     }
     if (visible()) moveMarker();
   };
@@ -888,7 +892,7 @@ export function initMotion() {
   let dlgObserver = null;
   if (typeof MutationObserver === 'function' && document.body) {
     dlgObserver = new MutationObserver((mutations) => {
-      if (!visible() || reduced.matches) return;
+      if (!visible() || reduced.matches || !richMotion()) return;
       for (const m of mutations) {
         const dlg = m.target;
         if (dlg?.tagName === 'DIALOG' && dlg.open) {
@@ -915,6 +919,7 @@ export function initMotion() {
     moveMarker,
     toggle() {
       if (!reduced.matches) mode = mode === 'standard' ? 'light' : 'standard';
+      setMotionLevel(mode);
       try { localStorage.setItem('mg-motion', mode); } catch { /* 当前会话仍然生效。 */ }
       sync();
       return mode;

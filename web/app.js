@@ -14,7 +14,7 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import * as views from './views.js';
-import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, showViewLayer, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog, fadeIn, morphDialog } from './motion.js';
+import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, showViewLayer, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog, fadeIn, morphDialog, richMotion } from './motion.js';
 import { STYLES, DEFAULT_STYLE, normalizeStyle, loadStyle, applyStyle, styleHint } from './theme.js';
 import {
   initForwardDialog, saveForward, forwardActions,
@@ -330,7 +330,7 @@ const VT_VARS = ['--vt-x', '--vt-y', '--vt-r', '--vt-duration'];
 
 function withCircleReveal(mutate, el) {
   // 视图切换正在滑的时候不套过渡：那套要把 view-transition-name 全摘掉，会把它撕开
-  if (reduceMotion() || typeof document.startViewTransition !== 'function'
+  if (!richMotion() || typeof document.startViewTransition !== 'function'
     || document.documentElement.dataset.vtDir) {
     mutate();
     return false;

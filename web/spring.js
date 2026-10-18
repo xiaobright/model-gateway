@@ -98,6 +98,24 @@ export function motionAllowed() {
   return !prefersReducedMotion();
 }
 
+/* 动效档位。「标准」全开；「轻量」只留短反馈 —— 页面推拉、弹窗换挡、列表重排、
+   图表生长这类整块运动都不播，改成立刻到位。开关在设置页，值记在 mg-motion。
+   注意和 motionAllowed 的分工：后者是系统级底线（后台/减少动态），这里是我们自己的档位。 */
+let level = 'standard';
+
+export function setMotionLevel(next) {
+  level = next === 'light' ? 'light' : 'standard';
+}
+
+export function motionLevel() {
+  return level;
+}
+
+/** 整块运动该不该播：标准档 + 系统没要求减弱 + 页面在前台。 */
+export function richMotion() {
+  return level !== 'light' && motionAllowed();
+}
+
 function schedule() {
   if (frame) return;
   last = now();

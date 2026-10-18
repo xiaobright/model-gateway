@@ -81,7 +81,7 @@ function harness(stored = null, { autoReady = true, springTokens = {}, dialogs =
   vm.runInContext(source, context);
   const api = vm.runInContext('({ initMotion, toggleMotion, moveNavMarker, slideIn, updateNumber,'
     + ' initViewStage, showViewLayer, createIndicator, syncSegMarkers, readBarWidths, morphBars,'
-    + ' enterHighlight, closeDialog, openDialog, springAnimate, morphDialog })', context);
+    + ' enterHighlight, enterStagger, closeDialog, openDialog, springAnimate, morphDialog, richMotion, setMotionLevel })', context);
   const control = api.initMotion();
   const flush = (step = 16) => {
     clock += step;
@@ -505,4 +505,46 @@ test('弹窗换挡：减弱动效直接落位，弹窗没开时不碰尺寸', ()
   closed.open = false;
   h.api.morphDialog(closed, () => { closed._w = 740; });
   assert.equal(closed.style.width, undefined, '没打开的弹窗不需要量也不需要动');
+});
+
+/* ---------------------------------------------------------------- 动效档位 */
+
+test('轻量档：整块位移类动效不播，短反馈照旧', () => {
+  const h = harness();
+  assert.equal(h.api.richMotion(), true);
+
+  const rows = [surface(), surface()];
+  h.api.enterStagger(rows);
+  assert.ok(rows.every((el) => el.animated.length === 1), '标准档有级联入场');
+
+  h.api.setMotionLevel('light');
+  assert.equal(h.api.richMotion(), false);
+
+  const quiet = [surface(), surface()];
+  h.api.enterStagger(quiet);
+  assert.equal(quiet[0].animated.length, 0, '轻量档不播列表级联');
+  assert.equal(quiet[1].animated.length, 0);
+
+  const dlg = frameSurface(420, 470);
+  h.api.morphDialog(dlg, () => { dlg._w = 740; dlg._h = 600; });
+  assert.equal(dlg.classes.has('is-morphing'), false, '轻量档换挡直接落位');
+  assert.equal(dlg.style.width, '');
+
+  // 短反馈（淡入）不受档位影响：状态变化还是要看得见
+  const one = surface();
+  h.api.springAnimate(one, [{ opacity: 0 }, { opacity: 1 }], { duration: 160 });
+  assert.equal(one.animated.length, 1, '轻量档保留短过渡');
+});
+
+test('动效开关：切到轻量会落下 data-motion、记住选择，并能切回来', () => {
+  const h = harness();
+  assert.equal(h.api.toggleMotion(), 'light');
+  assert.equal(h.root.dataset.motion, 'light');
+  assert.equal(h.storage.value, 'light');
+  assert.equal(h.api.richMotion(), false);
+
+  assert.equal(h.api.toggleMotion(), 'standard');
+  assert.equal(h.root.dataset.motion, 'standard');
+  assert.equal(h.storage.value, 'standard');
+  assert.equal(h.api.richMotion(), true);
 });

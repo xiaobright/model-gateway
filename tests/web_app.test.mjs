@@ -90,6 +90,7 @@ function harness(t) {
       return true;
     },
     reduceMotion: () => motionReduced,
+    richMotion: () => !motionReduced,
     moveNavMarker: noop, slideIn: (el) => h.slides.push(el), fadeIn: noop, toggleMotion: noop,
     readBarWidths: () => new Map(), morphBars: noop,
     enterStagger: noop, springAnimate: noop, SPRING: { bouncy: 'ease', smooth: 'ease', snappy: 'ease' },
