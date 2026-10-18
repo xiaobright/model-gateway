@@ -11,7 +11,7 @@ test('风格登记表：id 唯一、能直接用作属性选择器、默认风�
     // id 会拼进 :root[data-style="..."]，只放小写字母数字和连字符
     assert.match(s.id, /^[a-z][a-z0-9-]*$/);
     assert.ok(s.name, '分段按钮上要显示名字');
-    assert.ok(s.hint, '外观卡片要显示一句话说明');
+    assert.ok(s.hint, '外观卡片的问号悬停要有一句话说明');
   }
   assert.ok(ids.includes(DEFAULT_STYLE));
 });
@@ -40,9 +40,10 @@ test('app.js 的外观卡片接线：分段控件、动作入口和启动顺序�
   const read = (p) => readFileSync(new URL(p, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const html = read('../web/index.html');
   const js = read('../web/app.js');
-  for (const id of ['seg-theme', 'seg-style', 'style-hint']) {
+  for (const id of ['seg-theme', 'seg-style', 'style-q']) {
     assert.ok(html.includes(`id="${id}"`), `设置页缺少 #${id}`);
   }
+  assert.ok(js.includes("$('style-q')") && js.includes('styleHint(current)'), '风格说明要挂到问号的悬停里，不再常驻一行小字');
   for (const act of ["'set-theme'", "'set-style'"]) {
     assert.ok(js.includes(act), `ACTIONS 缺少 ${act}`);
   }

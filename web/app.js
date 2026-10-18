@@ -387,8 +387,8 @@ function renderStyleControls() {
   host.innerHTML = STYLES.map((s) =>
     `<button type="button" class="seg-item${s.id === current ? ' is-on' : ''}" data-act="set-style" data-style="${esc(s.id)}">${esc(s.name)}</button>`
   ).join('');
-  const hint = $('style-hint');
-  if (hint) hint.textContent = styleHint(current);
+  const q = $('style-q');
+  if (q) q.title = styleHint(current);
 }
 
 function setStyle(id, el) {
@@ -554,7 +554,9 @@ function egressHint() {
   const wasHidden = $('up-egress-url').hidden;
   $('up-egress-url').hidden = kind !== 'proxy';
   if (wasHidden && kind === 'proxy') slideIn($('up-egress-url'), { duration: 280, distance: 8, axis: 'x' });
-  $('up-egress-hint').textContent = EGRESS_TIP[kind] || '';
+  // 每种出口的解释挂到问号上；提示行只留给探测结果，换个出口上一轮探测就作废
+  $('up-egress-q').title = EGRESS_TIP[kind] || '';
+  $('up-egress-hint').textContent = '';
 }
 
 /* kind 由后端算（system / direct / vps / proxy），raw 只在编辑代理时按需取回 */
@@ -585,7 +587,7 @@ async function probeUpstream() {
       const dot = r.ok ? (r.status < 400 ? 'good' : 'warn') : 'crit';
       const what = r.ok ? `${r.status}` : esc(r.error.slice(0, 60));
       return `<span class="dot dot-${dot}"></span>${esc(r.label)} ${what} <span class="dim">${r.ms}ms</span>`;
-    }).join(' &nbsp; ') + '<br><span class="dim">拿到状态码就算这扇门能到站（401 也算 —— 问的是网络，不是 key）</span>';
+    }).join(' &nbsp; ');
   } catch (e) {
     if (seq === upstreamEditSeq && $('up-dialog').open) host.textContent = `测出口失败：${e.message}`;
   }
@@ -622,7 +624,7 @@ async function openUpstream(id) {
 
   const hint = $('up-groups-hint');
   hint.hidden = Boolean(u);
-  if (!u) hint.innerHTML = '保存后就能在这里加第一个分组：选接口（Anthropic Messages / OpenAI Responses / Chat Completions）＋ 填那把 key。';
+  if (!u) hint.innerHTML = '先保存供应商，才能加分组：接口、API Key 和模型列表都挂在分组上。';
   $('up-dialog').dataset.upstreamSession = String(seq);
   openDialog($('up-dialog'));
   views.renderUpGroups();      // 已有的供应商在这儿直接管分组，不用回列表里展开

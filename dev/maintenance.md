@@ -671,6 +671,8 @@ node dev/verify-scan-add.mjs 8399
 
 明暗（`data-theme`：auto/light/dark）与风格（`data-style`）是两个正交的轴，选择分别记在本机 `mg-theme`、`mg-style`，不随网关配置走，也不进数据库。控件在设置页「外观」卡片，侧栏保留明暗圆钮做快捷切换；两个入口改同一份状态，`applyTheme` 会顺手同步分段选中。风格皮肤只重新声明 `style.css` `:root` 里的同一批 token（契约注释在文件开头），两套明暗值各自用 `light-dark()` 给，`color-scheme` 仍由 `data-theme` 决定；没声明的 token 继承默认值，所以皮肤可以只写自己要改的那几个。新增风格 = `web/theme.js` 的 `STYLES` 登记一行 + `style.css` 加一段 `:root[data-style="id"]`，JS 不用动；id 只用小写字母、数字和连字符（会拼进属性选择器）。明暗和风格切换共用 `app.js` 的 `withCircleReveal` 圆形揭开，与视图过渡互斥、dpr 非 1 时用百分比半径这些规则不变。
 
+解释性小字不常驻：界面不摆「说明书」段落，使用说明一律收成标题/标签旁的 `.hint-q` 问号（内容写在 `title` 里，悬停变色，`cursor: help`），纯啰嗦的直接删。动态状态——探测结果、拉取计数、接口锁定原因、空状态引导——仍然常驻，它们说的是当前这份数据，不是使用方法；安全类警告（请求文本替换的「会改你的请求内容」）也保持常驻。问号的 title 由 JS 写时（`#style-q`、`#up-egress-q`）跟着当前选择更新；出口那行提示只留给探测结果，每种出口的静态解释在问号上，「测一下」的「401 也算」口径在按钮自己的 `title` 里。分组弹窗底部和供应商弹窗底部的「保存边界」说明同样收成问号。删段落之后要确认卡片/弹窗排版不塌：`node dev/verify-hint-cleanup.mjs 8341` 会查「没有常驻 card-hint、静态问号都带 title、各弹窗无横向溢出」，并出 dev/hint-*.png 截图。
+
 「标准 / 轻量」动效切换在设置页的外观卡片里并本地记忆，档位由 `spring.js` 的 `setMotionLevel()` 同步给内核（`richMotion()` 是统一的闸门）：
 - 标准全开；轻量只留短反馈 —— 视图推拉（`createViewStage`）、弹窗换挡（`morphDialog`）、列表/详情级联（`enterStagger`、`animateDetailSwap`、`flipElements`）、
   分组展开折叠（`animateRowHeights`）、图表（`morphBars`、`donut`、`animateWindowChange`）、主题圆形揭开（`app.js` 的 `withCircleReveal`）、

@@ -123,12 +123,11 @@
     <!-- ---------- 实时 ---------- -->
     <section class="view" data-view="live" hidden>
       <div class="view-head">
-        <h2>实时请求</h2><span class="count" id="live-total"></span>
+        <h2>实时请求</h2><span class="hint-q" title="查看当前上游、等待阶段与尝试经过。结束的请求保留 90 秒；中断只影响选中的请求。">?</span><span class="count" id="live-total"></span>
         <span class="grow"></span>
         <button class="btn btn-ghost btn-sm" data-act="go-settings">换站与超时设置</button>
       </div>
       <section class="card" data-flat>
-        <p class="card-hint">查看当前上游、等待阶段与尝试经过。结束的请求保留 90 秒；中断只影响选中的请求。</p>
         <div class="card-body scroll-y">
           <div id="live-list"></div>
           <div class="call-sep" id="recent-sep" hidden></div>
@@ -136,9 +135,7 @@
         </div>
       </section>
       <section class="card" data-flat>
-        <div class="card-head"><h2>分组健康</h2><span class="count" id="brk-count"></span></div>
-        <p class="card-hint">同一个分组连续失败 2 次就冷却 90 秒，再失败翻倍、封顶 10 分钟；冷却期内自动降级
-          跳过它。手动设为首选会立刻生效，并清除冷却。这些状态只在内存里，重启就清零。</p>
+        <div class="card-head"><h2>分组健康</h2><span class="hint-q" title="同一个分组连续失败 2 次就冷却 90 秒，再失败翻倍、封顶 10 分钟；冷却期内自动降级跳过它。手动设为首选会立刻生效，并清除冷却。这些状态只在内存里，重启就清零。">?</span><span class="count" id="brk-count"></span></div>
         <div class="card-body" id="brk-list"></div>
       </section>
     </section>
@@ -146,12 +143,11 @@
     <!-- ---------- 上游站点 ---------- -->
     <section class="view" data-view="upstreams" hidden>
       <div class="view-head">
-        <h2>上游站点</h2><span class="count" id="upstream-count"></span>
+        <h2>上游站点</h2><span class="count" id="upstream-count"></span><span class="hint-q" title="站点保存地址与连接方式，分组保存接口、密钥和模型目录。展开站点即可管理分组。">?</span>
         <span class="grow"></span>
         <button class="btn btn-sm" data-act="new-upstream">添加供应商</button>
       </div>
       <section class="card" data-flat>
-        <p class="card-hint">站点保存地址与连接方式，分组保存接口、密钥和模型目录。展开站点即可管理分组。</p>
         <div class="card-body scroll-x">
           <table class="tbl-upstreams">
             <thead><tr>
@@ -186,7 +182,7 @@
         <button class="btn btn-ghost btn-sm" data-act="reload-log">刷新</button>
         <button class="btn btn-danger btn-sm" data-act="clear-log">清空</button>
       </div>
-      <div class="log-filters"><input type="search" class="search" id="log-filter" placeholder="搜索模型、上游、客户端或结果…" aria-label="搜索转发记录"><label class="checkline"><input type="checkbox" id="log-issues">只看异常或中断</label><span class="dim">筛选最近已加载的记录</span></div>
+      <div class="log-filters"><input type="search" class="search" id="log-filter" placeholder="搜索模型、上游、客户端或结果…" aria-label="搜索转发记录"><label class="checkline"><input type="checkbox" id="log-issues">只看异常或中断</label><span class="hint-q" title="筛选只对已经加载进来的记录生效">?</span></div>
       <section class="card" data-flat>
         <div class="card-body scroll-y scroll-x">
           <table class="tbl-log">
@@ -206,8 +202,7 @@
     <section class="view" data-view="settings" hidden>
       <div class="view-head"><div><span class="eyebrow">网关行为</span><h2>网关设置</h2><p class="view-description">全局策略集中管理，模型和站点配置各自独立。</p></div></div>
       <section class="card">
-        <div class="card-head"><h2>外观</h2><span class="tag">即时生效</span></div>
-        <p class="card-hint">明暗和风格是两个独立的轴，各选各的；选择只记在这台浏览器里，不随网关配置走。</p>
+        <div class="card-head"><h2>外观</h2><span class="hint-q" title="明暗和风格是两个独立的轴，各选各的；选择只记在这台浏览器里，不随网关配置走。">?</span><span class="tag">即时生效</span></div>
         <div class="card-body">
           <div class="appearance-row">
             <span class="appearance-label">明暗</span>
@@ -219,6 +214,7 @@
           </div>
           <div class="appearance-row">
             <span class="appearance-label">风格</span>
+            <span class="hint-q" id="style-q" title=""></span>
             <span class="seg" id="seg-style" role="group" aria-label="主题风格"></span>
           </div>
           <div class="appearance-row">
@@ -226,14 +222,13 @@
             <button type="button" class="btn btn-ghost btn-sm" id="motion-toggle" data-act="toggle-motion"
                     title="标准保留环境流动和随动光感；轻量保留短交互动效">标准</button>
           </div>
-          <p class="card-hint" id="style-hint" aria-live="polite"></p>
         </div>
       </section>
       <div class="cols settings-grid">
-        <section class="card"><div class="card-head"><h2>接口开关</h2><span class="tag">即时生效</span></div><p class="card-hint">关闭接口会隐藏相关配置并拒绝新请求，已有配置保留。</p><div class="side-proto card-body" id="proto-switches" role="group" aria-label="接口全局开关"></div></section>
-        <section class="card"><div class="card-head"><h2>失败与超时</h2><span class="tag">即时生效</span></div><p class="card-hint">失败自动换站按接口设置；无内容超时是全局设置，0 表示关闭。等响应头与首个内容不计时。</p><div class="fo-box policy-fields card-body" id="failover-box"></div></section>
+        <section class="card"><div class="card-head"><h2>接口开关</h2><span class="hint-q" title="关闭接口会隐藏相关配置并拒绝新请求，已有配置保留。">?</span><span class="tag">即时生效</span></div><div class="side-proto card-body" id="proto-switches" role="group" aria-label="接口全局开关"></div></section>
+        <section class="card"><div class="card-head"><h2>失败与超时</h2><span class="hint-q" title="失败自动换站按接口设置；无内容超时是全局设置，0 表示关闭。等响应头与首个内容不计时。">?</span><span class="tag">即时生效</span></div><div class="fo-box policy-fields card-body" id="failover-box"></div></section>
       </div>
-      <section class="card"><div class="card-head"><h2>联网搜索上游</h2><span class="tag tag-accent" id="search-target-tag" hidden></span><span class="grow"></span><button class="btn btn-ghost btn-sm" data-act="open-search">配置搜索上游</button></div><p class="card-hint">Alpha Search 可以指定独立上游，也可以跟随模型的候选链。</p></section>
+      <section class="card"><div class="card-head"><h2>联网搜索上游</h2><span class="hint-q" title="Alpha Search 可以指定独立上游，也可以跟随模型的候选链。">?</span><span class="tag tag-accent" id="search-target-tag" hidden></span><span class="grow"></span><button class="btn btn-ghost btn-sm" data-act="open-search">配置搜索上游</button></div></section>
       <section class="card" data-flat>
         <div class="card-head"><h2>请求文本替换</h2><span class="count" id="rewrite-count"></span></div>
         <div class="card-body">
@@ -289,7 +284,9 @@
             </select>
             <input type="text" id="up-egress-url" hidden autocomplete="off" aria-label="代理地址"
                    placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
-            <button type="button" class="btn btn-ghost btn-sm" data-act="probe-upstream">测一下</button>
+            <span class="hint-q" id="up-egress-q" title=""></span>
+            <button type="button" class="btn btn-ghost btn-sm" data-act="probe-upstream"
+                    title="从每扇门各打一次。拿到状态码就算这扇门能到站（401 也算 —— 问的是网络，不是 key）">测一下</button>
           </div>
           <span class="dim" id="up-egress-hint" style="font-size:12px;margin-top:5px"></span>
         </div>
@@ -320,9 +317,6 @@
             <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="transient400">偶发 400，同站再试 2 次</button>
             <button type="button" class="btn btn-ghost btn-sm" data-act="preset-retry" data-r="capacity">容量 503，隔 300ms 再试 2 次</button>
           </div>
-          <span class="dim" style="font-size:12px;margin-top:6px;display:block">
-            上游偶发 400、或 capacity 503 这类「下一发就好」的毛病，都靠这个在网关里吞掉，客户端不停。
-          </span>
         </div>
       </details>
 
@@ -332,16 +326,13 @@
         <div class="adv-body">
           <label class="field">JSON 对象。同一份请求连着 after 次只拿回「200、没有完成事件、也没有一个字正文」时，
             下一次先把响应扣在网关里；还是空的就在原站重发，最多 times 次。delay_ms 是重发间隔毫秒。
+            <span class="hint-q" title="给排队排不进去时会回 200 加一段错误信封的站用（anyrouter / AgentRouter 这类公益站）。正常流式一见到第一个字就直接放行，不会拖慢好请求；扣住重发的那几次客户端看不到。">?</span>
             <textarea id="up-hold" rows="2" placeholder='{"after":2,"times":3,"delay_ms":0}'></textarea>
           </label>
           <div class="field-row" style="margin-top:8px">
             <button type="button" class="btn btn-ghost btn-sm" data-act="preset-hold" data-h="default">连错 2 次后拦截，重发 3 次</button>
             <button type="button" class="btn btn-ghost btn-sm" data-act="preset-hold" data-h="strict">要求响应字节完全相同</button>
           </div>
-          <span class="dim" style="font-size:12px;margin-top:6px;display:block">
-            给排队排不进去时会回 <code>200</code> 加一段错误信封的站用（anyrouter / AgentRouter 这类公益站）。
-            正常流式一见到第一个字就直接放行，不会拖慢好请求；扣住重发的那几次客户端看不到。
-          </span>
         </div>
       </details>
 
@@ -351,13 +342,12 @@
         <div id="up-groups"></div>
         <div class="field-row" style="margin-top:10px">
           <button type="button" class="btn btn-ghost btn-sm" data-act="new-group" id="up-add-group">＋ 添加分组</button>
-          <span class="dim" style="font-size:12px">接口、API Key、模型列表都在分组上</span>
         </div>
       </div>
       <p class="card-hint" id="up-groups-hint" hidden style="margin:14px 0 0"></p>
     </div>
     <div class="dlg-foot">
-      <span class="dim" style="font-size:12px">名称 / 地址 / 覆写要点保存才生效</span>
+      <span class="hint-q" title="只保存站点的名称、地址与请求头覆写；分组改动在各自的分组弹窗里保存">?</span>
       <span class="grow"></span>
       <button type="submit" class="btn" id="up-save">保存</button>
     </div>
@@ -398,13 +388,7 @@
 
       <!-- 上游模型目录是即时生效的：勾上=登记，取消=从目录去掉，和上面那些要保存的字段分开 -->
       <div id="grp-import" hidden>
-        <div class="dlg-section divider">模型目录 · 即时生效 <span class="tag" id="grp-mcount"></span></div>
-        <p class="dim" style="font-size:12px;margin:0 0 9px">
-          勾上 / 取消<b>立刻生效</b>，不用点保存。每行右侧的选择框决定这个上游模型<b>对应到哪个下游</b>：
-          对应到完全匹配 / 部分匹配的现有模型、新开一个下游模型、或只留着不暴露 —— 勾选和换选择都当场生效，
-          全选也会按每行的选择处理。建议只在这个接口的下游模型里找（同名模型在另一种接口下是另一条链，不算匹配），
-          弹窗里新开过下游模型后会重新问一次。已经挂在下游底下的行是锁着的，改映射去「模型路由」。
-          上面的组名、接口、Key 才要保存。</p>
+        <div class="dlg-section divider">模型目录 · 即时生效 <span class="hint-q" id="grp-catalog-q" title="勾上 / 取消立刻生效，不用点保存。每行右侧的选择框决定这个上游模型对应到哪个下游：完全匹配 / 部分匹配的现有模型、新开一个下游模型、或只留着不暴露；全选也会按每行的选择处理。建议只在这个接口的下游模型里找（同名模型在另一种接口下是另一条链，不算匹配）。已经挂在下游底下的行是锁着的，改映射去「模型路由」。组名、接口、Key 才要保存。">?</span><span class="tag" id="grp-mcount"></span></div>
         <div class="field-row">
           <button type="button" class="btn btn-ghost btn-sm" data-act="pull-models">拉取模型列表</button>
           <button type="button" class="btn btn-ghost btn-sm" data-act="pick-all">全选</button>
@@ -424,7 +408,6 @@
     </div>
     <div class="dlg-foot">
       <span class="grow"></span>
-      <span class="dim">此按钮仅保存分组信息</span>
       <button type="submit" class="btn" id="grp-save">保存分组</button>
     </div>
   </form>
@@ -522,14 +505,10 @@
 <dialog id="search-dialog" class="sm">
   <form id="search-form">
     <div class="dlg-head">
-      <h2>搜索上游</h2><span class="grow"></span>
+      <h2>搜索上游</h2><span class="hint-q" title="Codex 的联网搜索（/v1/alpha/search）默认跟着模型的候选链走。这里可以单独指定一个 OpenAI 分组专门做搜索 —— 有些站搜索能用但普通模型不通，或者只有某个分组带搜索权限。只影响搜索，不影响普通对话。">?</span><span class="grow"></span>
       <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
     </div>
     <div class="dlg-body">
-      <p class="card-hint" style="margin:0 0 12px">
-        Codex 的联网搜索（<code>/v1/alpha/search</code>）默认跟着模型的候选链走。这里可以单独
-        指定一个 <b>OpenAI</b> 分组专门做搜索 —— 有些站搜索能用但普通模型不通，或者只有某个
-        分组带搜索权限。只影响搜索，不影响普通对话。</p>
       <label class="field">供应商
         <select id="sr-upstream"></select>
       </label>
@@ -552,7 +531,7 @@
 <dialog id="fwd-dialog" class="sm">
   <form id="fwd-form">
     <div class="dlg-head">
-      <h2 id="fwd-title">整条链交给…</h2><span class="grow"></span>
+      <h2 id="fwd-title">整条链交给…</h2><span class="hint-q" title="转发是同接口内的：目标必须在同一个接口下有可用候选，否则转过去也是 404。设置后自己这条链的候选不参与路由（配置留着，取消转发就恢复）。">?</span><span class="grow"></span>
       <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
     </div>
     <div class="dlg-body">
@@ -560,10 +539,6 @@
       <label class="field">接到哪个下游模型
         <select id="fwd-target"></select>
       </label>
-      <p class="dim" style="font-size:12px;margin:10px 0 0">
-        转发是<b>同接口内</b>的：目标必须在同一个接口下有可用候选，否则转过去也是 404。
-        设置后自己这条链的候选<b>不参与路由</b>（配置留着，取消转发就恢复）。
-      </p>
     </div>
     <div class="dlg-foot">
       <button type="button" class="btn btn-danger" data-act="fwd-clear" id="fwd-clear" hidden>取消转发</button>

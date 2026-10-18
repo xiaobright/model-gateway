@@ -202,6 +202,14 @@ h3 { font-size: 14px; }
 .card-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
 .card-body { min-width: 0; }
 .card-hint { color: var(--ink-3); font-size: 12px; margin: 10px 0 16px; line-height: 1.8; }
+/* 悬停问号：解释性小字从常驻改成悬停可读 —— 一个圈跟在标题/标签旁边，信息不丢、界面不吵 */
+.hint-q { display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 15px; height: 15px; border: 1px solid var(--hair); border-radius: 50%;
+  font-size: 10px; font-weight: 600; line-height: 1; color: var(--ink-3); cursor: help;
+  user-select: none; transition: color .18s var(--spring-smooth), border-color .18s; }
+.hint-q:hover { color: var(--accent); border-color: var(--accent); }
+/* 标题旁边的问号往标题上贴一点，别被 flex 间距推得漂着 */
+.card-head .hint-q, .dlg-head .hint-q, .view-head .hint-q { margin-left: -6px; }
 .cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 
 /* ------------------------------------------------ 分段控制器：物理弹簧滑动胶囊 */
