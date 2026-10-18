@@ -127,6 +127,7 @@ def main() -> None:
                 inflight.progress(call, 1600, text_bytes=400)
 
     from gateway.app import create_app
+    config.set_bind('127.0.0.1', args.port)   # 和正式启动一样，让 /access-info 报对端口
     print(f'Isolated preview: http://127.0.0.1:{args.port}/ | DB: {config.DB_PATH}', flush=True)
     uvicorn.run(create_app(), host='127.0.0.1', port=args.port, log_level='warning')
 

@@ -169,14 +169,21 @@ h3 { font-size: 14px; }
   50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--good) 3%, transparent); }
 }
 :root[data-motion="light"] .live-dot.is-live { animation: none; }
-.side-foot { margin-top: auto; padding-top: 30px; display: grid; gap: 12px; }
-.motion-toggle { padding: 4px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-3); font-size: 11px; transition: background .2s, color .2s, transform .26s var(--spring-bouncy); }
-.motion-toggle:hover { background: var(--hover); color: var(--ink-2); }
-.motion-toggle:active { transform: scale(.95); }
-.pill { display: block; border: 0; background: none; color: var(--ink-3); padding: 4px 6px; border-radius: 8px; text-align: center; min-width: 0; transition: background .2s, color .2s, transform .26s var(--spring-bouncy); }
-.pill:hover { background: var(--hover); color: var(--ink-2); transform: translateY(-1px); }
-.pill:active { transform: scale(.96); }
-.pill code { display: block; font: 10.5px var(--mono); overflow: hidden; text-overflow: ellipsis; }
+.side-foot { margin-top: auto; padding-top: 30px; display: flex; align-items: center; gap: 8px; }
+/* 一块两用：平时显示访问地址，悬停整块上滚一行露出「下游接入」，点开看各接口该填什么。
+   滚上去和滚回来都走全站同一条弹簧曲线（--spring 是 24 点 linear() 采样）。 */
+.access-roll { flex: 1; min-width: 0; height: 32px; padding: 0; overflow: hidden; cursor: pointer;
+  border: 1px solid var(--hair); border-radius: 9px; background: var(--glass-sunken); color: var(--ink-3);
+  transition: border-color .22s, color .22s; }
+.access-roll:hover, .access-roll:focus-visible { border-color: var(--hair-2); color: var(--ink-2); }
+.access-roll-track { display: block; transition: transform .34s var(--spring); }
+.access-roll:hover .access-roll-track, .access-roll:focus-visible .access-roll-track { transform: translateY(-30px); }
+.access-roll-line { display: flex; align-items: center; justify-content: center; height: 30px; padding: 0 8px;
+  font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.access-roll code { font: 10px var(--mono); }
+.access-roll-alt { color: var(--ink-2); }
+.access-closed { flex: 1; min-width: 0; height: 32px; display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--hair); border-radius: 9px; font-size: 11px; color: var(--ink-3); }
 #theme-icon { display: inline-block; transition: transform .42s var(--spring-bouncy); }
 [data-act="toggle-theme"]:hover #theme-icon { transform: rotate(22deg) scale(1.12); }
 [data-act="toggle-theme"]:active #theme-icon { transform: rotate(-18deg) scale(.9); }
@@ -563,9 +570,6 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .pick-note { font-size: 11.5px; color: var(--ink-3); padding: 6px; font-family: -apple-system, sans-serif; }
 
 /* 侧栏底部：「下游接入」和主题切换并排，接入按钮占满剩余宽度 */
-.foot-row { display: flex; align-items: center; gap: 8px; }
-.foot-row .btn:first-child { flex: 1; }
-
 /* 复选行：勾选框和文字对齐，可以并排放几个 */
 .checkline { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer; transition: color .2s; }
 .checkline:hover { color: var(--ink); }
@@ -611,10 +615,21 @@ tbody tr:hover td { background: var(--hover); }
 .request-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 17px 25px; }
 .request-facts dt { color: var(--ink-3); font-size: 11px; }
 .request-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: 13px; }
-.access-row { margin-bottom: 18px; }
-.access-row:last-child { margin-bottom: 0; }
-.access-row input[readonly], .access-row textarea[readonly] { font-family: var(--mono); color: var(--ink); cursor: text; }
 .card-hint code, .dlg-body code { font: 12px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
+/* 接入弹窗：一行一个接口，点一行复制一行；没有说明段落，该说的都在地址里。 */
+.access-list { display: grid; gap: 8px; }
+.access-line { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0;
+  padding: 10px 12px; border: 1px solid var(--hair); border-radius: 10px;
+  background: var(--glass-sunken); color: var(--ink-2); font-size: 12px; text-align: left;
+  transition: background .2s, border-color .2s, transform .24s var(--spring-bouncy); }
+button.access-line:hover { background: var(--hover); border-color: var(--hair-2); }
+button.access-line:active { transform: scale(.99); }
+.access-line code { margin-left: auto; font: 11px var(--mono); color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.access-line-label { flex: none; }
+.access-copy { flex: none; font-size: 11px; color: var(--accent); opacity: 0; transition: opacity .2s; }
+button.access-line:hover .access-copy, button.access-line:focus-visible .access-copy { opacity: 1; }
+.access-line.is-static { border-style: dashed; background: none; }
 
 /* Metrics and charts live on the usage page. */
 .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 15px; margin-bottom: 20px; }
@@ -700,11 +715,11 @@ tbody tr:hover td { background: var(--hover); }
 ::-webkit-scrollbar { width: 7px; height: 7px; }::-webkit-scrollbar-thumb { background: var(--hair-2); border-radius: 8px; }
 @media (max-width: 1250px) { .shell { grid-template-columns: 184px minmax(0, 1fr); gap: 20px; padding: 20px; }.route-workspace { grid-template-columns: minmax(0, 1fr) 330px; }.route-columns, .route { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 90px; padding: 13px; }.route-usage, .route-columns > :last-child { display: none; }.cols { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 1100px) { .route-workspace { grid-template-columns: minmax(0, 1fr); }.route-detail { position: static; }.route-columns, .route { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 110px 55px; }.route-usage, .route-columns > :last-child { display: block; }.kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 760px) { .shell { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 20px; }.sidebar { position: static; min-height: 0; max-height: none; overflow: visible; overscroll-behavior: auto; padding: 14px; }.brand { padding-bottom: 8px; }.nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }.nav-item { padding: 7px; gap: 6px; justify-content: center; font-size: 12px; }.nav-label { flex: none; }.nav-ico { font-size: 15px; }.nav-badge { display: none; }.side-live { display: none; }.side-foot { padding-top: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }.side-foot .foot-row { flex: none; }.pill code { font-size: 10px; }.view-head h2 { font-size: 24px; }.view-head { gap: 9px; }.view-head > .grow { display: none; }.view-head > div:first-child { width: 100%; }.main { padding-top: 0; }.route-filters { align-items: stretch; }.route-filters .search, .log-filters .search { max-width: none; }.route-columns, .route { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) 90px; gap: 8px; }.route-usage, .route-columns > :last-child { display: none; }.route strong { font-size: 12px; }.card { padding: 16px; }.workspace-status { gap: 10px; }.workspace-status .grow { display: none; }.route-detail { padding: 17px; }.request-facts { grid-template-columns: minmax(0, 1fr); }.grid-2 { grid-template-columns: minmax(0, 1fr) 90px; }.kpi { padding: 13px; }.kpi-value { font-size: 23px; }.kpi-ring-host { display: none; } }
+@media (max-width: 760px) { .shell { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 20px; }.sidebar { position: static; min-height: 0; max-height: none; overflow: visible; overscroll-behavior: auto; padding: 14px; }.brand { padding-bottom: 8px; }.nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }.nav-item { padding: 7px; gap: 6px; justify-content: center; font-size: 12px; }.nav-label { flex: none; }.nav-ico { font-size: 15px; }.nav-badge { display: none; }.side-live { display: none; }.side-foot { padding-top: 8px; }.pill code { font-size: 10px; }.view-head h2 { font-size: 24px; }.view-head { gap: 9px; }.view-head > .grow { display: none; }.view-head > div:first-child { width: 100%; }.main { padding-top: 0; }.route-filters { align-items: stretch; }.route-filters .search, .log-filters .search { max-width: none; }.route-columns, .route { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) 90px; gap: 8px; }.route-usage, .route-columns > :last-child { display: none; }.route strong { font-size: 12px; }.card { padding: 16px; }.workspace-status { gap: 10px; }.workspace-status .grow { display: none; }.route-detail { padding: 17px; }.request-facts { grid-template-columns: minmax(0, 1fr); }.grid-2 { grid-template-columns: minmax(0, 1fr) 90px; }.kpi { padding: 13px; }.kpi-value { font-size: 23px; }.kpi-ring-host { display: none; } }
 @media (max-width: 400px) { .nav-ico { display: none; }.side-foot { flex-wrap: wrap; }.route-columns, .route { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); }.route-state { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; }.route-state small { margin: 0; }.route-columns span:nth-child(3) { display: none; }.health-row { grid-template-columns: minmax(0, 1fr) 45px 40px; }.h-p95,.h-n { display: none; }.bar-row { grid-template-columns: minmax(0, 1fr) 48px 40px; }.bar-note { display: none; } }
 @media (pointer: coarse) { button, .btn, .seg-item { min-height: 36px; }.candidate-actions .btn { min-width: 36px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
-@media (max-width: 760px) { .side-foot { flex-wrap: wrap; }.motion-toggle { margin-left: auto; }.ambient i { width: 125vw; height: 90vh; }.ambient-blue { left: -50%; }.ambient-violet { right: -50%; } }
+@media (max-width: 760px) { .side-foot { flex-wrap: wrap; }.ambient i { width: 125vw; height: 90vh; }.ambient-blue { left: -50%; }.ambient-violet { right: -50%; } }
 @media (hover: none) { .btn:hover, .kpi:hover, .side-live:hover, .candidate:hover { transform: none; } }
 @supports not (backdrop-filter: blur(1px)) { .sidebar, .route-table, .route-detail, .card, .kpi { background-color: var(--solid); } }
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) { .sidebar, .route-table, .route-detail, .card, .kpi, dialog { backdrop-filter: none; background: var(--solid); } }

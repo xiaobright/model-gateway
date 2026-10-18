@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from . import (
-    capture, db, failover, inflight, protocols, proxy as proxy_mod, rewrite, truncation,
+    capture, config, db, failover, inflight, protocols, proxy as proxy_mod, rewrite, truncation,
 )
 from . import model_batch
 from . import model_match
@@ -457,6 +457,17 @@ def get_upstreams() -> list[dict[str, Any]]:
 def get_protocols() -> dict[str, list[dict[str, object]]]:
     """前端用的只读协议投影，不暴露描述符里的函数、key 或上游配置。"""
     return {"protocols": protocols.public_metadata()}
+
+
+@router.get("/access-info")
+def get_access_info() -> dict[str, Any]:
+    """管理页左下角该显示哪个地址。
+
+    只听本机就给 127.0.0.1；绑到局域网（0.0.0.0 或某个网卡地址）就给本机的局域网 IP。
+    `local` 只用来在界面上说明「别的设备能不能连」，不参与展示的地址。
+    """
+    host = config.access_host()
+    return {"host": host, "port": config.bind_port(), "local": host == config.DEFAULT_HOST}
 
 
 def _protocol_switches() -> dict[str, dict[str, bool]]:

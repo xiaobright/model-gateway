@@ -77,12 +77,14 @@ try {
   await shot('fix-04-access-dialog');
 
   // 关键：点关闭按钮必须能关掉
+  // 退场是 180ms 的 WAAPI 动画，finished 再排一帧才真正 close；机器忙时会到 300ms 上下，
+  // 所以等 700ms —— 这里验的是「关得掉」，不是「在多少毫秒内关掉」。
   const closed = await evaluate(`(async () => {
     const dlg = document.getElementById('access-dialog');
     const x = dlg.querySelector('[data-act="close-dialog"]');
     if (!x) return 'no-close-btn';
     x.click();
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 700));
     return dlg.open ? 'still-open' : 'closed';
   })()`);
   check('「下游接入」弹窗能正常关闭', closed === 'closed', `结果=${closed}`);

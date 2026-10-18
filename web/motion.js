@@ -814,7 +814,7 @@ export function initMotion() {
     root.dataset.motion = mode;
     root.toggleAttribute('data-page-hidden', !visible());
     if (toggle) {
-      toggle.textContent = reduced.matches ? '动效 · 跟随系统减弱' : `动效 · ${mode === 'light' ? '轻量' : '标准'}`;
+      toggle.textContent = reduced.matches ? '跟随系统减弱' : (mode === 'light' ? '轻量' : '标准');
       toggle.disabled = reduced.matches;
       toggle.setAttribute('aria-label', reduced.matches ? '系统已开启减少动态效果' : `当前为${mode === 'light' ? '轻量' : '标准'}动效，点击切换`);
     }

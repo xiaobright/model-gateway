@@ -7,6 +7,7 @@ import time
 
 import uvicorn
 
+from . import config
 from .app import create_app
 from .startup import StartupError, logger
 
@@ -87,6 +88,7 @@ def request_shutdown() -> bool:
 
 def start_server_thread(port: int, host: str = "127.0.0.1") -> tuple[GatewayServer, threading.Thread]:
     logger.info("初始化服务 host=%s port=%s", host, port)
+    config.set_bind(host, port)
     try:
         server = GatewayServer(uvicorn.Config(create_app(), host=host, port=port, log_level="warning"))
     except Exception as exc:

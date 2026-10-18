@@ -43,16 +43,17 @@
     </button>
 
     <div class="side-foot">
-      <button class="pill" data-act="copy-endpoint" title="点击复制 Codex / OpenAI 兼容客户端要填的 API 地址">
-        <code id="endpoint">…</code>
+      <!-- 一块两用：平时是访问地址，悬停整块上滚一行露出「下游接入」，点开看各接口该填什么 -->
+      <button type="button" class="access-roll" id="access-roll" data-act="show-access" aria-label="下游接入">
+        <span class="access-roll-track">
+          <span class="access-roll-line"><code id="endpoint">…</code></span>
+          <span class="access-roll-line access-roll-alt">下游接入</span>
+        </span>
       </button>
-      <div class="foot-row">
-        <button class="btn btn-ghost btn-sm" data-act="show-access">下游接入</button>
-        <button class="btn btn-ghost btn-icon" data-act="toggle-theme" title="切换深浅色" aria-label="切换深浅色">
-          <span id="theme-icon">◐</span>
-        </button>
-      </div>
-      <button class="motion-toggle" data-act="toggle-motion" id="motion-toggle" title="标准保留环境流动和随动光感；轻量保留短交互动效">动效 · 标准</button>
+      <span class="access-closed" id="access-closed" hidden>接口已关闭</span>
+      <button class="btn btn-ghost btn-icon" data-act="toggle-theme" title="切换深浅色" aria-label="切换深浅色">
+        <span id="theme-icon">◐</span>
+      </button>
     </div>
   </aside>
 
@@ -219,6 +220,11 @@
           <div class="appearance-row">
             <span class="appearance-label">风格</span>
             <span class="seg" id="seg-style" role="group" aria-label="主题风格"></span>
+          </div>
+          <div class="appearance-row">
+            <span class="appearance-label">动效</span>
+            <button type="button" class="btn btn-ghost btn-sm" id="motion-toggle" data-act="toggle-motion"
+                    title="标准保留环境流动和随动光感；轻量保留短交互动效">标准</button>
           </div>
           <p class="card-hint" id="style-hint" aria-live="polite"></p>
         </div>

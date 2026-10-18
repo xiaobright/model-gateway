@@ -59,6 +59,7 @@ function renderProtocolControls() {
   for (const b of $('seg-iface').children) b.classList.toggle('is-on', b.dataset.iface === state.iface);
   for (const b of $('seg-proto').children) b.classList.toggle('is-on', b.dataset.proto === state.proto);
   $('protocol-status').textContent = '';
+  syncAccessEntry();
   syncSegMarkers();
 }
 
@@ -409,77 +410,78 @@ function syncThemeControls(name) {
   syncSegMarkers();
 }
 
-/* ---------------------------------------------------------------- 端点 */
-
-async function copyEndpoint() {
-  const text = `${location.origin}/v1`;
-  try {
-    await navigator.clipboard.writeText(text);
-    toast('已复制 ' + text, 'ok');
-  } catch {
-    toast('复制失败，请手动复制：' + text, 'err');
-  }
-}
-
 /* ---------------------------------------------------------------- 下游接入信息 */
 
-/* Codex 要填到 /v1 为止，Claude Code 的 ANTHROPIC_BASE_URL 反而不能带 /v1（它自己会拼
-   /v1/messages）。两个值不一样，侧栏只放一个的话粘错就是一路 404，所以单独开个弹窗写清楚。 */
-const TIERS = [
-  { key: 'opus', fallback: 'claude-opus-5', env: 'ANTHROPIC_DEFAULT_OPUS_MODEL' },
-  { key: 'sonnet', fallback: 'claude-sonnet-5', env: 'ANTHROPIC_DEFAULT_SONNET_MODEL' },
-  { key: 'haiku', fallback: 'claude-haiku-4-5', env: 'ANTHROPIC_DEFAULT_HAIKU_MODEL' },
-  { key: 'fable', fallback: 'claude-fable-5-1', env: '' },
-];
+/* 服务实际绑在哪由后台说了算（/access-info）：只听本机是 127.0.0.1，绑到局域网就是本机的
+   局域网 IP。拿到之前先用当前页面的 host 顶上，不会闪空。 */
+let accessInfo = null;
 
-/** 已录入的 Anthropic 接口模型里属于这个档位的那个；没有就给个默认名 */
-function tierModel(tier) {
-  const hit = state.routes
-    .filter((r) => r.protocol === 'anthropic')
-    .map((r) => r.model_name)
-    .filter((n) => n.toLowerCase().includes(tier.key));
-  return hit[0] || tier.fallback;
+async function refreshAccessInfo() {
+  try {
+    accessInfo = await api('GET', '/admin/api/access-info');
+  } catch {
+    accessInfo = null;   // 拿不到就退回 location.host，地址仍然是「你现在用的这个」
+  }
+  syncAccessEntry();
 }
 
-function copyRow(labelHtml, value) {
-  // 标签必须整段包在一个 span 里：.field 是 flex column，裸着放的 <code> 会各自成为
-  // 一个 flex item，把「API 地址（填到 /v1 为止）」拆成三行
-  return `<div class="access-row"><div class="field"><span>${labelHtml}</span>
-      <span class="key-wrap">
-        <input type="text" readonly value="${esc(value)}">
-        <button type="button" class="btn btn-ghost btn-sm" data-act="copy-text" data-text="${esc(value)}">复制</button>
-      </span>
-    </div></div>`;
+/** 展示用：主机[:端口]，不带协议、不带 /v1 —— 侧栏只有 130px 左右。 */
+function accessAddress() {
+  const host = accessInfo && accessInfo.host;
+  const port = Number(accessInfo && accessInfo.port) || 0;
+  if (!host) return location.host || '127.0.0.1';
+  return port && port !== 80 ? `${host}:${port}` : host;
 }
 
+/** 拼接用：给客户端填的完整地址（各接口自己再补 /v1）。 */
+function accessOrigin() {
+  const host = accessInfo && accessInfo.host;
+  const port = Number(accessInfo && accessInfo.port) || 0;
+  if (!host) return location.origin;
+  return `http://${host}${port && port !== 80 ? `:${port}` : ''}`;
+}
+
+/* 侧栏左下角那一块：平时显示访问地址，悬停翻成「下游接入」，点开看各接口分别该填什么。
+   接口全关时换成「接口已关闭」——留着地址只会让人去配一个用不上的接口。
+   跟接口开关走，所以挂在协议控件刷新里。 */
+function syncAccessEntry() {
+  const anyOn = protocolOn('openai') || protocolOn('openai-chat') || protocolOn('anthropic');
+  const roll = $('access-roll');
+  if (roll) {
+    roll.hidden = !anyOn;
+    // 别的设备能不能连，和显示哪个地址是同一件事的两面，悬停时说明白
+    roll.title = accessInfo && accessInfo.local === false
+      ? '下游接入（局域网可访问）' : '下游接入（仅本机可访问）';
+  }
+  const closed = $('access-closed');
+  if (closed) closed.hidden = anyOn;
+  const endpoint = $('endpoint');
+  if (endpoint) endpoint.textContent = accessAddress();
+}
+
+/* 弹窗只列「还开着的接口」各自该填的地址，点一行复制一行；API Key 单列一行写「任意」。
+   没有说明段落 —— 该说的都在地址里。接口停用后对应那一行自然消失；
+   关掉弹窗时生成的内容一并清掉，下次打开永远是新的一份。 */
 function showAccess() {
-  const origin = location.origin;
-  const env = [
-    `setx ANTHROPIC_BASE_URL ${origin}`,
-    'setx ANTHROPIC_AUTH_TOKEN local',
-    ...TIERS.filter((t) => t.env).map((t) => `setx ${t.env} ${tierModel(t)}`),
-  ].join('\n');
+  const origin = accessOrigin();
+  const rows = [];
+  // Responses 和 Chat 共用一个 /v1，合成一行；Claude Code 的 BASE_URL 不能带 /v1
+  if (protocolOn('openai') || protocolOn('openai-chat')) {
+    rows.push({ label: 'OpenAI 兼容 · Responses / Chat', url: `${origin}/v1` });
+  }
+  if (protocolOn('anthropic')) rows.push({ label: 'Anthropic · Claude Code', url: origin });
 
-  $('access-body').innerHTML = `
-    <div class="dlg-section">Codex / OpenAI 兼容客户端</div>
-    ${copyRow('API 地址（填到 <code>/v1</code> 为止；Responses 与 Chat Completions 都从这里走）', `${origin}/v1`)}
-    <div class="dlg-section divider">Claude Code</div>
-    ${copyRow('<b>ANTHROPIC_BASE_URL</b>：不要带 <code>/v1</code>，它自己会拼 <code>/v1/messages</code>', origin)}
-    <div class="access-row">
-      <div class="field"><span>环境变量（Windows，设完要重开终端；模型名取自你已录入的档位）</span>
-        <textarea readonly rows="${env.split('\n').length}">${esc(env)}</textarea>
-      </div>
-      <div class="field-row" style="margin-top:7px">
-        <span class="grow"></span>
-        <button type="button" class="btn btn-ghost btn-sm" data-act="copy-text" data-text="${esc(env)}">复制全部</button>
-      </div>
+  $('access-body').innerHTML = `<div class="access-list">
+    ${rows.map((row) => `<button type="button" class="access-line" data-act="copy-text" data-text="${esc(row.url)}">
+      <span class="access-line-label">${esc(row.label)}</span>
+      <code>${esc(row.url)}</code>
+      <span class="access-copy" aria-hidden="true">复制</span>
+    </button>`).join('')}
+    <div class="access-line is-static">
+      <span class="access-line-label">API Key</span>
+      <code>任意</code>
     </div>
-    <p class="card-hint" style="margin:16px 0 0">
-      两边的 API Key 都随便填 —— 本地服务没做鉴权，真正的 key 存在每个分组里。模型名必须和「模型路由」
-      里录入的一致，而且要在对应的接口下：Claude Code 打的是 <code>/v1/messages</code>，只能用
-      Anthropic 接口下的模型，反之同理。没配过的名字会 404（只有认得出档位关键字的才会被兜到
-      同接口、同档位那条配置上）。fable 档没有对应的环境变量，在 Claude Code 里用 <code>/model</code> 选。
-    </p>`;
+  </div>`;
   openDialog($('access-dialog'));
 }
 
@@ -1880,8 +1882,6 @@ async function saveRewrite() {
 /* ---------------------------------------------------------------- 动作表 */
 
 const ACTIONS = {
-  'copy-endpoint': copyEndpoint,
-
   'save-rewrite': saveRewrite,
 
   'copy-text': async ({ text }) => {
@@ -2582,6 +2582,11 @@ $('route-dialog').addEventListener('close', (ev) => {
   resetScan();
 });
 
+// 接入弹窗的内容是现生成的：关掉就清掉，下次打开不会看到上一次（或已停用接口）的残影
+$('access-dialog').addEventListener('close', () => {
+  $('access-body').innerHTML = '';
+});
+
 $('route-filter').addEventListener('input', (ev) => {
   state.filter = ev.target.value;
   views.renderRoutes();
@@ -2640,7 +2645,6 @@ applyStyle(loadStyle());
 renderStyleControls();
 initMotion();
 views.initRoutePad();   // 路由视图：内容变短时用留白兜住滚动位置，不把用户夹回去
-$('endpoint').textContent = `${location.origin}/v1`;
 views.initLogFollow();   // 「自动跟随新记录」的勾选状态变化时补插攒下的行
 // 转发弹窗：写操作通过这一个入口回到主流程，弹窗自己不碰刷新
 initForwardDialog({ refreshConfig: () => refreshConfig() });
@@ -2655,6 +2659,8 @@ currentView = '';
 showView(initial);
 
 run(null, async () => {
+  // 先拿到「后台绑在哪」，renderProtocolControls 里的侧栏地址才不会是猜的
+  await refreshAccessInfo();
   await refreshProtocols();
   await Promise.all([refreshConfig(), refreshOverview(), refreshStats()]);
   if (state.view === 'log') await refreshLog();

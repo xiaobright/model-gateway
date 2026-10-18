@@ -78,7 +78,7 @@ function harness(t) {
       startViewTransition: (fn) => { fn(); return { finished: Promise.resolve() }; },
     },
     window: { addEventListener: noop, innerWidth: 1000, innerHeight: 800, scrollY: 0, scrollTo: noop }, localStorage: { getItem: () => null, setItem: noop },
-    location: { origin: 'http://127.0.0.1', hash: '' }, history: { replaceState: noop },
+    location: { origin: 'http://127.0.0.1', host: '127.0.0.1:8317', hash: '' }, history: { replaceState: noop },
     views: new Proxy({}, { get: () => noop }),
     // forward-dialog.js 的出口 —— ACTIONS 里 spread 了 forwardActions，少了它整个模块都跑不起来
     forwardActions: {}, initForwardDialog: noop, saveForward: async () => {},
@@ -1166,4 +1166,68 @@ test('普通切换不再传 initial，交给视图舞台从侧面推入', (t) =>
   h.app.showView('routes');
   assert.equal(h.vt.last.dir, 'up');
   assert.equal(h.vt.last.initial, false);
+});
+
+/* ---------------------------------------------------------------- 侧栏接入入口 */
+
+test('侧栏接入：地址一块两用，接口全关时换成「接口已关闭」', (t) => {
+  const h = harness(t);
+  h.evaluate('renderProtocolControls()');
+  assert.equal(h.element('access-roll').hidden, false);
+  assert.equal(h.element('access-closed').hidden, true);
+  assert.equal(h.element('endpoint').textContent, '127.0.0.1:8317', '只显示地址本身，不带协议和 /v1');
+
+  // 只留一种接口也算对外开放
+  util.state.protocolEnabled = { openai: false, 'openai-chat': false, anthropic: true };
+  h.evaluate('renderProtocolControls()');
+  assert.equal(h.element('access-roll').hidden, false);
+
+  // 后台说绑在局域网上：地址跟着换成局域网 IP，title 也说明别的设备能连
+  h.evaluate("accessInfo = { host: '192.168.1.5', port: 8317, local: false }");
+  h.evaluate('renderProtocolControls()');
+  assert.equal(h.element('endpoint').textContent, '192.168.1.5:8317');
+  assert.match(h.element('access-roll').title, /局域网可访问/);
+  h.evaluate('accessInfo = null');
+  h.evaluate('renderProtocolControls()');
+
+  util.state.protocolEnabled = { openai: false, 'openai-chat': false, anthropic: false };
+  h.evaluate('renderProtocolControls()');
+  assert.equal(h.element('access-roll').hidden, true, '都关了就别再给一个用不上的地址');
+  assert.equal(h.element('access-closed').hidden, false);
+});
+
+test('接入弹窗：一行一个接口、点一行复制，关掉就清空', (t) => {
+  const h = harness(t);
+  h.app.actions['show-access']();
+  const html = h.element('access-body').innerHTML;
+  assert.equal(h.element('access-dialog').open, true);
+  assert.match(html, /OpenAI 兼容 · Responses \/ Chat/);
+  assert.match(html, /data-text="http:\/\/127\.0\.0\.1\/v1"/, 'OpenAI 那边带 /v1');
+  assert.match(html, /Anthropic · Claude Code/);
+  assert.match(html, /data-text="http:\/\/127\.0\.0\.1"/, 'Claude Code 那边不带 /v1');
+  assert.match(html, /API Key[\s\S]*?任意/, 'API Key 单独一行写「任意」');
+  assert.doesNotMatch(html, /setx|环境变量|说明/, '不再有说明段落和环境变量');
+
+  // 关掉弹窗：生成的内容清空，下次打开不会看到上一次的残影
+  h.element('access-dialog').close();
+  assert.equal(h.element('access-body').innerHTML, '');
+
+  // 停用的接口那一行自然消失
+  util.state.protocolEnabled = { openai: true, anthropic: false };
+  h.app.actions['show-access']();
+  const onlyOpenAI = h.element('access-body').innerHTML;
+  assert.match(onlyOpenAI, /OpenAI 兼容/);
+  assert.doesNotMatch(onlyOpenAI, /Anthropic/);
+
+  util.state.protocolEnabled = { openai: false, 'openai-chat': false, anthropic: true };
+  h.app.actions['show-access']();
+  const onlyClaude = h.element('access-body').innerHTML;
+  assert.match(onlyClaude, /Anthropic/);
+  assert.doesNotMatch(onlyClaude, /OpenAI/);
+
+  // 地址用后台报的那个主机名，不是 window.location
+  h.evaluate("accessInfo = { host: '192.168.1.5', port: 8317, local: false }");
+  h.app.actions['show-access']();
+  assert.match(h.element('access-body').innerHTML, /data-text="http:\/\/192\.168\.1\.5:8317"/);
+  h.evaluate('accessInfo = null');
 });

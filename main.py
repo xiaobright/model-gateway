@@ -75,6 +75,7 @@ def main() -> int:
     from gateway.app import create_app
 
     srv = uvicorn.Server(uvicorn.Config(create_app(), host="127.0.0.1", port=args.port, log_level="info"))
+    config.set_bind("127.0.0.1", args.port)
     server_mod.register_server(srv)
     srv.run()
     return 0

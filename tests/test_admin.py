@@ -1015,3 +1015,29 @@ def test_rewrite_rules_round_trip_and_start_empty(gateway):
 def test_rewrite_rule_requires_a_non_empty_from(gateway):
     bad = gateway.put("/admin/api/rewrite-rules", json={"rules": [{"to": "b"}]})
     assert bad.status_code == 422, "没有 from 的规则会被 FastAPI 挡在门外"
+
+
+def test_access_info_follows_the_bind_address(gateway, monkeypatch):
+    """左下角显示哪个地址：只听本机就是 127.0.0.1，绑到局域网才给局域网 IP。"""
+    from gateway import config
+
+    monkeypatch.setattr(config, "_bound_host", "127.0.0.1")
+    monkeypatch.setattr(config, "_bound_port", 8317)
+    monkeypatch.setattr(config, "lan_ip", lambda: "192.168.1.5")
+    assert gateway.get("/admin/api/access-info").json() == {
+        "host": "127.0.0.1", "port": 8317, "local": True,
+    }
+
+    # 0.0.0.0 等于监听所有网卡：取本机的局域网地址
+    monkeypatch.setattr(config, "_bound_host", "0.0.0.0")
+    assert gateway.get("/admin/api/access-info").json() == {
+        "host": "192.168.1.5", "port": 8317, "local": False,
+    }
+
+    # 取不到局域网地址就退回本机，别给一个连不上的
+    monkeypatch.setattr(config, "lan_ip", lambda: None)
+    assert gateway.get("/admin/api/access-info").json()["host"] == "127.0.0.1"
+
+    # 绑在具体某个网卡地址上就照它显示
+    monkeypatch.setattr(config, "_bound_host", "10.0.0.7")
+    assert gateway.get("/admin/api/access-info").json()["host"] == "10.0.0.7"
