@@ -54,6 +54,83 @@ def test_retired_delete_parameters_cannot_widen_the_deletion(gateway, extra):
             assert gateway.get("/admin/api/models").json() == before
 
 
+def test_rename_downstream_model_keeps_the_chain_and_upstream_config(gateway):
+    """改名只换客户端看到的名字：候选 id、首选、顺序和上游配置都原地不动。"""
+    with MockUpstream("siteA") as a:
+        g1 = add_upstream(gateway, a, "siteA")
+        g2 = add_group(gateway, provider_id(gateway, "siteA"), "openai", "second", "key-second")
+        r1 = add_route(gateway, "old-name", g1, "remote-one")
+        r2 = add_route(gateway, "old-name", g2, "remote-two")
+        assert gateway.post("/admin/api/models/switch", json={"route_id": r2}).status_code == 200
+        before = next(
+            r for r in gateway.get("/admin/api/models").json() if r["model_name"] == "old-name"
+        )
+        upstreams_before = gateway.get("/admin/api/upstreams").json()
+
+        resp = gateway.post(
+            "/admin/api/models/rename",
+            json={"model_name": "old-name", "protocol": "openai", "new_name": "new-name"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["routes"] == 2
+
+        rows = gateway.get("/admin/api/models").json()
+        assert not any(r["model_name"] == "old-name" for r in rows)
+        after = next(r for r in rows if r["model_name"] == "new-name")
+        assert [c["route_id"] for c in after["candidates"]] == [r1, r2], "候选和顺序原地保留"
+        assert after["preferred_route_id"] == before["preferred_route_id"] == r2
+        assert after["active_route_id"] == r2
+        assert [c["remote_model"] for c in after["candidates"]] == ["remote-one", "remote-two"]
+        assert gateway.get("/admin/api/upstreams").json() == upstreams_before, "上游配置一字不动"
+
+        assert "new-name" in {m["id"] for m in gateway.get("/v1/models").json()["data"]}
+        assert gateway.post("/v1/responses", json={"model": "new-name"}).status_code == 200
+        assert gateway.post("/v1/responses", json={"model": "old-name"}).status_code == 404
+
+
+def test_rename_rejects_a_name_taken_in_the_same_protocol_only(gateway):
+    """同接口下改名撞到已有模型：拒绝合并；另一个接口下的同名链不算占用。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_openai = add_upstream(gateway, a, "siteA", "openai")
+        g_claude = add_upstream(gateway, b, "siteB", "anthropic")
+        add_route(gateway, "one", g_openai)
+        add_route(gateway, "two", g_openai)
+        taken = gateway.post(
+            "/admin/api/models/rename",
+            json={"model_name": "one", "protocol": "openai", "new_name": "two"},
+        )
+        assert taken.status_code == 409
+        assert "已经有一个模型" in taken.json()["detail"]
+        assert {r["model_name"] for r in gateway.get("/admin/api/models").json()} == {"one", "two"}
+
+        add_route(gateway, "shared", g_claude)
+        moved = gateway.post(
+            "/admin/api/models/rename",
+            json={"model_name": "one", "protocol": "openai", "new_name": "shared"},
+        )
+        assert moved.status_code == 200, moved.text
+        chains = {(r["model_name"], r["protocol"]) for r in gateway.get("/admin/api/models").json()}
+        assert ("shared", "openai") in chains
+        assert ("shared", "anthropic") in chains
+
+
+def test_rename_unknown_model_or_same_name_is_rejected(gateway):
+    missing = gateway.post(
+        "/admin/api/models/rename",
+        json={"model_name": "ghost", "protocol": "openai", "new_name": "other"},
+    )
+    assert missing.status_code == 404
+
+    with MockUpstream("siteA") as a:
+        g = add_upstream(gateway, a, "siteA")
+        add_route(gateway, "same", g)
+        same = gateway.post(
+            "/admin/api/models/rename",
+            json={"model_name": "same", "protocol": "openai", "new_name": " same "},
+        )
+        assert same.status_code == 400
+
+
 def test_remote_model_pull_and_manual_add_default_remote_name(gateway):
     with MockUpstream("siteA") as a:
         g_a = add_upstream(gateway, a, "siteA")

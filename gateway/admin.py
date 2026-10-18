@@ -84,6 +84,19 @@ class RouteEditIn(BaseModel):
     remote_model: str = ""
 
 
+class RenameModelIn(BaseModel):
+    """改下游模型名：只动客户端看到的名字，候选和上游分组都不碰。
+
+    一条链由「模型名 + 接口」定位；同名模型在别的接口下是另一条链，不在这次改动范围。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: _NonBlank
+    protocol: str = Field(min_length=1)
+    new_name: str = Field(min_length=1, max_length=200)
+
+
 class GroupModelsIn(BaseModel):
     """登记上游模型（只进目录，不产生下游候选）。"""
 
@@ -1052,6 +1065,46 @@ def post_order(payload: OrderIn) -> dict[str, Any]:
         raise HTTPException(404, f"「{payload.model_name}」没有这些候选")
     log(f"ORDER model={payload.model_name!r} -> {list(payload.order)}")
     return {"ok": True, "ordered": n}
+
+
+@router.post("/models/rename")
+def post_model_rename(payload: RenameModelIn) -> dict[str, Any]:
+    """改下游模型名：候选、首选、顺序、交接关系和上游配置都原地保留。
+
+    旧名字立刻不再暴露；客户端要改用新名字。同接口的转发布置一起跟过去。
+    """
+    protocol = _validate_protocol(payload.protocol)
+    old = payload.model_name.strip()
+    new = payload.new_name.strip()
+    if not new:
+        raise HTTPException(400, "新的模型名不能为空")
+    if new == old:
+        raise HTTPException(400, "新的模型名和原来一样，没有可改的")
+    try:
+        moved = db.rename_model(old, protocol, new)
+    except db.ModelNameTaken as exc:
+        raise HTTPException(
+            409,
+            f"「{exc.args[0]}」在 {exc.args[1]} 接口下已经有一个模型了；"
+            "两条链不会自动合并，先给另一个改名或删掉它再来",
+        ) from exc
+    except db.ForwardCycle as exc:
+        raise HTTPException(
+            409, f"改名后这条转发会绕成环：{' → '.join(exc.args[0])}"
+        ) from exc
+    if moved is None:
+        raise HTTPException(404, f"「{old}」在 {protocol} 接口下没有可改的模型")
+    log(
+        f"RENAME model={old!r} -> {new!r} [{protocol}]"
+        f" routes={moved['routes']} forward={moved['forward']} retargeted={moved['retargeted']}"
+    )
+    return {
+        "ok": True,
+        "model_name": old,
+        "new_name": new,
+        "protocol": protocol,
+        **moved,
+    }
 
 
 @router.post("/models/forward")

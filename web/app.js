@@ -1376,6 +1376,55 @@ async function saveRoute() {
   toast(cand ? '已保存' : '已添加', 'ok');
 }
 
+/* ---------------------------------------------------------------- 改下游模型名 */
+
+/* 只换客户端看到的名字。候选、首选、顺序、交接关系和上游分组都留在原行上；改完
+   旧名字立刻不再暴露。同名模型在别的接口下是另一条独立的链，提示里说清楚它不跟着改。 */
+let renamingRoute = null;
+let renameSeq = 0;
+
+function openRename(model, proto) {
+  const row = state.routes.find((r) => r.model_name === model && (!proto || r.protocol === proto));
+  if (!row) return;
+  renamingRoute = { model: row.model_name, proto: row.protocol };
+  renameSeq += 1;
+  const others = state.routes.filter((r) => r.model_name === row.model_name && r.protocol !== row.protocol);
+  $('rename-title').textContent = `重命名：${row.model_name}`;
+  $('rn-name').value = row.model_name;
+  $('rn-hint').innerHTML = '候选、保存的首选和顺序原样保留；上游站点、分组和密钥完全不动。'
+    + '改完后旧名字立刻不再暴露，客户端要改用新名字；历史转发记录仍记在旧名字下。'
+    + (row.forward_to ? `<br>它现在把整条链交给 <b>${esc(row.forward_to)}</b>，这条交接也会跟着改成新名字。` : '')
+    + (others.length
+      ? `<br>同名模型在 ${others.map((r) => esc(PROTO_LABEL[r.protocol] || r.protocol)).join('、')} 下还有一条独立的链，那条仍然叫 <b>${esc(row.model_name)}</b>。`
+      : '');
+  openDialog($('rename-dialog'));
+  $('rn-name').focus();
+  $('rn-name').select?.();
+}
+
+async function saveRename() {
+  if (!renamingRoute) return;
+  const seq = renameSeq;
+  const { model, proto } = renamingRoute;
+  const next = $('rn-name').value.trim();
+  if (!next) return toast('模型名不能为空', 'err');
+  if (next === model) {
+    closeDialog($('rename-dialog'));
+    return;
+  }
+  await api('POST', '/admin/api/models/rename', {
+    model_name: model, protocol: proto, new_name: next,
+  });
+  // 先刷新再切选中：旧名字已经不在列表里，照着旧键选会落到第一行
+  await refreshConfig();
+  // 请求飞在路上时关掉又打开了别的模型：这次结果不能去关新会话的弹窗
+  if (renameSeq !== seq) return;
+  renamingRoute = null;
+  closeDialog($('rename-dialog'));
+  views.selectRoute(next, proto);
+  toast(`${model} 已改名为 ${next}`, 'ok');
+}
+
 /** 候选的显示名：「供应商 · 分组」，真名和模型名不一样时补上真名 ——
     同一个分组挂了好几条时，全靠真名区分是哪一条 */
 function candLabel(model, cand) {
@@ -2112,6 +2161,7 @@ const ACTIONS = {
   'new-route': () => openRoute('', null),
   'add-candidate': ({ model, proto }) => openRoute(model, null, proto),
   'edit-candidate': ({ model, rid, proto }) => openRoute(model, Number(rid), proto),
+  'rename-model': ({ model, proto }) => openRename(model, proto),
 
   /* 批量添加新模型：先扫描（只读），再按勾选提交 */
   'batch-add': openBatchAdd,
@@ -2345,6 +2395,11 @@ $('group-form').addEventListener('submit', (ev) => {
 $('route-form').addEventListener('submit', (ev) => {
   ev.preventDefault();
   run($('rt-save'), saveRoute);
+});
+
+$('rename-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  run($('rn-save'), saveRename);
 });
 
 $('search-form').addEventListener('submit', (ev) => {

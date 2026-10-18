@@ -107,6 +107,7 @@ function harness(t) {
   vm.runInContext('refreshConfig = refreshForTest;', context);
   h.app = vm.runInContext(`({
     openUpstream, saveUpstream, probeUpstream, openGroup, saveGroup, openRoute,
+    openRename, saveRename,
     fillRemoteList, saveRewrite, actions: ACTIONS, groupDirty,
     openBatchAdd, scanModels, commitBatch, syncBatchSelection,
     editingKey: () => editingKey, showView
@@ -660,6 +661,28 @@ function loadViews(h) {
   }
 }
 
+test('改下游模型名只提交名字，提示同名模型在别的接口下不受影响', async (t) => {
+  const h = harness(t);
+  util.state.routes = [
+    { model_name: 'old', protocol: 'openai', candidates: [{ route_id: 7 }], active_route_id: 7, preferred_route_id: 7 },
+    { model_name: 'old', protocol: 'openai-chat', candidates: [] },
+  ];
+  h.app.openRename('old', 'openai');
+  assert.equal(h.element('rename-dialog').open, true);
+  assert.equal(h.element('rn-name').value, 'old');
+  assert.match(h.element('rn-hint').innerHTML, /Chat/);
+
+  h.element('rn-name').value = 'new';
+  const saving = h.app.saveRename();
+  assert.equal(h.latest().method, 'POST');
+  assert.equal(h.latest().path, '/admin/api/models/rename');
+  assert.deepEqual(h.latest().body, { model_name: 'old', protocol: 'openai', new_name: 'new' });
+  h.latest().resolve({ ok: true });
+  await saving;
+  assert.equal(h.element('rename-dialog').open, false);
+  assert.deepEqual(h.toasts.at(-1), ['old 已改名为 new', 'ok']);
+});
+
 test('工作台刷新保留同名模型的协议选择；筛选后重新校验选择', (t) => {
   const h = harness(t);
   loadViews(h);
@@ -668,6 +691,7 @@ test('工作台刷新保留同名模型的协议选择；筛选后重新校验�
   }));
   h.evaluate("selectRouteWorkspace('shared', 'openai-chat'); renderRoutes()");
   assert.match(h.element('route-detail').innerHTML, /<span class="tag">Chat<\/span>/);
+  assert.match(h.element('route-detail').innerHTML, /data-act="rename-model"/);
   const before = h.element('route-list').innerHTML;
   let writes = 0;
   Object.defineProperty(h.element('route-list'), 'innerHTML', {

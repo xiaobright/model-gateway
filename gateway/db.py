@@ -155,6 +155,10 @@ class ProtocolLocked(Exception):
     """分组下已经有候选了，不能再改它的接口。args = (候选数,)。"""
 
 
+class ModelNameTaken(Exception):
+    """改下游模型名时，目标名字在这个接口下已经有一条链了。args = (目标名, 接口)。"""
+
+
 class ForwardCycle(Exception):
     """转发会绕成一个环。args[0] = 环上的名字序列（首尾同名）。"""
 
@@ -1103,6 +1107,64 @@ def delete_model(model_name: str, protocol: str = "") -> tuple[int, int]:
                 "DELETE FROM model_forwards WHERE model_name=?", (model_name,)
             ).rowcount
         return removed, forwards
+
+
+def rename_model(model_name: str, protocol: str, new_name: str) -> dict[str, int] | None:
+    """把一条链整个改到另一个下游名字上；老名字在这个接口下没有链时返回 None。
+
+    只改「客户端看到的名字」：候选（含首选和顺序）、上游站点、分组、密钥、冷却状态
+    都原样留着。同接口内指向它的转发布置一起改指到新名字，它自己的转发布置也跟着搬
+    过去 —— 不然改完名字，交接关系就断在旧名字上了。老名字在别的接口下的同名链不受
+    影响：一条链是「模型名 + 接口」。
+
+    新名字在这个接口下已经被占用时抛 ModelNameTaken。合并两条链没有确定的语义（候选
+    怎么排、首选听谁的），让调用方先删或先改名比静默合并好排查。
+    """
+    old = model_name.strip()
+    new = new_name.strip()
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        own_forward = conn.execute(
+            "SELECT target_model FROM model_forwards WHERE model_name=? AND protocol=?",
+            (old, protocol),
+        ).fetchone()
+        has_routes = conn.execute(
+            "SELECT 1 FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=? LIMIT 1",
+            (old, protocol),
+        ).fetchone()
+        if has_routes is None and own_forward is None:
+            return None
+        taken = conn.execute(
+            "SELECT 1 FROM model_routes m JOIN upstream_groups g ON g.id = m.group_id"
+            " WHERE m.model_name=? AND g.protocol=? LIMIT 1",
+            (new, protocol),
+        ).fetchone() or conn.execute(
+            "SELECT 1 FROM model_forwards WHERE model_name=? AND protocol=?",
+            (new, protocol),
+        ).fetchone()
+        if taken is not None:
+            raise ModelNameTaken(new, protocol)
+        # 老链自己转到一半就到了新名字：改名后就成了自己转给自己
+        path = _forward_walk(conn, old, protocol)
+        if path and new in path:
+            raise ForwardCycle((old, *path))
+        routes = conn.execute(
+            "UPDATE model_routes SET model_name=? WHERE id IN ("
+            "  SELECT m.id FROM model_routes m"
+            "  JOIN upstream_groups g ON g.id = m.group_id"
+            "  WHERE m.model_name=? AND g.protocol=?)",
+            (new, old, protocol),
+        ).rowcount
+        moved = conn.execute(
+            "UPDATE model_forwards SET model_name=? WHERE model_name=? AND protocol=?",
+            (new, old, protocol),
+        ).rowcount
+        retargeted = conn.execute(
+            "UPDATE model_forwards SET target_model=? WHERE target_model=? AND protocol=?",
+            (new, old, protocol),
+        ).rowcount
+        return {"routes": routes, "forward": moved, "retargeted": retargeted}
 
 
 def switch_route(route_id: int) -> str:

@@ -252,7 +252,7 @@ function renderRouteDetail(row) {
       </div></article>`;
   }).join('');
   const detailChanged = replaceIfChanged(host, head + forwarding + facts + `<div class="detail-section-head"><h3>候选顺序</h3>${buttons('add-candidate', '＋ 添加')}</div><p class="detail-note">首选先试，其余按顺序尝试；换首选不会改变这里的排序。</p>` + (candidates || '<p class="empty">这个模型没有自己的候选。</p>')
-    + `<div class="detail-footer">${!row.forward_to ? buttons('fwd-open', '全部转发到…') : ''}${buttons('del-model', '删除模型', '', 'btn-danger')}</div>`);
+    + `<div class="detail-footer">${!row.forward_to ? buttons('fwd-open', '全部转发到…') : ''}${buttons('rename-model', '重命名')}${buttons('del-model', '删除模型', '', 'btn-danger')}</div>`);
 
   if (detailChanged && sameModel && prevCandRects?.size) {
     flipElements(host, '.candidate', (el) => el.querySelector('[data-rid]')?.dataset.rid, prevCandRects, { staggerNew: true });

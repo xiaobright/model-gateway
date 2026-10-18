@@ -468,6 +468,26 @@
   </form>
 </dialog>
 
+<!-- ============ 改下游模型名：客户端看到的名字换了，候选和上游都不动 ============ -->
+<dialog id="rename-dialog" class="sm">
+  <form id="rename-form">
+    <div class="dlg-head">
+      <h2 id="rename-title">重命名模型</h2><span class="grow"></span>
+      <button type="button" class="dlg-x" data-act="close-dialog" aria-label="关闭">✕</button>
+    </div>
+    <div class="dlg-body">
+      <label class="field">新的模型名（下游按这个名字调用）
+        <input type="text" id="rn-name" placeholder="如 my-chat-v2" autocomplete="off" required>
+      </label>
+      <p class="dim" id="rn-hint" style="font-size:12px;margin:10px 0 0"></p>
+    </div>
+    <div class="dlg-foot">
+      <span class="grow"></span>
+      <button type="submit" class="btn" id="rn-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- ============ 批量添加新模型：一次问遍所有上游站，勾选要加的分组 ============ -->
 <dialog id="batch-dialog" class="wide">
   <form id="batch-form">

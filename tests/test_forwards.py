@@ -230,6 +230,52 @@ def test_forward_protocol_scoped(gateway):
         assert gateway.post("/v1/messages", json=msg("multi")).json()["upstream"] == "siteT"
 
 
+def rename_model(client, model_name, protocol, new_name):
+    return client.post(
+        "/admin/api/models/rename",
+        json={"model_name": model_name, "protocol": protocol, "new_name": new_name},
+    )
+
+
+def test_rename_follows_handovers_in_both_directions(gateway):
+    """改目标名：指向它的交接跟着改指；改源名：它自己的转发布置一起搬走。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA")
+        g_b = add_upstream(gateway, b, "siteB")
+        add_route(gateway, "alias", g_a)
+        add_route(gateway, "target", g_b, "remote-target")
+        assert set_forward(gateway, "alias", "openai", "target").status_code == 200
+
+        assert rename_model(gateway, "target", "openai", "target-v2").status_code == 200
+        assert models_row(gateway, "alias")["forward_to"] == "target-v2"
+        assert gateway.post("/v1/responses", json={"model": "alias"}).json()["upstream"] == "siteB"
+
+        assert rename_model(gateway, "alias", "openai", "alias-v2").status_code == 200
+        moved = models_row(gateway, "alias-v2")
+        assert moved is not None and moved["forward_to"] == "target-v2"
+        assert models_row(gateway, "alias") is None
+        assert gateway.post("/v1/responses", json={"model": "alias-v2"}).json()["upstream"] == "siteB"
+        assert gateway.post("/v1/responses", json={"model": "alias"}).status_code == 404
+
+
+def test_rename_refuses_to_create_a_forward_cycle(gateway):
+    """a→b 的目标链被删掉后只剩断链；这时把 a 改成 b 会变成自己转给自己。"""
+    with MockUpstream("siteA") as a, MockUpstream("siteB") as b:
+        g_a = add_upstream(gateway, a, "siteA")
+        g_b = add_upstream(gateway, b, "siteB")
+        add_route(gateway, "alias", g_a)
+        add_route(gateway, "target", g_b)
+        assert set_forward(gateway, "alias", "openai", "target").status_code == 200
+        assert gateway.delete(
+            "/admin/api/models", params={"model_name": "target", "protocol": "openai"}
+        ).status_code == 200
+
+        resp = rename_model(gateway, "alias", "openai", "target")
+        assert resp.status_code == 409
+        assert "环" in resp.json()["detail"]
+        assert models_row(gateway, "alias")["forward_to"] == "target", "拒绝后配置保持原样"
+
+
 def test_old_db_upgrade_creates_forwards_table_and_hold_retry(gateway):
     """老库升到当前版本：建回 model_forwards，并补上 200 截断守卫那一列。"""
     from gateway import config, db
