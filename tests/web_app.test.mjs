@@ -59,7 +59,7 @@ function harness(t) {
     dataset: {},
   };
   const h = { element, requests: [], refreshes: [], timers: [], toasts: [], blockRefresh: false,
-    vt: { vars: vtVars, root: vtRoot, calls: [], runs: true }, slides: [],
+    vt: { vars: vtVars, root: vtRoot, calls: [], last: null, runs: true }, slides: [],
     setReduceMotion: (v) => { motionReduced = v; } };
   const oldFetch = globalThis.fetch;
   globalThis.fetch = async (path, options) => {
@@ -84,15 +84,22 @@ function harness(t) {
     forwardActions: {}, initForwardDialog: noop, saveForward: async () => {},
     toast: (...args) => h.toasts.push(args), run: (_el, fn) => fn(), confirmBox: async () => true,
     requestAnimationFrame: (fn) => fn(), setInterval: (fn, ms) => h.timers.push({ fn, ms }),
-    withViewTransition: (dir, fn, afterPaint) => {
-      if (!h.vt.runs) { fn(); afterPaint?.(false); return false; }
-      h.vt.calls.push(dir); fn(); afterPaint?.(true); return true;
+    showViewLayer: (el, dir, options = {}) => {
+      h.vt.calls.push(dir);
+      h.vt.last = { el, dir, ...options };
+      return true;
     },
     reduceMotion: () => motionReduced,
     moveNavMarker: noop, slideIn: (el) => h.slides.push(el), fadeIn: noop, toggleMotion: noop,
     readBarWidths: () => new Map(), morphBars: noop,
     enterStagger: noop, springAnimate: noop, SPRING: { bouncy: 'ease', smooth: 'ease', snappy: 'ease' },
-    animateViewEnter: noop, syncSegMarkers: noop,
+    syncSegMarkers: noop,
+    createIndicator: () => ({ move: noop, hide: noop, finish: noop, active: false }),
+    MOTION: {
+      route: { stiffness: 520, damping: 40, mass: 1 },
+      size: { stiffness: 700, damping: 54, mass: 1 },
+      fade: { stiffness: 420, damping: 40, mass: 1 },
+    },
     openDialog: dlg => dlg.showModal(), closeDialog: dlg => { dlg.close(); return Promise.resolve(); },
     captureRects: () => new Map(), flipElements: noop, animateDetailSwap: noop, pulse: noop,
     updateNumber: (el, value) => { if (el) el.textContent = value; },
@@ -1026,23 +1033,27 @@ test('减少动态时主题切换不走视图过渡，直接换', (t) => {
 
 test('视图切换按导航顺序定横向方向，同视图和未知名不切', (t) => {
   const h = harness(t);
-  h.vt.calls.length = 0;              // 启动时已经翻到默认视图一次
-  h.app.showView('live');             // routes(0) → live(1)
+  h.app.showView('live');             // routes 之后的第一跳：initial 落位
+  assert.equal(h.vt.last.initial, true);
+  h.vt.calls.length = 0;
   h.app.showView('routes');           // 往回翻
   h.app.showView('routes');           // 同视图
   h.app.showView('nope');             // 不存在的视图
-  assert.deepEqual(h.vt.calls, ['down', 'up']);
+  assert.deepEqual(h.vt.calls, ['up']);
+
+  h.vt.calls.length = 0;
+  h.app.showView('live');             // routes(0) → live(1)
+  assert.deepEqual(h.vt.calls, ['down']);
 });
 
-test('没套上过渡时视图切换自己补淡入，不重复播放入场动画', (t) => {
+test('普通切换不再传 initial，交给视图舞台从侧面推入', (t) => {
   const h = harness(t);
+  h.app.showView('live');             // 先建立当前视图
   h.vt.calls.length = 0;
-  h.vt.runs = false;
-  h.app.showView('overview');
-  assert.equal(h.vt.calls.length, 0);
-  assert.equal(h.slides.length, 1);
-  h.vt.runs = true;
   h.app.showView('settings');
-  assert.equal(h.vt.calls.length, 1, '套上过渡就不再补淡入，否则两段动画叠在一起');
-  assert.equal(h.slides.length, 1);
+  assert.equal(h.vt.last.dir, 'down');
+  assert.equal(h.vt.last.initial, false);
+  h.app.showView('routes');
+  assert.equal(h.vt.last.dir, 'up');
+  assert.equal(h.vt.last.initial, false);
 });

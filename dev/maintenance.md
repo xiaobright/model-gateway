@@ -595,7 +595,7 @@ uv run .venv\Scripts\python.exe -m pytest --full -q -p no:cacheprovider --durati
 
 ### 前端检查
 
-动效生命周期与帧合并单跑 `node --test tests/web_motion.test.mjs`；涉及页面切换或路由选择时，同时检查 `tests/web_app.test.mjs` 与 `tests/web_workbench.test.mjs`。真实动画与布局用 `node dev/check-motion.mjs 8341`，先启动下文的隔离工作台；脚本使用临时 Chrome 配置，不连接正式端口。
+动效生命周期与帧合并单跑 `node --test tests/web_motion.test.mjs`，弹簧数学单跑 `node --test tests/web_spring.test.mjs`；涉及页面切换或路由选择时，同时检查 `tests/web_app.test.mjs` 与 `tests/web_workbench.test.mjs`。真实动画、连续连点和布局用 `node dev/check-motion.mjs 8341`，先启动下文的隔离工作台；脚本使用临时 Chrome 配置，不连接正式端口，并会留一张推拉中途的截图。
 
 没有 npm 构建步骤，直接检查原生 JavaScript：
 
@@ -623,6 +623,8 @@ git diff --check
 | `test_learning` | 调度元数据、请求/尝试关联、事件时间线、取消、容量限制及采集故障旁路。 |
 | `test_egress`、`test_units` | 代理、证书、工具函数与内容观察。 |
 | `web_protocols.test.mjs`、`web_app.test.mjs` | 协议选项、刷新队列、弹窗会话、模型列表重开与统计展示。 |
+| `web_spring.test.mjs` | 弹簧重定向保留位置/速度、有限帧收敛、曲线采样与落位时间。 |
+| `web_motion.test.mjs` | 指示器连续改目标、视图舞台叠层与收尾、减弱动效、帧合并和弹窗退场。 |
 | `web_workbench.test.mjs` | 首选与实际起点、协议隔离、转发路径、请求结果与请求结果标签。 |
 
 测试使用临时数据库和模拟上游，不拿真实 `data/` 做演练。为了提速不能删必要断言、隐藏失败用例，或修改正式运行的超时/重试参数。
@@ -666,9 +668,9 @@ node dev/verify-batch-add.mjs 8399
 
 明暗（`data-theme`：auto/light/dark）与风格（`data-style`）是两个正交的轴，选择分别记在本机 `mg-theme`、`mg-style`，不随网关配置走，也不进数据库。控件在设置页「外观」卡片，侧栏保留明暗圆钮做快捷切换；两个入口改同一份状态，`applyTheme` 会顺手同步分段选中。风格皮肤只重新声明 `style.css` `:root` 里的同一批 token（契约注释在文件开头），两套明暗值各自用 `light-dark()` 给，`color-scheme` 仍由 `data-theme` 决定；没声明的 token 继承默认值，所以皮肤可以只写自己要改的那几个。新增风格 = `web/theme.js` 的 `STYLES` 登记一行 + `style.css` 加一段 `:root[data-style="id"]`，JS 不用动；id 只用小写字母、数字和连字符（会拼进属性选择器）。明暗和风格切换共用 `app.js` 的 `withCircleReveal` 圆形揭开，与视图过渡互斥、dpr 非 1 时用百分比半径这些规则不变。
 
-侧栏提供「标准 / 轻量」动效切换并本地记忆：标准包含环境流动与单个悬停面板的光感，轻量保留短交互动画。系统减少动态效果优先；页面隐藏暂停环境动画并取消动效模块待执行的帧。窄屏路由定位在系统减弱时使用立即滚动。JS 弹簧曲线读取 CSS 的 `--spring-*` token，有限动画通过 `springAnimate` 登记；环形图先写最新 SVG 数值，再过渡，完成或取消后都显示最新值。鼠标光感按帧合并，只更新一个当前容器，离开、滚动、打开弹窗、切入后台时清除，无常驻 JS 动画循环。
+侧栏提供「标准 / 轻量」动效切换并本地记忆：标准包含环境流动与单个悬停面板的光感，轻量保留短交互动画。系统减少动态效果优先；页面隐藏暂停环境动画并取消动效模块待执行的帧。窄屏路由定位在系统减弱时使用立即滚动。可连续打断的导航胶囊、分段胶囊、路由选中条和视图推拉走 `spring.js` 的运行时弹簧（位置 + 速度一起保存，重定向不清状态）；一次性入场仍走 WAAPI，曲线读取 CSS 的 `--spring-*` 多点 `linear()`，两边由同一组物理参数采样而来。环形图先写最新 SVG 数值，再过渡，完成或取消后都显示最新值。鼠标光感按帧合并，只更新一个当前容器，离开、滚动、打开弹窗、切入后台时清除，无常驻 JS 动画循环。
 
-视图切换用 View Transitions 把 `.main` 的新旧两块横向错开推过来（`style.css` 的 `data-vt-dir`，`motion.js` 的 `withViewTransition`），侧栏不参与。它和明暗切换的圆形揭开互斥：圆形要摘掉所有 `view-transition-name`，两条路同时跑会互相抢名字把页面撕开，所以在 `app.js` 里互相挡着；`.main` 上的 `will-change: filter` 让它在名字被临时摘掉时仍是 backdrop root，收尾才不会整块跳色。换视图会改文档高度，显示和渲染包在过渡回调里、同一次任务内把 `scrollY` 夹回来。内部级联在 `ready` 后通过第三个回调启动，避免目标页尚未显示时跳过；过渡不支持或被跳过则补淡入。连点导航靠序号保证旧过渡不播放过时入场，也不擦掉新方向。
+视图切换不再用 View Transitions：它在过渡期间整页是快照，侧栏点击到不了按钮；连续调用也只能跳到最新快照，没法从当前帧接着走。现在 `#view-stage` 里目标视图留在正常流里决定高度，离场视图绝对定位并立即 `inert`、断开命中；两层由 `spring.js` 的弹簧组逐帧写 y / opacity，改目标时保留当前位置和速度，所以可以连续点、也可以半路点回来。侧栏是上下排列的，所以切换也走纵向：点下面的栏位，新视图从下方进入、旧视图往上退；点上面的栏位反过来。运动期间才给舞台加 `overflow: clip`，挡住推拉时伸出去的上下边缘；静止后恢复 `visible`，不破坏 `route-detail` 的 sticky 和卡片阴影。导航高亮当帧更新，最多同时留三层，更早的直接收掉。减弱动效、没有舞台或首屏时直接切换，不播放推拉。明暗切换的圆形揭开仍走 View Transitions，这两条路互不参与。
 
 健康度与热度这两处条形列表换数据时，`motion.js` 的 `readBarWidths` / `morphBars` 按 `data-key` 把旧宽度还给新条、提交样式后下一帧放开，让条从旧值长到新值；只给新增条目播放入场。冷却列表按「分组 + 上游真名」复用节点，倒计时只改文字。新日志的淡入和高亮使用一条组合动画，避免互相取消。
 

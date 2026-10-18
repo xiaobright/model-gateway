@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 def seed_preview(db) -> None:
     """造一批覆盖各种状态的预览数据：多候选、单候选、停用的站/分组、纯转发链。"""
+    db.init_db()
     # 三个站：一个正常、一个多候选里当备用、一个停用
     a = db.create_upstream("站点A", "https://a.example.invalid")
     b = db.create_upstream("站点B", "https://b.example.invalid")

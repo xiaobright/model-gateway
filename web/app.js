@@ -14,7 +14,7 @@ import {
   PROTO_LABEL, PROTO_SHORT, PROTO_PATH, PROTO_CLIENT, PROTO_INFO, PROTOCOLS, setProtocolMetadata,
 } from './util.js';
 import * as views from './views.js';
-import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, withViewTransition, animateViewEnter, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog } from './motion.js';
+import { initMotion, moveNavMarker, reduceMotion, slideIn, toggleMotion, showViewLayer, syncSegMarkers, enterStagger, springAnimate, SPRING, openDialog, closeDialog } from './motion.js';
 import { STYLES, DEFAULT_STYLE, normalizeStyle, loadStyle, applyStyle, styleHint } from './theme.js';
 import {
   initForwardDialog, saveForward, forwardActions,
@@ -232,9 +232,6 @@ const VIEWS = ['routes', 'live', 'upstreams', 'log', 'overview', 'settings'];
 let currentView = '';
 
 function paintView(name) {
-  for (const sec of document.querySelectorAll('.view')) {
-    sec.hidden = sec.dataset.view !== name;
-  }
   for (const btn of document.querySelectorAll('.nav-item')) {
     const on = btn.dataset.view === name;
     btn.classList.toggle('is-active', on);
@@ -249,23 +246,19 @@ function showView(name) {
   const cur = VIEWS.indexOf(currentView);
   if (next < 0 || next === cur) return;
   const dir = cur < 0 || next > cur ? 'down' : 'up';
+  const initial = cur < 0;
   currentView = name;
   state.view = name;
-  // 换视图会改文档高度，浏览器可能把滚动位置夹回去；同一次任务里补回来，过渡期间
-  // 视口是冻结的，用户看不见这一下。没套上过渡（减弱动效 / 不支持）时退回淡入。
   const viewEl = document.querySelector(`.view[data-view="${name}"]`);
-  withViewTransition(dir, () => {
-    const y = window.scrollY;
-    paintView(name);
-    if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
-    if (name === 'routes') views.renderRoutes();
-    if (name === 'settings') views.renderPolicies();
-    if (window.scrollY !== y) window.scrollTo(0, y);
-  }, (moved) => {
-    if (currentView !== name) return;
-    if (!moved) slideIn(viewEl);
-    animateViewEnter(viewEl, dir, { withVt: moved });
-  });
+  // 换视图会改文档高度，浏览器可能把滚动位置夹回去；先记下来，布局改完再补回。
+  // 视图先上台（立即可交互），同一帧内再渲染内容，浏览器不会画出中间态。
+  const y = window.scrollY;
+  paintView(name);
+  showViewLayer(viewEl, dir, { initial });
+  if (name === 'overview') { views.renderKpis(); views.renderSeries(); views.renderHealth(); views.renderHot(); }
+  if (name === 'routes') views.renderRoutes();
+  if (name === 'settings') views.renderPolicies();
+  if (window.scrollY !== y) window.scrollTo(0, y);
   history.replaceState(null, '', '#' + name);
   if (name === 'log' && state.protocolsReady) run(null, refreshLog);
   if (name === 'live') run(null, refreshInflight);

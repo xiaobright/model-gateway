@@ -946,18 +946,28 @@ export function afterSwitch(model, fromRid, toRid, proto) {
 
 /**
  * 时间窗切换：先横向弹簧淡出、换数据、再横向弹簧回弹淡入。
+ * 连点时从当前透明度和位移接着走；被取消的旧淡出不能再去改数据。
  */
+let windowMotionSeq = 0;
+
 export function animateWindowChange(mutate) {
   const host = $('chart-series');
   if (!host || reduceMotion() || typeof host.animate !== 'function') { mutate(); return; }
 
+  const seq = ++windowMotionSeq;
+  const style = typeof getComputedStyle === 'function' ? getComputedStyle(host) : null;
+  const from = {
+    opacity: style?.opacity || 1,
+    transform: !style || style.transform === 'none' ? 'none' : style.transform,
+  };
   for (const anim of host.getAnimations()) anim.cancel();
 
   const out = host.animate(
-    [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translate3d(-16px, 0, 0) scale(0.985)' }],
+    [from, { opacity: 0, transform: 'translate3d(-16px, 0, 0) scale(0.985)' }],
     { duration: 150, easing: SPRING.exit, fill: 'forwards' },
   );
   out.finished.catch(() => {}).then(() => {
+    if (seq !== windowMotionSeq) return;   // 已被新的时间窗点击取代
     mutate();
     const back = host.animate(
       [{ opacity: 0, transform: 'translate3d(18px, 0, 0) scale(0.985)' }, { opacity: 1, transform: 'none' }],

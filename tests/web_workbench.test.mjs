@@ -101,6 +101,8 @@ function routePadHarness({ desktop = true, reduced = false } = {}) {
     ...util, ...routeModel, routeKey: routeModel.modelKey, fadeIn: () => {},
     enterStagger: () => {}, animateDetailSwap: () => {}, captureRects: () => new Map(),
     flipElements: () => {}, pulse: () => {}, reduceMotion: () => reduced,
+    createIndicator: () => ({ move: () => {}, hide: () => {}, finish: () => {} }),
+    MOTION: { route: {}, size: {}, fade: {} },
     requestAnimationFrame: (fn) => fn(),
     $: element, document: { documentElement, activeElement: null }, window: win,
   });

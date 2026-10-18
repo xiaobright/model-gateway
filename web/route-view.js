@@ -3,7 +3,7 @@
    选中模型按「名字 + 接口」保存，刷新、筛选和删除后重新校验。 */
 import { $, state, esc, fmtInt, fmtSec, fmtLeft, protocolOn, PROTO_LABEL, splitOneM } from './util.js';
 import { modelKey as routeKey, orderedCandidates, forwardPath, usable } from './route-model.js';
-import { fadeIn, enterStagger, animateDetailSwap, captureRects, flipElements, pulse, reduceMotion } from './motion.js';
+import { fadeIn, enterStagger, animateDetailSwap, captureRects, flipElements, pulse, reduceMotion, createIndicator, MOTION } from './motion.js';
 
 let selectedRouteKey = null;
 let lastFilterSig = null;
@@ -59,32 +59,38 @@ function syncRouteSelection(host) {
    stagger / FLIP 会给行加 transform，而 rect 会被 transform 污染，首帧量出来就偏下
    一个身位（刷新后「往下歪」的根因，行升回原位后 marker 却不重量，一直偏着）。offset*
    是布局值，不受 transform / 滚动影响，量到的永远是行的最终位置。
-   首帧（进页面后第一次落位）临时关掉过渡直接落位：否则 marker 会从 translateY(0) 弹
-   到目标行，就是「刷新后先弹一下」。落位后恢复 CSS 过渡，之后的切换才走弹簧。
-   缺布局信息（测试桩）时藏起来。 */
+   首帧（进页面后第一次落位）直接落位，不播放滑入；之后交给弹簧内核，连续点选时
+   从当前值和速度继续。缺布局信息（测试桩）时藏起来。 */
 let markerPlaced = false;
+let markerIndicator = null;
 
 function moveRouteMarker(host, { instant = false } = {}) {
   const marker = $('route-marker');
   if (!marker) return;
+  if (!markerIndicator) {
+    markerIndicator = createIndicator(({ y, h, opacity }) => {
+      marker.style.transform = `translateY(${y.toFixed(2)}px)`;
+      marker.style.height = `${Math.max(0, h).toFixed(2)}px`;
+      marker.style.opacity = opacity.toFixed(3);
+    }, {
+      y: { ...MOTION.route, value: 0 },
+      h: { ...MOTION.size, value: 0 },
+      opacity: { ...MOTION.fade, value: 0 },
+    });
+  }
   const table = marker.parentElement;
   const row = host?.querySelector?.('.route.is-selected');
   const height = row?.offsetHeight;
   if (!table || !row || !height || typeof row.offsetTop !== 'number') {
-    marker.style.opacity = 0;
-    markerPlaced = false;   // 没有可见目标时复位，下次重新出现仍按首帧无过渡落位
+    markerIndicator.hide({ instant: !markerPlaced });
+    markerPlaced = false;   // 没有可见目标时复位，下次重新出现仍直接落位
     return;
   }
-  const snap = instant || !markerPlaced;
-  if (snap) marker.style.transition = 'none';
-  marker.style.height = height + 'px';
-  marker.style.transform = `translateY(${row.offsetTop}px)`;
-  marker.style.opacity = 1;
-  if (snap) {
-    void marker.offsetHeight;      // 强制回流，把无过渡的首帧样式提交掉
-    marker.style.transition = '';  // 恢复 CSS 过渡，后续切换才动画
-    markerPlaced = true;
-  }
+  markerIndicator.move(
+    { y: row.offsetTop, h: height, opacity: 1 },
+    { instant: instant || !markerPlaced },
+  );
+  markerPlaced = true;
 }
 
 /* 页面长度由内容决定，但不允许内容变化把用户的视口收回去：右卡或列表一变短，

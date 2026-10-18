@@ -2,9 +2,13 @@
    统一管理：
    1. 物理弹簧曲线（snappy / smooth / bouncy / gentle）与有限时长 WAAPI 动画
    2. 侧栏导航胶囊（#nav-marker）与全站分段控制器胶囊（.seg::before）的弹簧滑动
-   3. 主视图切换（View Transitions API + 视图内部区块级联弹簧入场）
+   3. 主视图切换（可连续打断的双层推拉）
    4. 列表 / 候选卡片 FLIP（First-Last-Invert-Play）物理重排过渡
    5. 详情面板切换、表格分组折叠展开、弹窗与折叠面板（<details>）、Toast 退场 */
+
+import { MOTION, createSpringGroup, motionAllowed, settleAllMotions } from './spring.js';
+
+export { MOTION } from './spring.js';
 
 export const reduceMotion = () => Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
 
@@ -42,6 +46,30 @@ export function springAnimate(el, frames, options = {}) {
 }
 
 const animate = springAnimate;
+
+/* ---------------------------------------------------------------- 指示器（胶囊 / 选中条）
+
+   x/y/w/h/opacity 一起交给一个弹簧组，每帧只写一次 style。首次出现用 place
+   直接落位，之后 set 只改目标：连续点击时从当前值和当前速度继续，不回零。 */
+
+export function createIndicator(apply, spec) {
+  let group = null;
+  const ensure = () => group ||= createSpringGroup(spec, apply);
+  return {
+    move(values, { instant = false } = {}) {
+      ensure();
+      if (instant) group.place(values);
+      else group.set(values);
+    },
+    hide({ instant = false } = {}) {
+      ensure();
+      if (instant) group.place({ opacity: 0 });
+      else group.set({ opacity: 0 });
+    },
+    finish() { group?.finish(); },
+    get active() { return Boolean(group?.active); },
+  };
+}
 
 /* ---------------------------------------------------------------- 基础元素动效 */
 
@@ -152,45 +180,6 @@ export function animateDetailSwap(detailEl) {
   } else if (empty) {
     slideIn(empty, { duration: 320, distance: 8 });
   }
-}
-
-/** 切换主视图或子视图（如 路由列表 <-> 编排视图）时，级联驱动新视图内各区块的物理弹簧入场 */
-export function animateViewEnter(viewEl, dir = 'down', { withVt = false } = {}) {
-  if (!viewEl || reduceMotion()) return;
-  const blocks = [
-    viewEl.querySelector('.view-head'),
-    viewEl.querySelector('.workspace-status'),
-    viewEl.querySelector('.route-filters'),
-    viewEl.querySelector('.log-filters'),
-    ...viewEl.querySelectorAll(':scope > .kpis > .kpi'),
-    ...viewEl.querySelectorAll(':scope > .route-workspace > *'),
-    ...viewEl.querySelectorAll(':scope > .card, :scope > .cols > .card'),
-  ].filter((el) => el && !el.hidden);
-
-  const isHoriz = dir === 'left' || dir === 'right';
-  const sign = dir === 'up' || dir === 'left' ? -1 : 1;
-  const dist = (withVt ? 8 : 14) * sign;
-  const startOpacity = withVt ? 0.78 : 0.25;
-
-  blocks.slice(0, 10).forEach((el, i) => {
-    const shift = isHoriz
-      ? `translate3d(${dist}px, 0, 0)`
-      : `translate3d(0, ${dist}px, 0)`;
-    animate(
-      el,
-      [
-        { opacity: startOpacity, transform: `${shift} scale(0.99)` },
-        { opacity: 1, transform: 'none' },
-      ],
-      {
-        duration: 420,
-        delay: i * 24,
-        easing: SPRING.bouncy,
-        fill: 'backwards',
-      },
-    );
-  });
-
 }
 
 /* ---------------------------------------------------------------- FLIP 物理布局重排 */
@@ -382,33 +371,175 @@ export function animateToastOut(el, onDone) {
 
 /* ---------------------------------------------------------------- 视图切换 */
 
-/* 视图切换：新旧两块主区横向/纵向错开推过去，规则在 style.css 的 data-vt-dir 上。
-   dir 只有 'down'（往后翻）和 'up'（往回翻）两种，按导航顺序定。
-   主题切换走的是另一套 —— data-vt-theme 的圆形揭开要把所有 view-transition-name
-   摘掉，两条路同时跑会互相抢名字、把页面撕开，所以互斥。
-   返回是否真的套上了过渡，没套上时调用方自己补一个淡入。 */
-let vtSeq = 0;
+/* 真实 DOM 双层舞台：目标视图留在正常流里定义高度，离场视图绝对定位并立刻断掉
+   命中测试。侧栏是上下排列的，所以切换也走上下：点下面的栏位，新视图从下方进来、
+   旧视图往上退；点上面的栏位反过来。两层各跑一组弹簧，y 和透明度都带着当前速度，
+   连点第三个栏位时，正在离场的那层从半路直接改目标，不会回到起点重播。
+   不再用 View Transitions：它会把整页做成快照盖在最上面，过渡期间点击到不了侧栏。 */
 
-export function withViewTransition(dir, mutate, afterPaint) {
-  const root = document.documentElement;
-  const seq = ++vtSeq;
-  if (reduceMotion() || typeof document.startViewTransition !== 'function' || root.dataset.vtTheme) {
-    delete root.dataset.vtDir;
-    mutate();
-    afterPaint?.(false);
-    return false;
-  }
-  root.dataset.vtDir = dir;
-  // 连点导航会把上一次的过渡打断，它的收尾不能把新过渡的方向擦掉
-  const vt = document.startViewTransition(mutate);
-  // ready 在新快照捕获之后才兑现；此时目标页已显示，内部 WAAPI 动画能实际播放。
-  vt.ready.then(() => { if (seq === vtSeq) afterPaint?.(true); }).catch(() => {
-    vt.updateCallbackDone.then(() => { if (seq === vtSeq) afterPaint?.(false); }).catch(() => {});
-  });
-  vt.finished
-    .catch(() => { /* 切换被打断不算错误 */ })
-    .finally(() => { if (seq === vtSeq) delete root.dataset.vtDir; });
-  return true;
+const VIEW_DISTANCE = 48;
+const VIEW_SPEC = {
+  y: { ...MOTION.view, value: 0 },
+  opacity: { ...MOTION.viewFade, value: 1 },
+};
+
+let viewStage = null;
+
+export function initViewStage(stage) {
+  viewStage?.dispose();
+  viewStage = stage ? createViewStage(stage) : null;
+  return viewStage;
+}
+
+export function showViewLayer(el, dir = 'down', options = {}) {
+  return viewStage?.show(el, dir, options) ?? false;
+}
+
+export function createViewStage(stage, { distance = VIEW_DISTANCE } = {}) {
+  let current = null;
+  let order = [];
+  const states = new WeakMap();
+  const views = () => [...(stage?.querySelectorAll?.('.view') || [])];
+
+  const clear = (el) => {
+    el.style.transform = '';
+    el.style.opacity = '';
+    el.style.willChange = '';
+  };
+
+  const markMoving = (on) => {
+    if (!stage) return;
+    if (on) {
+      stage.dataset.moving = '1';
+      stage.classList.add('is-moving');
+    } else {
+      delete stage.dataset.moving;
+      stage.classList.remove('is-moving');
+    }
+  };
+
+  const anyActive = () => views().some((el) => states.get(el)?.group.active);
+
+  const hideNow = (el) => {
+    states.get(el)?.group.place({ y: 0, opacity: 0 });
+    el.hidden = true;
+    el.classList.remove('is-leaving');
+    clear(el);
+    order = order.filter((item) => item !== el);
+  };
+
+  const stateFor = (el) => {
+    let state = states.get(el);
+    if (state) return state;
+    state = { el };
+    state.group = createSpringGroup(VIEW_SPEC, ({ y, opacity }) => {
+      const shrink = Math.min(0.012, (Math.abs(y) / distance) * 0.012);
+      el.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0) scale(${(1 - shrink).toFixed(4)})`;
+      el.style.opacity = opacity.toFixed(3);
+    }, {
+      onRest: () => {
+        if (current === el) {
+          clear(el);
+        } else {
+          el.hidden = true;
+          el.classList.remove('is-leaving');
+          clear(el);
+          order = order.filter((item) => item !== el);
+        }
+        if (!anyActive()) markMoving(false);
+      },
+    });
+    states.set(el, state);
+    return state;
+  };
+
+  /* 首屏、减弱动效和测试环境：不做推拉，直接把目标视图放好。 */
+  const instant = (el) => {
+    for (const view of views()) {
+      if (view === el) continue;
+      states.get(view)?.group.place({ y: 0, opacity: 0 });
+      view.hidden = true;
+      view.classList.remove('is-leaving');
+      clear(view);
+      order = order.filter((item) => item !== view);
+    }
+    const state = stateFor(el);
+    state.group.place({ y: 0, opacity: 1 });
+    el.hidden = false;
+    el.classList.remove('is-leaving');
+    el.inert = false;
+    el.removeAttribute('aria-hidden');
+    order = [el];
+    current = el;
+    markMoving(false);
+  };
+
+  return {
+    get current() { return current; },
+    show(el, dir = 'down', { initial = false } = {}) {
+      if (!el || (stage && typeof stage.contains === 'function' && !stage.contains(el))) return false;
+      if (!current || initial) {
+        instant(el);
+        return false;
+      }
+      if (el === current) return false;
+      if (!motionAllowed()) {
+        instant(el);
+        return false;
+      }
+
+      const sign = dir === 'up' ? -1 : 1;
+      const incoming = stateFor(el);
+      const wasVisible = !el.hidden;
+      el.hidden = false;
+      el.classList.remove('is-leaving');
+      el.inert = false;
+      el.removeAttribute('aria-hidden');
+      el.style.willChange = 'transform, opacity';
+      // 正在离场时又被点回来：保留当前 x 和速度，从半路直接反向；只有从 hidden
+      // 重新入场才放到新方向的起点。
+      if (!wasVisible) incoming.group.place({ y: sign * distance, opacity: 0.55 });
+      incoming.group.set({ y: 0, opacity: 1 });
+
+      const outgoing = current;
+      if (outgoing && outgoing !== el) {
+        const out = stateFor(outgoing);
+        outgoing.hidden = false;
+        outgoing.classList.add('is-leaving');
+        outgoing.inert = true;
+        outgoing.setAttribute('aria-hidden', 'true');
+        outgoing.style.willChange = 'transform, opacity';
+        out.group.set({ y: -sign * distance, opacity: 0 });
+      }
+
+      current = el;
+      order = order.filter((item) => item !== el);
+      order.push(el);
+
+      // 快速连点最多同时留三层；更早的直接收掉，避免半透明卡片叠成一团
+      const live = order.filter((item) => !item.hidden);
+      if (live.length > 3) {
+        const keep = new Set(live.slice(-3));
+        for (const view of views()) {
+          if (!keep.has(view) && !view.hidden) hideNow(view);
+        }
+        order = order.filter((item) => keep.has(item));
+      }
+      markMoving(true);
+      return true;
+    },
+    settle() {
+      for (const el of views()) states.get(el)?.group.finish();
+      markMoving(false);
+    },
+    dispose() {
+      for (const el of views()) states.get(el)?.group.dispose();
+      delete stage?.dataset.moving;
+      stage?.classList.remove('is-moving');
+      current = null;
+      order = [];
+    },
+  };
 }
 
 /* ---------------------------------------------------------------- 条形图形变 */
@@ -491,20 +622,44 @@ export function updateNumber(el, text) {
 
 /* ---------------------------------------------------------------- 分段控制器胶囊指示器 */
 
+const SEG_SPEC = {
+  x: { ...MOTION.seg, value: 0 },
+  y: { ...MOTION.seg, value: 0 },
+  w: { ...MOTION.size, value: 0 },
+  h: { ...MOTION.size, value: 0 },
+  opacity: { ...MOTION.fade, value: 0 },
+};
+
+const segIndicators = new WeakMap();
+
 export function syncSegMarkers(scope = document) {
   if (!scope?.querySelectorAll) return;
   for (const seg of scope.querySelectorAll('.seg')) {
+    let indicator = segIndicators.get(seg);
+    if (!indicator) {
+      indicator = createIndicator(({ x, y, w, h, opacity }) => {
+        seg.style.setProperty('--seg-x', `${x.toFixed(2)}px`);
+        seg.style.setProperty('--seg-y', `${y.toFixed(2)}px`);
+        seg.style.setProperty('--seg-w', `${Math.max(0, w).toFixed(2)}px`);
+        seg.style.setProperty('--seg-h', `${Math.max(0, h).toFixed(2)}px`);
+        seg.style.setProperty('--seg-opacity', opacity.toFixed(3));
+      }, SEG_SPEC);
+      segIndicators.set(seg, indicator);
+    }
+    const ready = seg.dataset.segReady === '1';
     const active = seg.querySelector('.seg-item.is-on');
     if (!active || !active.offsetWidth) {
-      seg.style.setProperty('--seg-opacity', '0');
+      indicator.move({ opacity: 0 }, { instant: !ready });
       delete seg.dataset.segReady;
       continue;
     }
-    seg.style.setProperty('--seg-x', `${active.offsetLeft}px`);
-    seg.style.setProperty('--seg-y', `${active.offsetTop}px`);
-    seg.style.setProperty('--seg-w', `${active.offsetWidth}px`);
-    seg.style.setProperty('--seg-h', `${active.offsetHeight}px`);
-    seg.style.setProperty('--seg-opacity', '1');
+    indicator.move({
+      x: active.offsetLeft,
+      y: active.offsetTop,
+      w: active.offsetWidth,
+      h: active.offsetHeight,
+      opacity: 1,
+    }, { instant: !ready });
     seg.dataset.segReady = '1';
   }
 }
@@ -519,6 +674,7 @@ export function toggleMotion() { return controller?.toggle(); }
 export function initMotion() {
   controller?.dispose();
   syncSpringCurves();
+  initViewStage(document.getElementById('view-stage'));
   const root = document.documentElement;
   const nav = document.getElementById('nav');
   const marker = document.getElementById('nav-marker');
@@ -545,16 +701,36 @@ export function initMotion() {
     for (const animation of animations.values()) animation.cancel();
     animations.clear();
   };
+  const navSpec = {
+    x: { ...MOTION.nav, value: 0 },
+    y: { ...MOTION.nav, value: 0 },
+    w: { ...MOTION.size, value: 0 },
+    h: { ...MOTION.size, value: 0 },
+    opacity: { ...MOTION.fade, value: 0 },
+  };
+  const navIndicator = marker ? createIndicator(({ x, y, w, h, opacity }) => {
+    marker.style.transform = `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)`;
+    marker.style.width = `${Math.max(0, w).toFixed(2)}px`;
+    marker.style.height = `${Math.max(0, h).toFixed(2)}px`;
+    marker.style.opacity = opacity.toFixed(3);
+  }, navSpec) : null;
+  let markerPlaced = false;
   const moveMarker = () => {
     if (navFrame || !visible() || !nav || !marker) return;
     navFrame = requestAnimationFrame(() => {
       navFrame = 0;
       const selected = nav.querySelector('.is-active');
-      if (selected) {
-        marker.style.width = selected.offsetWidth + 'px';
-        marker.style.height = selected.offsetHeight + 'px';
-        marker.style.transform = `translate(${selected.offsetLeft}px, ${selected.offsetTop}px)`;
-        marker.style.opacity = '1';
+      if (!selected) {
+        navIndicator?.hide({ instant: !markerPlaced });
+      } else {
+        navIndicator?.move({
+          x: selected.offsetLeft,
+          y: selected.offsetTop,
+          w: selected.offsetWidth,
+          h: selected.offsetHeight,
+          opacity: 1,
+        }, { instant: !markerPlaced });
+        markerPlaced = true;
       }
       syncSegMarkers();
     });
@@ -570,6 +746,7 @@ export function initMotion() {
     clearLight();
     if (!visible() || reduced.matches) {
       stopAnimations();
+      settleAllMotions();
       if (navFrame) cancelAnimationFrame(navFrame);
       navFrame = 0;
     }
@@ -670,6 +847,9 @@ export function initMotion() {
     dispose() {
       clearLight();
       stopAnimations();
+      settleAllMotions();
+      viewStage?.dispose();
+      viewStage = null;
       for (const pending of closingDialogs.values()) pending.cancel();
       if (navFrame) cancelAnimationFrame(navFrame);
       observer.disconnect();

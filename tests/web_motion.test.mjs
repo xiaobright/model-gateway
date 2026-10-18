@@ -3,7 +3,13 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 
-const source = readFileSync(new URL('../web/motion.js', import.meta.url), 'utf8').replace(/^export /gm, '');
+const springSource = readFileSync(new URL('../web/spring.js', import.meta.url), 'utf8')
+  .replace(/^export /gm, '');
+const motionSource = readFileSync(new URL('../web/motion.js', import.meta.url), 'utf8')
+  .replace(/^import [\s\S]*? from '[^']+';\r?\n/gm, '')
+  .replace(/^export \{[^}]*\} from '[^']+';\r?\n/gm, '')
+  .replace(/^export /gm, '');
+const source = springSource + '\n' + motionSource;
 function events(extra = {}) {
   const listeners = new Map();
   return Object.assign({
@@ -63,7 +69,9 @@ function harness(stored = null, { autoReady = true, springTokens = {}, dialogs =
   });
   const window = events({ matchMedia: query => query.includes('reduced-motion') ? reduced : pointer });
   const storage = { value: stored, getItem() { return this.value; }, setItem(_key, value) { this.value = value; } };
+  let clock = 0;
   const context = vm.createContext({ window, document, localStorage: storage,
+    performance: { now: () => clock },
     getComputedStyle: el => ({ opacity: '1', transform: 'none',
       getPropertyValue: key => el === root ? springTokens[key] || '' : '' }),
     ResizeObserver: class { observe() {} disconnect() {} },
@@ -72,12 +80,23 @@ function harness(stored = null, { autoReady = true, springTokens = {}, dialogs =
   });
   vm.runInContext(source, context);
   const api = vm.runInContext('({ initMotion, toggleMotion, moveNavMarker, slideIn, updateNumber,'
-    + ' withViewTransition, readBarWidths, morphBars, enterHighlight, closeDialog, openDialog, springAnimate })', context);
+    + ' initViewStage, showViewLayer, createIndicator, syncSegMarkers, readBarWidths, morphBars,'
+    + ' enterHighlight, closeDialog, openDialog, springAnimate })', context);
   const control = api.initMotion();
-  const flush = () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(fn => fn()); };
+  const flush = (step = 16) => {
+    clock += step;
+    const pending = [...frames.values()];
+    frames.clear();
+    pending.forEach(fn => fn(clock));
+  };
+  const settle = (limit = 240) => {
+    let i = 0;
+    while (frames.size && i < limit) { flush(); i++; }
+    return frames.size === 0;
+  };
   flush();
   const move = (target, x = 60, y = 80) => document.emit('pointermove', { target, clientX: x, clientY: y, pointerType: 'mouse' });
-  return { api, control, document, window, frames, reduced, pointer, root, marker, selected, toggle, storage, flush, move, transitions };
+  return { api, control, document, window, frames, reduced, pointer, root, marker, selected, toggle, storage, flush, settle, move, transitions };
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -87,6 +106,36 @@ function bar(key, width) {
   const fill = { style: { width } };
   return { dataset: { key }, _fill: fill, querySelector: () => fill };
 }
+
+function viewSurface(name, visible = false) {
+  const classes = new Set();
+  return {
+    dataset: { view: name }, hidden: !visible, inert: false, attrs: {}, style: {}, classes,
+    classList: {
+      add: (key) => classes.add(key),
+      remove: (key) => classes.delete(key),
+      contains: (key) => classes.has(key),
+    },
+    setAttribute(key, value) { this.attrs[key] = value; },
+    removeAttribute(key) { delete this.attrs[key]; },
+  };
+}
+
+function stageSurface(views) {
+  const classes = new Set();
+  return {
+    dataset: {}, classes,
+    classList: {
+      add: (key) => classes.add(key),
+      remove: (key) => classes.delete(key),
+      contains: (key) => classes.has(key),
+    },
+    querySelectorAll: (selector) => (selector === '.view' ? views : []),
+    contains: (el) => views.includes(el),
+  };
+}
+
+const viewY = (el) => { const raw = (el.style.transform || '').replace('translate3d(', '').replace(')', '').split(','); return raw.length >= 2 ? parseFloat(raw[1]) : NaN; };
 
 test('高频指针移动合并成一帧，只计算并点亮最后一个容器，不自行续帧', () => {
   const h = harness(), a = surface(), b = surface();
@@ -131,7 +180,7 @@ test('后台取消光感、导航帧和有限动画；返回前台只补一次�
   assert.equal(a.animated.length, 1);
   h.document.visibilityState = 'visible'; h.document.emit('visibilitychange'); h.flush();
   assert.equal(h.root['data-page-hidden'], false);
-  assert.equal(h.marker.style.transform, 'translate(0px, 98px)');
+  assert.equal(h.marker.style.transform, 'translate3d(0.00px, 98.00px, 0)');
   assert.equal(h.frames.size, 0);
 });
 
@@ -173,58 +222,98 @@ test('同值数字不重播，新值中止旧动画；隐藏元素不播放', ()
   assert.equal(a.reads, 0);
 });
 
-test('导航尺寸变化合并更新，支持移动端两行位置', () => {
+const markerX = (marker) => Number(/translate3d\((-?[\d.]+)px/.exec(marker.style.transform)?.[1]);
+
+test('导航尺寸变化合并更新；连续改目标从当前位置继续', () => {
   const h = harness();
-  Object.assign(h.selected, { offsetLeft: 108, offsetTop: 48, offsetWidth: 104 });
-  h.api.moveNavMarker(); h.api.moveNavMarker();
-  assert.equal(h.frames.size, 1);
+  Object.assign(h.selected, { offsetLeft: 0, offsetTop: 98, offsetWidth: 180, offsetHeight: 44 });
+  h.api.moveNavMarker();
   h.flush();
-  assert.equal(h.marker.style.transform, 'translate(108px, 48px)');
-  assert.equal(h.marker.style.width, '104px');
-  assert.equal(h.frames.size, 0);
+  h.settle();
+  Object.assign(h.selected, { offsetLeft: 108, offsetTop: 48, offsetWidth: 104 });
+  h.api.moveNavMarker();
+  h.api.moveNavMarker();
+  assert.equal(h.frames.size, 1, '同一帧内的多次移动只排一次');
+  h.flush();   // moveMarker 的 rAF：读位置、起弹簧
+  h.flush();   // 弹簧第一帧
+  const mid = markerX(h.marker);
+  assert.ok(mid > 0 && mid < 108, `第一帧应已离开起点，实际 ${mid}`);
+
+  Object.assign(h.selected, { offsetLeft: 0, offsetTop: 98, offsetWidth: 180 });
+  h.api.moveNavMarker();
+  assert.equal(markerX(h.marker), mid, '改目标不能把当前值清回起点');
+  h.flush();
+  const after = markerX(h.marker);
+  assert.ok(after > 0 && after < 108, `反向途中也不能跳到任一端点，实际 ${after}`);
+  h.settle();
+  assert.match(h.marker.style.transform, /translate3d\(0\.00px, 98\.00px, 0\)/);
+  assert.equal(h.marker.style.width, '180.00px');
 });
 
-test('视图切换：挂上方向，在异步更新回调中改 DOM，收尾后摘掉', async () => {
+test('视图舞台：新视图立刻可见可点，离场层断开命中并在落定后隐藏', () => {
   const h = harness();
-  const order = [];
-  assert.equal(h.api.withViewTransition('down', () => order.push('painted')), true);
-  assert.equal(h.root.dataset.vtDir, 'down');
-  assert.deepEqual(order, [], '真实 API 在捕获旧快照后异步更新 DOM');
-  await tick();
-  assert.deepEqual(order, ['painted'], 'DOM 变更必须在挂上方向之后、过渡之内完成');
-  assert.equal(h.transitions.length, 1);
-  h.transitions[0].settle();
-  await tick();
-  assert.equal(h.root.dataset.vtDir, undefined);
+  const views = ['a', 'b', 'c'].map((name, i) => viewSurface(name, i === 0));
+  const stage = stageSurface(views);
+  h.api.initViewStage(stage);
+  assert.equal(h.api.showViewLayer(views[0], 'down', { initial: true }), false);
+  assert.equal(views[0].hidden, false);
+
+  assert.equal(h.api.showViewLayer(views[1], 'down'), true);
+  assert.equal(views[1].hidden, false, '新视图当帧就要显示');
+  assert.equal(views[0].classes.has('is-leaving'), true);
+  assert.equal(views[0].inert, true);
+  assert.equal(views[0].attrs['aria-hidden'], 'true');
+  assert.match(views[1].style.transform, /translate3d\(0, 48\.00px/);
+
+  h.flush();
+  assert.equal(views[0].hidden, false, '离场层还在动，不能提前藏');
+  h.settle();
+  assert.equal(views[0].hidden, true);
+  assert.equal(views[0].classes.has('is-leaving'), false);
+  assert.equal(views[0].style.transform, '');
+  assert.equal(views[1].style.transform, '', '落定后清掉内联 transform，不留下合成层');
+  assert.equal(stage.dataset.moving, undefined);
 });
 
-test('级联等待新快照 ready；被取代的旧过渡不能播放入场', async () => {
-  const h = harness(null, { autoReady: false });
-  const events = [];
-  h.api.withViewTransition('down', () => events.push('paint A'), moved => events.push(`enter A ${moved}`));
-  h.transitions[0].paint();
-  assert.deepEqual(events, ['paint A'], 'DOM 更新完成仍不能在捕获新快照前播放');
-  h.api.withViewTransition('up', () => events.push('paint B'), moved => events.push(`enter B ${moved}`));
-  h.transitions[0].markReady();
-  h.transitions[1].paint();
-  h.transitions[1].markReady();
-  await tick();
-  assert.deepEqual(events, ['paint A', 'paint B', 'enter B true']);
+test('视图舞台：连点第三个栏位时，半路的那层直接改目标，不回到起点', () => {
+  const h = harness();
+  const views = ['a', 'b', 'c'].map((name, i) => viewSurface(name, i === 0));
+  const stage = stageSurface(views);
+  h.api.initViewStage(stage);
+  h.api.showViewLayer(views[0], 'down', { initial: true });
+
+  h.api.showViewLayer(views[1], 'down');
+  for (let i = 0; i < 3; i++) h.flush();
+  const mid = viewY(views[1]);
+  assert.ok(mid < 48 && mid > 0, `第二层应停在半路，实际 ${mid}`);
+
+  assert.equal(h.api.showViewLayer(views[2], 'down'), true);
+  assert.equal(viewY(views[1]), mid, '半路的那层不能被重新放到起点');
+  assert.equal(views[1].classes.has('is-leaving'), true);
+  assert.equal(views[2].hidden, false);
+  assert.match(views[2].style.transform, /translate3d\(0, 48\.00px/);
+
+  // 立刻点回第二层：它正从半路离场，应该原地反向，而不是重新从 +48 进来
+  const before = viewY(views[1]);
+  assert.equal(h.api.showViewLayer(views[1], 'up'), true);
+  assert.equal(viewY(views[1]), before);
+  assert.equal(views[1].classes.has('is-leaving'), false);
+  h.settle();
+  assert.equal(views[1].hidden, false);
+  assert.equal(views[2].hidden, true);
+  assert.equal(views[0].hidden, true, '更早的层应被收掉');
 });
 
-test('过渡 ready 被跳过时，在更新完成后补入场；减少动效同步显示', async () => {
-  const h = harness(null, { autoReady: false });
-  const calls = [];
-  h.api.withViewTransition('down', () => calls.push('paint'), moved => calls.push(moved));
-  h.transitions[0].rejectReady(new Error('skipped'));
-  await tick();
-  assert.deepEqual(calls, []);
-  h.transitions[0].paint();
-  await tick();
-  assert.deepEqual(calls, ['paint', false]);
+test('视图舞台：减弱动效直接切换，不排动画帧', () => {
+  const h = harness();
+  const views = ['a', 'b'].map((name, i) => viewSurface(name, i === 0));
+  h.api.initViewStage(stageSurface(views));
+  h.api.showViewLayer(views[0], 'down', { initial: true });
   h.reduced.matches = true;
-  h.api.withViewTransition('up', () => calls.push('reduced paint'), moved => calls.push(moved));
-  assert.deepEqual(calls, ['paint', false, 'reduced paint', false]);
+  assert.equal(h.api.showViewLayer(views[1], 'down'), false);
+  assert.equal(views[1].hidden, false);
+  assert.equal(views[0].hidden, true);
+  assert.equal(h.frames.size, 0);
 });
 
 test('JS 动画采用 CSS 的实际弹簧 token，默认曲线也在初始化后更新', () => {
@@ -298,35 +387,6 @@ test('Esc 与确认框提交共用退场；切换系统减弱时直接完成关�
   assert.equal(dlg.open, false);
   assert.equal(dlg.returnValue, 'ok');
   assert.equal(prevented, 2);
-});
-
-test('连点导航：被打断的旧过渡收尾不能擦掉新方向', async () => {
-  const h = harness();
-  h.api.withViewTransition('down', () => {});
-  h.api.withViewTransition('up', () => {});
-  assert.equal(h.root.dataset.vtDir, 'up');
-  h.transitions[0].settle();     // 第一次的 finished 才到
-  await tick();
-  assert.equal(h.root.dataset.vtDir, 'up');
-  h.transitions[1].settle();
-  await tick();
-  assert.equal(h.root.dataset.vtDir, undefined);
-});
-
-test('减弱动效或主题揭开进行中，视图切换不套过渡并告诉调用方', () => {
-  const h = harness();
-  let painted = 0;
-  h.reduced.matches = true;
-  assert.equal(h.api.withViewTransition('down', () => painted++), false);
-  assert.equal(painted, 1);
-  assert.equal(h.transitions.length, 0);
-  assert.equal(h.root.dataset.vtDir, undefined);
-  h.reduced.matches = false;
-  h.root.dataset.vtTheme = '1';
-  assert.equal(h.api.withViewTransition('up', () => painted++), false);
-  assert.equal(painted, 2);
-  assert.equal(h.transitions.length, 0);
-  assert.equal(h.root.dataset.vtDir, undefined, '两条过渡互斥，谁也不能把方向挂上');
 });
 
 test('条形形变：按 data-key 把旧宽度还给新条，下一帧放开到目标宽度', () => {

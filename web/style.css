@@ -52,10 +52,16 @@
   --mono: "SF Mono", Consolas, "Liberation Mono", monospace;
 }
 @supports (transition-timing-function: linear(0, 1)) {
+  /* 曲线由 spring.js 的同一组物理参数采样而来（24 点）：
+     snappy 700/34、smooth 420/38、bouncy 480/24、gentle 260/30。
+     需要「从当前速度继续」的导航/视图用运行时弹簧，不走这里；
+     这里的 linear() 只负责 hover、颜色、一次性入场这些不会重定向的过渡。 */
   :root {
-    --spring-snappy: linear(0, 0.38 9%, 0.72 19%, 0.94 30%, 1.03 42%, 1.01 58%, 1);
-    --spring-bouncy: linear(0, 0.42 9%, 0.82 19%, 1.05 31%, 1.07 41%, 1.02 56%, 0.995 74%, 1);
-    --spring-smooth: linear(0, 0.35 10%, 0.68 22%, 0.89 35%, 0.97 50%, 0.995 68%, 1);
+    --spring: linear(0, 0.059 4.17%, 0.1837 8.33%, 0.3281 12.5%, 0.4675 16.67%, 0.5902 20.83%, 0.6923 25%, 0.7706 29.17%, 0.8345 33.33%, 0.8828 37.5%, 0.9185 41.67%, 0.9444 45.83%, 0.9628 50%, 0.9752 54.17%, 0.9841 58.33%, 0.9901 62.5%, 0.9941 66.67%, 0.9967 70.83%, 0.9983 75%, 0.9992 79.17%, 0.9998 83.33%, 1.0001 87.5%, 1.0002 91.67%, 1.0003 95.83%, 1 100%);
+    --spring-snappy: linear(0, 0.1242 4.17%, 0.3618 8.33%, 0.6184 12.5%, 0.8183 16.67%, 0.955 20.83%, 1.0348 25%, 1.0656 29.17%, 1.0679 33.33%, 1.0548 37.5%, 1.0374 41.67%, 1.0212 45.83%, 1.0084 50%, 1.0006 54.17%, 0.9965 58.33%, 0.9952 62.5%, 0.9955 66.67%, 0.9966 70.83%, 0.9979 75%, 0.9989 79.17%, 0.9996 83.33%, 1.0001 87.5%, 1.0003 91.67%, 1.0003 95.83%, 1 100%);
+    --spring-bouncy: linear(0, 0.1637 4.17%, 0.4739 8.33%, 0.7734 12.5%, 0.9859 16.67%, 1.0966 20.83%, 1.126 25%, 1.1064 29.17%, 1.0664 33.33%, 1.0286 37.5%, 1.0018 41.67%, 0.9878 45.83%, 0.9841 50%, 0.9866 54.17%, 0.9915 58.33%, 0.9963 62.5%, 0.9998 66.67%, 1.0015 70.83%, 1.002 75%, 1.0017 79.17%, 1.0011 83.33%, 1.0005 87.5%, 1 91.67%, 0.9998 95.83%, 1 100%);
+    --spring-smooth: linear(0, 0.059 4.17%, 0.1837 8.33%, 0.3281 12.5%, 0.4675 16.67%, 0.5902 20.83%, 0.6923 25%, 0.7706 29.17%, 0.8345 33.33%, 0.8828 37.5%, 0.9185 41.67%, 0.9444 45.83%, 0.9628 50%, 0.9752 54.17%, 0.9841 58.33%, 0.9901 62.5%, 0.9941 66.67%, 0.9967 70.83%, 0.9983 75%, 0.9992 79.17%, 0.9998 83.33%, 1.0001 87.5%, 1.0002 91.67%, 1.0003 95.83%, 1 100%);
+    --spring-gentle: linear(0, 0.0549 4.17%, 0.1729 8.33%, 0.3114 12.5%, 0.4471 16.67%, 0.5685 20.83%, 0.6709 25%, 0.754 29.17%, 0.8195 33.33%, 0.8682 37.5%, 0.9064 41.67%, 0.9346 45.83%, 0.9551 50%, 0.9698 54.17%, 0.98 58.33%, 0.9871 62.5%, 0.9919 66.67%, 0.995 70.83%, 0.9972 75%, 0.9985 79.17%, 0.9993 83.33%, 0.9998 87.5%, 1.0001 91.67%, 1.0002 95.83%, 1 100%);
   }
 }
 :root[data-theme="light"] { color-scheme: light; }
@@ -94,34 +100,17 @@
   to   { clip-path: circle(var(--vt-r, 150%) at var(--vt-x, 50%) var(--vt-y, 50%)); }
 }
 
-/* ------------------------------------------------ 视图切换：两块主区错开弹簧过渡
-   只有 withViewTransition 会挂 data-vt-dir，主题切换时主区不会莫名跟着横滑一下。
-   和上面那套圆形揭开互斥：圆形要摘掉所有 view-transition-name，正在滑的时候抢走
-   名字会把页面撕开，所以两条路在 app.js 里互相挡着。
-   侧栏不参与：它是 sticky 的常驻容器，滑进去会和"钉死在左边"的观感打架。 */
-:root[data-vt-dir]::view-transition-old(view-main) {
-  animation: slideOutLeft .34s var(--spring-smooth) both;
-}
-:root[data-vt-dir]::view-transition-new(view-main) {
-  animation: slideInRight .44s var(--spring-bouncy) both;
-}
-:root[data-vt-dir="up"]::view-transition-old(view-main) { animation-name: slideOutRight; }
-:root[data-vt-dir="up"]::view-transition-new(view-main) { animation-name: slideInLeft; }
-
-@keyframes slideOutLeft {
-  to { opacity: 0; transform: translate3d(-28px, 0, 0) scale(.982); filter: blur(2px); }
-}
-@keyframes slideInRight {
-  from { opacity: 0; transform: translate3d(32px, 0, 0) scale(.988); filter: blur(2px); }
-  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); filter: blur(0); }
-}
-@keyframes slideOutRight {
-  to { opacity: 0; transform: translate3d(28px, 0, 0) scale(.982); filter: blur(2px); }
-}
-@keyframes slideInLeft {
-  from { opacity: 0; transform: translate3d(-32px, 0, 0) scale(.988); filter: blur(2px); }
-  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); filter: blur(0); }
-}
+/* ------------------------------------------------ 视图舞台：真实 DOM 两层上下推拉
+   目标视图留在正常流里决定高度；离场层绝对定位、立刻断开命中测试。两层由
+   motion.js 的弹簧内核逐帧写 transform/opacity，连续点击时从当前速度和位置
+   继续，不再等上一段动画播完。
+   侧栏是上下排列的，所以切换也走纵向：点下面的栏位，新视图从下方进来。
+   运动期间才给舞台加 overflow: clip，挡住推拉时伸出去的上下边缘；静止后
+   恢复 visible，route-detail 的 sticky 和卡片阴影都不受影响。 */
+.view-stage { position: relative; }
+.view-stage.is-moving { overflow: clip; }
+.view { position: relative; z-index: 1; }
+.view.is-leaving { position: absolute; top: 0; left: 0; width: 100%; z-index: 0; pointer-events: none; }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--page-1); font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; -webkit-font-smoothing: antialiased; }
@@ -159,7 +148,7 @@ h3 { font-size: 14px; }
 .brand h1 { font-size: 14px; line-height: 1.4; font-weight: 650; margin: 0; }
 .brand p { color: var(--ink-3); font-size: 11px; margin: 3px 0 0; }
 .nav { position: relative; display: flex; flex-direction: column; gap: 5px; }
-.nav-marker { position: absolute; left: 0; top: 0; border: 1px solid var(--edge); border-radius: 13px; background: linear-gradient(115deg, var(--sheen), transparent), var(--glass-2); box-shadow: var(--edge-highlight), 0 4px 12px light-dark(#4e70ae14, #00000025); pointer-events: none; opacity: 0; transition: transform .42s var(--spring-bouncy), width .32s var(--spring-smooth), height .32s var(--spring-smooth), opacity .2s; }
+.nav-marker { position: absolute; left: 0; top: 0; border: 1px solid var(--edge); border-radius: 13px; background: linear-gradient(115deg, var(--sheen), transparent), var(--glass-2); box-shadow: var(--edge-highlight), 0 4px 12px light-dark(#4e70ae14, #00000025); pointer-events: none; opacity: 0; }
 .nav-item { position: relative; display: flex; align-items: center; gap: 11px; width: 100%; min-height: 44px; text-align: left; border: 1px solid transparent; border-radius: 13px; background: transparent; padding: 9px 12px; color: var(--ink-2); transition: background .22s var(--spring-smooth), color .22s var(--spring-smooth), transform .28s var(--spring-bouncy); }
 .nav-item:hover { background: var(--hover); transform: translateX(2px); }
 .nav-item.is-active { color: var(--accent); font-weight: 600; transform: none; }
@@ -191,12 +180,10 @@ h3 { font-size: 14px; }
 #theme-icon { display: inline-block; transition: transform .42s var(--spring-bouncy); }
 [data-act="toggle-theme"]:hover #theme-icon { transform: rotate(22deg) scale(1.12); }
 [data-act="toggle-theme"]:active #theme-icon { transform: rotate(-18deg) scale(.9); }
-/* view-transition-name 让 .main 在视图切换时新旧各成一层（规则见上面的 data-vt-dir），
-   同时它本身就把 .main 变成了 backdrop root。will-change: filter 让这个副作用在名字被
-   主题切换临时摘掉时也保持住：卡片的 backdrop-filter 只采样 .main 内部、吃不到页面
-   极光，两个时刻渲染一致，圆形揭开的收尾才不会整块跳色。
-   以后若给别的元素加 view-transition-name，同样记得补这条兜底。 */
-.main { min-width: 0; padding-top: 8px; view-transition-name: view-main; will-change: filter; }
+/* .main 是卡片 backdrop-filter 的采样边界：will-change: filter 让它成为 backdrop root，
+   卡片只采样 .main 内部、吃不到页面极光；主题圆形揭开整页捕获时，前后两个时刻的
+   渲染一致，收尾才不会整块跳色。 */
+.main { min-width: 0; padding-top: 8px; will-change: filter; }
 .view-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 23px; }
 .view-head h2 { font-size: 27px; line-height: 1.3; font-weight: 650; letter-spacing: -.6px; margin: 0; }
 .view-description { color: var(--ink-3); margin: 8px 0 0; font-size: 13px; }
@@ -239,7 +226,6 @@ h3 { font-size: 14px; }
   box-shadow: var(--edge-highlight), 0 2px 5px light-dark(#1232570f, #00000035);
   opacity: var(--seg-opacity, 0);
   pointer-events: none;
-  transition: transform .38s var(--spring-bouncy), width .32s var(--spring-smooth), height .32s var(--spring-smooth), opacity .18s;
 }
 .seg-item {
   position: relative;
@@ -254,22 +240,19 @@ h3 { font-size: 14px; }
 }
 .seg-item:hover { color: var(--ink); }
 .seg-item:active { transform: scale(.94); }
-/* 点中的那一下轻轻回弹；若 JS 胶囊就绪则由 ::before 承担底板滑动，未就绪时自身保留底色兜底 */
+/* JS 胶囊就绪后由 ::before 承担底板滑动；未就绪时自身保留底色兜底。不再给文字加弹跳，避免和底板两条动效打架。 */
 .seg-item.is-on {
   color: var(--accent);
   font-weight: 550;
   background: var(--glass-2);
   border-color: var(--edge);
   box-shadow: var(--edge-highlight), 0 2px 5px light-dark(#1232570f, #00000035);
-  animation: seg-pop .32s var(--spring-bouncy);
 }
 .seg[data-seg-ready="1"] .seg-item.is-on {
   background: transparent;
   border-color: transparent;
   box-shadow: none;
 }
-@keyframes seg-pop { from { transform: scale(.93); } }
-
 .view-tabs { display: flex; gap: 22px; }
 /* 下划线弹簧展开：换页时旧的那条缩回去、新的那条弹性长出来 */
 .view-tabs button { position: relative; padding: 12px 0 10px; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--ink-3); transition: color .22s var(--spring-smooth), transform .28s var(--spring-bouncy); }
@@ -295,9 +278,8 @@ h3 { font-size: 14px; }
 /* 选中蓝条是 .route-table 里一条独立的 .route-marker：切换选择时不重建列表，
    marker 用弹簧从上一行滑到下一行（translateY + height 一起过渡）。 */
 .route-table { position: relative; }
-.route-marker { position: absolute; left: 0; top: 0; width: 3.5px; height: 0; background: var(--accent); border-radius: 0 2px 2px 0; opacity: 0; transform: translateY(0); pointer-events: none; transition: transform .44s var(--spring-bouncy), height .4s var(--spring-bouncy), opacity .2s var(--spring-smooth); }
+.route-marker { position: absolute; left: 0; top: 0; width: 3.5px; height: 0; background: var(--accent); border-radius: 0 2px 2px 0; opacity: 0; transform: translateY(0); pointer-events: none; }
 .route.is-selected { background: linear-gradient(100deg, var(--accent-wash), light-dark(#ffffff30, #abc8ff08)); }
-:root[data-motion="light"] .route-marker { transition: none; }
 .route:focus-visible { outline-offset: -3px; }
 .route strong { font-weight: 600; display: block; font-size: 12.5px; overflow-wrap: anywhere; transition: transform .26s var(--spring-bouncy), color .2s; }
 .route small { display: block; color: var(--ink-3); font-size: 11px; margin-top: 5px; overflow-wrap: anywhere; }

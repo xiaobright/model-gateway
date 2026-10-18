@@ -53,9 +53,10 @@ async function click(selector) {
   await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', buttons: 1, clickCount: 1 });
   await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', buttons: 0, clickCount: 1 });
 }
+const stageIdle = `!document.getElementById('view-stage').dataset.moving`;
 async function view(name) {
   await click(`.nav-item[data-view="${name}"]`);
-  await wait(`!document.querySelector('.view[data-view="${name}"]').hidden && !document.documentElement.dataset.vtDir`);
+  await wait(`!document.querySelector('.view[data-view="${name}"]').hidden && ${stageIdle}`);
 }
 async function reduce(value) {
   await send('Emulation.setEmulatedMedia', { features: value ? [{ name: 'prefers-reduced-motion', value: 'reduce' }] : [] });
@@ -93,15 +94,97 @@ try {
   await send('Runtime.enable');
   await send('Page.enable');
   await send('Page.navigate', { url: origin });
-  await wait(`document.querySelectorAll('#route-list .route').length > 0 && !document.documentElement.dataset.vtDir`);
+  await wait(`document.querySelectorAll('#route-list .route').length > 0 && ${stageIdle}`);
   await evaluate(`window.motionQA=[];window.originalAnimate=Element.prototype.animate;Element.prototype.animate=function(frames,options){const a=window.originalAnimate.call(this,frames,options);motionQA.push({el:this,frames,options,a,view:this.closest('.view')?.dataset.view});return a;};`);
 
   await view('settings');
-  check('页面级联在新视图显示后执行', await evaluate(`motionQA.some(x=>x.view==='settings'&&x.options.duration===420&&!x.a.playState.includes('idle'))`));
-  check('CSS 与 JS 使用同一条弹簧曲线', await evaluate(`motionQA.filter(x=>x.view==='settings'&&x.options.duration===420).every(x=>x.options.easing===getComputedStyle(document.documentElement).getPropertyValue('--spring-bouncy').trim())`));
+  check('视图切换落定后没有残留离场层', await evaluate(`document.querySelectorAll('.view.is-leaving').length === 0 && !document.getElementById('view-stage').dataset.moving`));
+  const idleOverflow = await evaluate(`getComputedStyle(document.getElementById('view-stage')).overflow`);
+  check('静止时舞台不裁切（阴影和 sticky 不受影响）', idleOverflow === 'visible', { overflow: idleOverflow });
+
+  await evaluate(`document.querySelector('.nav-item[data-view="upstreams"]').click()`);
+  await sleep(90);
+  const mid = await evaluate(`(()=>{
+    const next=document.querySelector('.view[data-view="upstreams"]');
+    const prev=document.querySelector('.view[data-view="settings"]');
+    const stage=document.getElementById('view-stage');
+    const pos=el=>{const raw=(el.style.transform||'').replace('translate3d(','').replace(')','').split(',');return raw.length>=2?{x:parseFloat(raw[0]),y:parseFloat(raw[1])}:null;};
+    return {nextVisible:!next.hidden,prevLeaving:prev.classList.contains('is-leaving'),
+      next:pos(next),prev:pos(prev),overflow:getComputedStyle(stage).overflow,
+      horizontal:document.documentElement.scrollWidth>innerWidth};
+  })()`);
+  await screenshot('mid-switch');
+  check('推拉中途两层同时可见：往上点，新页从上方进、旧页往下退',
+    mid.nextVisible && mid.prevLeaving && mid.next?.y < 0 && mid.prev?.y > 0
+      && mid.overflow === 'clip' && !mid.horizontal, mid);
+  await wait(stageIdle);
+
+  await click('.nav-item[data-view="settings"]');
+  await sleep(50);
+  await click('.nav-item[data-view="upstreams"]');
+  await sleep(40);
+  const mouseRapid = await evaluate(`(()=>{const stage=document.getElementById('view-stage');return {active:document.querySelector('.nav-item.is-active')?.dataset.view,moving:stage.dataset.moving||'',leaving:document.querySelectorAll('.view.is-leaving').length,nextHidden:document.querySelector('.view[data-view="upstreams"]').hidden};})()`);
+  check('真实鼠标在动画途中点第二个栏位也立即生效',
+    mouseRapid.active === 'upstreams' && mouseRapid.moving === '1'
+      && mouseRapid.leaving > 0 && mouseRapid.nextHidden === false, mouseRapid);
+  await wait(stageIdle);
+
+  await view('routes');
+  const bounce = await evaluate(`(async()=>{
+    const marker = document.getElementById('nav-marker');
+    const item = n => document.querySelector('.nav-item[data-view="'+n+'"]');
+    const view = n => document.querySelector('.view[data-view="'+n+'"]');
+    const pos = el => { const raw = (el.style.transform || '').replace('translate3d(', '').replace(')', '').split(','); return raw.length >= 2 ? { x: parseFloat(raw[0]), y: parseFloat(raw[1]) } : null; };
+    item('settings').click();
+    const target = { x: item('settings').offsetLeft, y: item('settings').offsetTop };
+    const incoming = view('settings');
+    let maxY = -Infinity, minY = Infinity, n = 0;
+    const started = performance.now();
+    await new Promise(resolve => {
+      const tick = () => {
+        const m = pos(marker), v = pos(incoming);
+        if (m) maxY = Math.max(maxY, m.y);
+        if (v) minY = Math.min(minY, v.y);
+        n++;
+        if (performance.now() - started < 800) requestAnimationFrame(tick); else resolve();
+      };
+      requestAnimationFrame(tick);
+    });
+    return { target, maxY, minY, samples: n };
+  })()`);
+  check('落位有明显回弹：胶囊越过目标、视图越过 0 再回来',
+    bounce.maxY > bounce.target.y + 3 && bounce.minY < -2 && bounce.samples > 20, bounce);
+  await wait(stageIdle);
+  await view('upstreams');
+
+  const navRapid = await evaluate(`(async()=>{
+    const go = n => document.querySelector('.nav-item[data-view="'+n+'"]').click();
+    const v = n => document.querySelector('.view[data-view="'+n+'"]');
+    const stage = document.getElementById('view-stage');
+    const active = () => document.querySelector('.nav-item.is-active')?.dataset.view;
+    go('settings');
+    await new Promise(requestAnimationFrame);
+    const first = { active: active(), moving: stage.dataset.moving || '' };
+    go('upstreams');
+    const second = { active: active(), moving: stage.dataset.moving || '',
+      leaving: v('settings').classList.contains('is-leaving'), nextHidden: v('upstreams').hidden };
+    await new Promise(r => setTimeout(r, 700));
+    return { first, second, after: { active: active(), moving: stage.dataset.moving || '',
+      leaving: document.querySelectorAll('.view.is-leaving').length,
+      visible: [...document.querySelectorAll('.view')].filter(x => !x.hidden).map(x => x.dataset.view) } };
+  })()`);
+  check('连点导航：第二次点击在第一次动画结束前生效，落定只留目标页',
+    navRapid.first.active === 'settings' && navRapid.first.moving === '1'
+      && navRapid.second.active === 'upstreams' && navRapid.second.nextHidden === false
+      && navRapid.second.leaving === true && navRapid.second.moving === '1'
+      && navRapid.after.active === 'upstreams' && navRapid.after.leaving === 0
+      && !navRapid.after.moving && navRapid.after.visible.join(',') === 'upstreams', navRapid);
 
   await view('upstreams');
   await click('[data-act="new-upstream"]');
+  await evaluate(`new Promise(requestAnimationFrame)`);
+  const curve = await evaluate(`(()=>{const a=motionQA.filter(x=>x.el.classList.contains('dlg-head'));const token=getComputedStyle(document.documentElement).getPropertyValue('--spring-smooth').trim();return {n:a.length,ok:a.every(x=>x.options.easing===token),token};})()`);
+  check('CSS 与 JS 使用同一条弹簧曲线', curve.n > 0 && curve.ok, curve);
   const dialog = await evaluate(`(async()=>{const {closeDialog}=await import('/static/motion.js');const d=document.getElementById('up-dialog');const finished=closeDialog(d);const during={open:d.open,inert:d.inert,closing:d.dataset.closing};await finished;return {during,open:d.open,inert:d.inert,display:getComputedStyle(d).display};})()`);
   check('弹窗退场后关闭且不留下布局', dialog.during.open && dialog.during.inert && dialog.during.closing === '1' && !dialog.open && !dialog.inert && dialog.display === 'none', dialog);
   const reopen = await evaluate(`(async()=>{const {closeDialog,openDialog}=await import('/static/motion.js');const d=document.getElementById('up-dialog');openDialog(d);const closing=closeDialog(d);openDialog(d);await closing;await ${frames};const result={open:d.open,inert:d.inert,closing:d.dataset.closing};await closeDialog(d);return result;})()`);
