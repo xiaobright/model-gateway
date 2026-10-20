@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#05070d">
+<title>NEXUS · Model Gateway</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Cpath d='M20 3 34 11v18L20 37 6 29V11z' fill='%230b0e18' stroke='%238b7bff' stroke-width='2'/%3E%3Ccircle cx='20' cy='20' r='4' fill='%23a78bfa'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<canvas id="field" aria-hidden="true"></canvas>
+<div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+<div class="grain" aria-hidden="true"></div>
+
+<div class="app">
+  <aside class="rail" aria-label="主导航">
+    <a class="brand" href="#" id="brand" aria-label="NEXUS 控制台">
+      <span class="brand-halo" aria-hidden="true"></span>
+      <svg viewBox="0 0 40 40" aria-hidden="true">
+        <defs>
+          <linearGradient id="brand-grad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#a78bfa"/>
+            <stop offset=".55" stop-color="#60a5fa"/>
+            <stop offset="1" stop-color="#22d3ee"/>
+          </linearGradient>
+        </defs>
+        <path d="M20 3.5 33.4 11v17L20 35.5 6.6 28V11Z" fill="none" stroke="url(#brand-grad)" stroke-width="1.5" stroke-linejoin="round"/>
+        <path d="M20 11.4 27.1 15.6v8.2L20 28 12.9 23.8v-8.2Z" fill="url(#brand-grad)" opacity=".16" stroke="url(#brand-grad)" stroke-width=".9" stroke-linejoin="round"/>
+        <circle cx="20" cy="19.8" r="2.7" fill="#f8fafc"/>
+        <circle cx="20" cy="19.8" r="5.4" fill="none" stroke="#f8fafc" stroke-opacity=".28"/>
+      </svg>
+    </a>
+
+    <nav class="rail-nav" id="rail-nav">
+      <button type="button" class="rail-btn is-active" data-view="overview" aria-label="总览">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2.6"/><circle cx="12" cy="12" r="7.4" opacity=".55"/><path d="M12 2.4v1.9M12 19.7v1.9M2.4 12h1.9M19.7 12h1.9"/></svg>
+        <span>总览</span>
+      </button>
+      <button type="button" class="rail-btn" data-view="models" aria-label="模型路由">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="12" cy="18.4" r="2.4"/><path d="M8.4 6h7.2M7.3 8.2l3.4 7.6M16.7 8.2l-3.4 7.6"/></svg>
+        <span>模型</span>
+      </button>
+      <button type="button" class="rail-btn" data-view="upstreams" aria-label="上游站点">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3.8" width="18" height="6.4" rx="2"/><rect x="3" y="13.8" width="18" height="6.4" rx="2"/><path d="M6.8 7h.01M6.8 17h.01M11 7h5.4M11 17h5.4"/></svg>
+        <span>上游</span>
+      </button>
+      <button type="button" class="rail-btn" data-view="live" aria-label="实时请求">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.8 12h3.4L9 4.8l4 14.4 2.7-7.2h5.5"/></svg>
+        <span>实时</span>
+        <i class="rail-badge" id="rail-live" hidden></i>
+      </button>
+      <button type="button" class="rail-btn" data-view="log" aria-label="转发记录">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.2h16M4 12h16M4 17.8h9.6"/></svg>
+        <span>记录</span>
+      </button>
+      <button type="button" class="rail-btn" data-view="settings" aria-label="网关设置">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.6 7.4h9.2M17.6 7.4h2.8M3.6 16.6h2.8M11.2 16.6h9.2"/><circle cx="15" cy="7.4" r="2.1"/><circle cx="8.6" cy="16.6" r="2.1"/></svg>
+        <span>设置</span>
+      </button>
+    </nav>
+
+    <div class="rail-foot">
+      <button type="button" class="rail-btn rail-ghost" id="theme-btn" aria-label="切换主题">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-moon"><path d="M20 14.4A8.2 8.2 0 0 1 9.6 4a8.4 8.4 0 1 0 10.4 10.4Z"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-sun"><circle cx="12" cy="12" r="4.1"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/></svg>
+        <span>外观</span>
+      </button>
+      <span class="rail-state" id="rail-state" title="控制面状态"><i></i></span>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <span class="eyebrow" id="page-eyebrow">MODEL GATEWAY / OVERVIEW</span>
+        <h1 id="page-title">总览</h1>
+      </div>
+      <div class="topbar-tools">
+        <button type="button" class="icon-btn only-mobile" id="theme-btn-mobile" aria-label="切换主题">
+          <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-moon"><path d="M20 14.4A8.2 8.2 0 0 1 9.6 4a8.4 8.4 0 1 0 10.4 10.4Z"/></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-sun"><circle cx="12" cy="12" r="4.1"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/></svg>
+        </button>
+        <button type="button" class="live-pill" id="live-pill" title="正在执行的请求">
+          <span class="live-dot"></span>
+          <b id="live-count">0</b>
+          <span>活跃</span>
+        </button>
+        <button type="button" class="endpoint-chip" id="endpoint-chip" title="点击复制下游接入地址">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.6 14.4 14.4 9.6M7.2 12 4.8 14.4a3.4 3.4 0 0 0 4.8 4.8L12 16.8M12 7.2l2.4-2.4a3.4 3.4 0 0 1 4.8 4.8L16.8 12"/></svg>
+          <code id="endpoint-text">127.0.0.1:8317</code>
+        </button>
+        <button type="button" class="icon-btn" id="refresh-btn" title="刷新数据">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.5-5.8M20 4.2V9h-4.8"/></svg>
+        </button>
+        <button type="button" class="palette-btn" id="palette-btn" title="命令面板">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.4"/><path d="m15.6 15.6 4.2 4.2"/></svg>
+          <span>搜索</span>
+          <kbd>Ctrl K</kbd>
+        </button>
+      </div>
+    </header>
+
+    <main class="stage" id="stage">
+      <!-- ============================ 总览 ============================ -->
+      <section class="view is-active" data-view="overview">
+        <div class="kpi-grid" id="kpi-grid"></div>
+
+        <div class="split split-chart">
+          <article class="card chart-card">
+            <header class="card-head">
+              <div class="card-title">
+                <span class="eyebrow">THROUGHPUT</span>
+                <h2>流量地形</h2>
+              </div>
+              <div class="segmented" id="window-seg" role="tablist" aria-label="时间窗">
+                <button type="button" data-window="1h" role="tab">1 小时</button>
+                <button type="button" data-window="24h" role="tab" class="is-on">24 小时</button>
+                <button type="button" data-window="7d" role="tab">7 天</button>
+                <span class="seg-pill" aria-hidden="true"></span>
+              </div>
+            </header>
+            <div class="chart-wrap" id="chart-wrap">
+              <svg id="traffic-chart" role="img" aria-label="请求量随时间的变化"></svg>
+              <div class="chart-tip" id="chart-tip" hidden></div>
+            </div>
+            <footer class="chart-foot">
+              <span class="lg"><i class="lg-req"></i>请求</span>
+              <span class="lg"><i class="lg-err"></i>失败</span>
+              <span class="chart-note" id="chart-note"></span>
+            </footer>
+          </article>
+
+          <article class="card pulse-card" id="pulse-card"></article>
+        </div>
+
+        <article class="card galaxy-card">
+          <header class="card-head">
+            <div class="card-title">
+              <span class="eyebrow">TOPOLOGY</span>
+              <h2>路由星系</h2>
+              <p>每个下游模型挂在哪些站上，谁在起点。点一个模型，看它的整条链。</p>
+            </div>
+            <div class="galaxy-legend" aria-hidden="true">
+              <span><i class="dot dot-model"></i>下游模型</span>
+              <span><i class="dot dot-up"></i>上游站点</span>
+              <span><i class="dot dot-live"></i>当前起点</span>
+            </div>
+          </header>
+          <div class="galaxy-body">
+            <div class="galaxy-scroll-hint">左右滑动查看完整星系 →</div>
+            <div class="galaxy-stage" id="galaxy-stage"></div>
+            <aside class="galaxy-panel" id="galaxy-panel"></aside>
+          </div>
+        </article>
+
+        <div class="split">
+          <article class="card">
+            <header class="card-head">
+              <div class="card-title"><span class="eyebrow">UPSTREAMS</span><h2>上游健康</h2></div>
+              <span class="head-meta" id="health-meta"></span>
+            </header>
+            <div class="health-list" id="health-list"></div>
+          </article>
+          <article class="card">
+            <header class="card-head">
+              <div class="card-title"><span class="eyebrow">HEAT</span><h2>模型热度</h2></div>
+              <span class="head-meta" id="heat-meta"></span>
+            </header>
+            <div class="heat-list" id="heat-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <!-- ============================ 模型 ============================ -->
+      <section class="view" data-view="models" hidden>
+        <div class="toolbar">
+          <label class="search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.4"/><path d="m15.6 15.6 4.2 4.2"/></svg>
+            <input id="model-search" type="search" placeholder="搜索模型、上游或真实模型名" autocomplete="off">
+          </label>
+          <div class="chips" id="protocol-chips" role="tablist" aria-label="接口筛选"></div>
+          <button type="button" class="btn btn-primary" id="new-model-btn">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg>
+            新增模型
+          </button>
+          <span class="count" id="model-count"></span>
+        </div>
+        <div class="chain-list" id="model-list"></div>
+      </section>
+
+      <!-- ============================ 上游 ============================ -->
+      <section class="view" data-view="upstreams" hidden>
+        <div class="toolbar">
+          <label class="search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.4"/><path d="m15.6 15.6 4.2 4.2"/></svg>
+            <input id="upstream-search" type="search" placeholder="搜索站点名、地址或分组" autocomplete="off">
+          </label>
+          <span class="count" id="upstream-count"></span>
+        </div>
+        <div class="station-grid" id="upstream-grid"></div>
+      </section>
+
+      <!-- ============================ 实时 ============================ -->
+      <section class="view" data-view="live" hidden>
+        <div class="live-summary card" id="live-summary"></div>
+        <div class="live-grid" id="live-grid"></div>
+        <article class="card recent-card">
+          <header class="card-head">
+            <div class="card-title"><span class="eyebrow">RECENTLY CLOSED</span><h2>刚结束</h2></div>
+            <span class="head-meta">保留 90 秒 · 每 2 秒刷新</span>
+          </header>
+          <div id="live-recent"></div>
+        </article>
+      </section>
+
+      <!-- ============================ 记录 ============================ -->
+      <section class="view" data-view="log" hidden>
+        <div class="toolbar log-toolbar">
+          <label class="search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.4"/><path d="m15.6 15.6 4.2 4.2"/></svg>
+            <input id="log-search" type="search" placeholder="搜索客户端、模型、上游或备注" autocomplete="off">
+          </label>
+          <select id="log-protocol" class="select" aria-label="接口"></select>
+          <select id="log-status" class="select" aria-label="状态">
+            <option value="all">全部结果</option>
+            <option value="ok">正常结束</option>
+            <option value="bad">异常或中断</option>
+            <option value="2xx">仅 2xx</option>
+            <option value="4xx">仅 4xx</option>
+            <option value="5xx">仅 5xx</option>
+          </select>
+          <span class="count" id="log-count"></span>
+          <button type="button" class="btn btn-ghost" id="log-clear">清空记录</button>
+        </div>
+        <article class="card table-card">
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>时间</th><th>客户端</th><th>模型</th><th>上游</th>
+                  <th>结果</th><th class="ta-r">耗时</th><th class="ta-r">输入</th><th class="ta-r">输出</th><th>备注</th>
+                </tr>
+              </thead>
+              <tbody id="log-body"></tbody>
+            </table>
+          </div>
+          <div class="table-empty" id="log-empty" hidden></div>
+        </article>
+      </section>
+
+      <!-- ============================ 设置 ============================ -->
+      <section class="view" data-view="settings" hidden>
+        <div class="settings-grid">
+          <article class="card">
+            <header class="card-head">
+              <div class="card-title"><span class="eyebrow">PROTOCOLS</span><h2>接口开关</h2><p>停用等于暂时隐藏：模型、分组和历史记录一起收起，配置全部保留。</p></div>
+            </header>
+            <div class="setting-list" id="protocol-switches"></div>
+          </article>
+
+          <article class="card">
+            <header class="card-head">
+              <div class="card-title"><span class="eyebrow">FAILURE</span><h2>失败与超时</h2><p>自动换站按候选顺序重试；发呆超时只中断当前请求，不记为故障。</p></div>
+            </header>
+            <div class="setting-list" id="failover-settings"></div>
+            <div class="field-row" id="stall-row"></div>
+          </article>
+
+          <article class="card">
+            <header class="card-head">
+              <div class="card-title"><span class="eyebrow">CLIENTS</span><h2>下游接入</h2><p>客户端只配一次。模型名填这里起的名，密钥填任意非空占位值。</p></div>
+            </header>
+            <div class="access-list" id="access-list"></div>
+          </article>
+
+          <article class="card danger-card">
+            <header class="card-head">
+              <div class="card-title"><span class="eyebrow">RUNTIME</span><h2>运行</h2><p>关闭网页不会关闭网关。这里的操作会影响正在运行的进程。</p></div>
+            </header>
+            <div class="runtime-rows">
+              <div class="run-row"><div><b>控制面状态</b><span id="runtime-state">已连接</span></div><span class="status-dot ok"></span></div>
+              <div class="run-row"><div><b>数据目录</b><span class="mono">data/gateway.db</span></div><span class="tag">本机</span></div>
+              <div class="run-row"><div><b>关闭网关</b><span>所有转发立刻停止，托盘模式可再次启动。</span></div><button type="button" class="btn btn-danger" id="shutdown-btn">关闭网关</button></div>
+            </div>
+            <p class="safety-note">只监听本机，没有登录系统。不要把管理页暴露到公网；密钥在数据库中明文保存。</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span><i class="foot-dot"></i>本地控制面</span>
+      <span class="mono" id="foot-addr">127.0.0.1:8317</span>
+      <span class="foot-sep"></span>
+      <span id="foot-updated">尚未同步</span>
+      <span class="foot-grow"></span>
+      <a class="foot-link" href="/" title="返回原管理页：添加供应商、拉取模型列表等">经典管理页</a>
+      <span class="foot-hint"><kbd>Ctrl K</kbd> 命令面板 · <kbd>Esc</kbd> 关闭</span>
+    </footer>
+  </div>
+</div>
+
+<!-- ============================ 抽屉 ============================ -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="详情">
+  <div class="drawer-head">
+    <div id="drawer-eyebrow" class="eyebrow">DETAIL</div>
+    <button type="button" class="icon-btn" id="drawer-close" aria-label="关闭">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 6.4 11.2 11.2M17.6 6.4 6.4 17.6"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<!-- ============================ 命令面板 ============================ -->
+<div class="palette-wrap" id="palette" hidden>
+  <div class="palette-scrim" data-close-palette></div>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="命令面板">
+    <div class="palette-input">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.4"/><path d="m15.6 15.6 4.2 4.2"/></svg>
+      <input id="palette-input" type="text" placeholder="跳转、搜模型、复制接入地址…" autocomplete="off">
+      <kbd>Esc</kbd>
+    </div>
+    <div class="palette-results" id="palette-results"></div>
+    <div class="palette-foot">
+      <span><kbd>↑</kbd><kbd>↓</kbd> 移动</span>
+      <span><kbd>Enter</kbd> 打开</span>
+      <span class="foot-grow"></span>
+      <span>NEXUS</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ 确认框 ============================ -->
+<div class="modal-wrap" id="modal" hidden>
+  <div class="modal-scrim" data-close-modal></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title">确认操作</h3>
+    <p id="modal-text"></p>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" id="modal-cancel">取消</button>
+      <button type="button" class="btn btn-danger" id="modal-ok">确认</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script type="module" src="./js/app.js"></script>
+</body>
+</html>

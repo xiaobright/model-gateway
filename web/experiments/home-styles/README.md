@@ -1,13 +1,16 @@
 # 首页风格备用样稿
 
-本目录集中保存未启用的首页实验，供以后比较、替换或融合。正式首页继续使用现有版本，运行时不加载这些样稿。
+本目录集中保存未启用的首页与控制台实验，供以后比较、替换或融合。正式首页继续使用现有版本，运行时不加载这些样稿。
 
 - [四种风格对比](home-style-gallery.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/home-styles/home-style-gallery.html>。顶部可切换单版或并排比较，也可在浏览器内收藏喜欢的风格。
 - [控制台重构样稿](../console-redesign/console-demo.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/console-redesign/console-demo.html>。石墨工作台、流水线候选卡片、三列流量关系图、实时请求瀑布轴与统一排查抽屉。
+- [NEXUS 控制台样稿](../nexus-console/index.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/nexus-console/index.html>。深空玻璃、路由星系、实时总览与命令面板；直接读取真实 Admin API，操作会落到当前配置。
 - [液态玻璃实验](liquid-glass-lab.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/home-styles/liquid-glass-lab.html>。保留 CSS、均衡、极致三档和测量面板。
 - [液态玻璃性能记录](liquid-glass-benchmark.md)及[原始测量数据](liquid-glass-benchmark.json)：保留实验当时的对照结果与适用边界。
 
-两个 HTML 都可直接打开；建议通过上面的网关地址访问，以便从样稿返回正式首页。迁移前位于 `/static/` 根目录的旧样稿链接已由上述入口替代。
+首页的两个 HTML 都可直接打开；NEXUS 例外，它要读真实接口，必须通过网关地址访问。建议都从上面的网关地址进入，以便返回正式首页。迁移前位于 `/static/` 根目录的旧样稿链接已由上述入口替代。
+
+控制台样稿与前两组不同：它直接请求 `/admin/api`，设首选、启停、删除、关闭网关等操作会改动真实配置或进程，不是一个只影响本页的演示。只想看界面时不要点危险操作。
 
 | 方案 | 视觉方向 | 适合借鉴的部分 |
 | --- | --- | --- |
