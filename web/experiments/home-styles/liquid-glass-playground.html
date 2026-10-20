@@ -1,0 +1,1418 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LUMEN · 玻璃背景实验室</title>
+<style>
+/* ==========================================================================
+   LUMEN — a background study for liquid glass.
+   Single file, no dependencies. Text stays DOM; glass is drawn by WebGL.
+   ========================================================================== */
+:root{
+  --ink:#eef4ff;
+  --ink-2:#c6d3e6;
+  --muted:#93a5bf;
+  --dim:#687c98;
+  --line:rgba(255,255,255,.13);
+  --line-2:rgba(255,255,255,.22);
+  --panel-solid:#0a101c;
+  --accent:#67e8f9;
+  --accent-2:#a78bfa;
+  --warm:#fbbf24;
+  --good:#34d399;
+  --radius:22px;
+  --blur:18px;
+  --ease:cubic-bezier(.22,.9,.28,1);
+  --spring:cubic-bezier(.2,1.25,.36,1);
+  --sans:"Segoe UI Variable Text","Segoe UI",-apple-system,"PingFang SC","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
+  --display:"Bahnschrift","Segoe UI Variable Display","Segoe UI",var(--sans);
+  --mono:"Cascadia Code","JetBrains Mono",ui-monospace,Consolas,monospace;
+}
+html[data-theme="light"] body{
+  background:
+    radial-gradient(60% 55% at 18% 8%, rgba(255,236,200,.55), transparent 70%),
+    radial-gradient(55% 60% at 82% 26%, rgba(214,196,164,.35), transparent 72%),
+    #efe7d8;
+}
+html[data-theme="light"]{
+  --ink:#2a241d;
+  --ink-2:#3a3026;
+  --muted:#5a4c3d;
+  --dim:#7d6d5a;
+  --line:rgba(42,36,29,.15);
+  --line-2:rgba(42,36,29,.26);
+  --panel-solid:#f7f2e8;
+  --accent:#0e7490;
+  --accent-2:#6d28d9;
+  --warm:#b45309;
+  --good:#047857;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  overflow:hidden;
+  background:
+    radial-gradient(60% 55% at 18% 8%, rgba(45,212,191,.16), transparent 70%),
+    radial-gradient(55% 60% at 82% 26%, rgba(124,58,237,.15), transparent 72%),
+    radial-gradient(75% 55% at 50% 105%, rgba(30,64,175,.28), transparent 70%),
+    #05080f;
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:13px;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+  transition:color .5s var(--ease);
+}
+h1,h2,h3,p{margin:0}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:8px}
+::selection{background:rgba(103,232,249,.28)}
+svg{display:block}
+.mono{font-family:var(--mono)}
+.eyebrow{
+  font-family:var(--mono);
+  font-size:9px;
+  letter-spacing:.22em;
+  text-transform:uppercase;
+  color:var(--dim);
+  white-space:nowrap;
+}
+
+/* ---------------------------------------------------------------- canvas */
+#scene{position:fixed;inset:0;width:100%;height:100%;z-index:0;display:block}
+#grain{
+  position:fixed;inset:0;z-index:1;pointer-events:none;opacity:.28;
+  mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.32'/%3E%3C/svg%3E");
+}
+html[data-theme="light"] #grain{opacity:.14;mix-blend-mode:multiply}
+
+/* ---------------------------------------------------------------- stage */
+.stage{
+  position:relative;z-index:2;
+  height:100vh;
+  display:grid;
+  grid-template-columns:212px minmax(0,1fr) 332px;
+  grid-template-rows:64px minmax(0,1fr) 76px;
+  grid-template-areas:
+    "top top top"
+    "nav hero panel"
+    "nav dock panel";
+  gap:14px;
+  padding:20px;
+}
+
+/* ---------------------------------------------------------------- glass */
+.glass{
+  position:relative;
+  border-radius:var(--radius);
+  border:1px solid var(--line);
+  background:
+    linear-gradient(145deg,rgba(255,255,255,.10),rgba(255,255,255,.018) 52%,rgba(255,255,255,.05));
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.16),
+    inset 0 -1px 0 rgba(0,0,0,.16),
+    0 24px 60px -28px rgba(0,0,0,.8);
+  backdrop-filter:blur(var(--blur)) saturate(138%);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(138%);
+}
+html[data-theme="light"] .glass{
+  background:linear-gradient(145deg,rgba(255,255,255,.72),rgba(255,255,255,.34) 60%,rgba(255,255,255,.56));
+  box-shadow:inset 0 1px 0 #fff,0 22px 56px -30px rgba(70,50,25,.4);
+}
+/* WebGL 模式：面板只留文字与描边，玻璃由 shader 画在 canvas 上 */
+body[data-render="gl"] .glass{
+  background:transparent;
+  border-color:transparent;
+  box-shadow:none;
+  backdrop-filter:none;
+  -webkit-backdrop-filter:none;
+}
+body[data-render="gl"] .glass::after{
+  content:"";
+  position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  border:1px solid rgba(255,255,255,.10);
+}
+html[data-theme="light"] body[data-render="gl"] .glass::after{border-color:rgba(255,255,255,.35)}
+
+/* ---------------------------------------------------------------- topbar */
+.topbar{
+  grid-area:top;
+  display:flex;align-items:center;gap:16px;
+  padding:0 18px;
+}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.mark{
+  width:30px;height:30px;border-radius:9px;flex:none;position:relative;
+  background:linear-gradient(140deg,#7dd3fc,#6366f1 58%,#a855f7);
+  box-shadow:inset 0 1px 2px #fff8,0 6px 18px -6px #38bdf8aa;
+}
+.mark::after{
+  content:"";position:absolute;inset:8px;border-radius:50%;
+  background:radial-gradient(circle at 38% 32%,#fff,rgba(255,255,255,.15) 62%,transparent 70%);
+}
+.brand b{display:block;font-family:var(--display);font-size:14px;letter-spacing:.16em;line-height:1.1}
+.brand span{display:block;font-family:var(--mono);font-size:8px;letter-spacing:.24em;color:var(--dim);margin-top:2px}
+.top-mid{display:flex;align-items:center;gap:10px;margin-left:18px;padding-left:18px;border-left:1px solid var(--line)}
+.top-mid b{font-size:12px;font-weight:500;color:var(--ink-2)}
+.top-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.live{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:9px;color:var(--muted)}
+.live i{width:5px;height:5px;border-radius:50%;background:var(--good);box-shadow:0 0 8px var(--good);animation:pulse 2.2s var(--ease) infinite}
+@keyframes pulse{50%{opacity:.4;transform:scale(.8)}}
+.chip{
+  display:inline-flex;align-items:center;height:24px;padding:0 9px;border-radius:7px;
+  border:1px solid var(--line);font-family:var(--mono);font-size:9px;color:var(--muted);
+  background:rgba(255,255,255,.035);
+}
+html[data-theme="light"] .chip{background:rgba(255,255,255,.4)}
+
+/* ---------------------------------------------------------------- nav */
+.nav{
+  grid-area:nav;
+  padding:18px 13px 14px;
+  display:flex;flex-direction:column;min-height:0;
+}
+.nav .eyebrow{padding:0 8px;margin:18px 0 8px}
+.scene-link{
+  display:flex;align-items:center;gap:10px;width:100%;
+  padding:8px 9px;border-radius:12px;border:1px solid transparent;
+  text-align:left;color:var(--muted);
+  transition:background .25s var(--ease),color .25s,border-color .25s,transform .3s var(--spring);
+}
+.scene-link:hover{background:rgba(255,255,255,.05);color:var(--ink-2)}
+.scene-link.active{
+  color:var(--ink);border-color:var(--line);
+  background:linear-gradient(120deg,rgba(255,255,255,.09),rgba(255,255,255,.03));
+}
+.scene-link:active{transform:scale(.975)}
+html[data-theme="light"] .scene-link:hover{background:rgba(255,255,255,.5)}
+html[data-theme="light"] .scene-link.active{background:rgba(255,255,255,.62)}
+.sw{
+  width:28px;height:28px;border-radius:8px;flex:none;position:relative;overflow:hidden;
+  border:1px solid rgba(255,255,255,.18);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.22);
+}
+.sw::after{content:"";position:absolute;inset:0;background:linear-gradient(135deg,rgba(255,255,255,.22),transparent 55%)}
+.sw-aurora{background:radial-gradient(120% 100% at 20% 0%,#2dd4bf 0%,#1e3a8a 45%,#070b18 100%)}
+.sw-neon{background:radial-gradient(100% 120% at 70% 10%,#f0abfc 0%,#0e7490 45%,#05060f 100%)}
+.sw-paper{background:linear-gradient(145deg,#fdf6e8,#e7d8bf 60%,#cbb99a)}
+.sw-silk{background:linear-gradient(140deg,#0f766e,#4c1d95 55%,#0b1020)}
+.scene-link b{display:block;font-size:11.5px;font-weight:500;line-height:1.3}
+.scene-link span{display:block;font-family:var(--mono);font-size:8px;color:var(--dim);letter-spacing:.04em;margin-top:1px}
+.nav-foot{margin-top:auto;padding:10px 8px 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:7px}
+.nav-foot p{font-size:10px;color:var(--dim);line-height:1.6}
+.nav-foot .row{display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--muted)}
+.nav-foot .row b{color:var(--ink-2);font-weight:500}
+
+/* ---------------------------------------------------------------- hero */
+.hero{
+  grid-area:hero;
+  padding:26px 28px 22px;
+  display:flex;flex-direction:column;min-height:0;
+}
+.hero-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}
+.hero h1{
+  font-family:var(--display);
+  font-size:clamp(30px,3.1vw,44px);
+  line-height:1.06;letter-spacing:-.035em;font-weight:600;margin-top:8px;
+  max-width:13ch;
+}
+.hero h1 em{font-style:normal;color:var(--accent)}
+.hero .lede{
+  max-width:56ch;margin-top:12px;color:var(--muted);font-size:12.5px;line-height:1.85;
+}
+.hero .lede b{color:var(--ink-2);font-weight:500}
+.freq{
+  position:relative;height:112px;margin:18px 0 16px;border-radius:14px;
+  border:1px solid var(--line);overflow:hidden;
+  background:rgba(0,0,0,.28);
+}
+html[data-theme="light"] .freq{background:rgba(255,255,255,.3)}
+.freq svg{position:absolute;inset:0;width:100%;height:100%}
+.freq .tag{
+  position:absolute;bottom:9px;font-family:var(--mono);font-size:8px;letter-spacing:.1em;color:var(--dim);
+}
+.freq .tag.l{left:12px}
+.freq .tag.r{right:12px;text-align:right}
+.freq .tag b{display:block;color:var(--muted);font-weight:500}
+.rules{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;padding:12px 0 0;border-top:1px solid var(--line);margin-bottom:14px}
+.rules > div{display:flex;gap:8px;min-width:0}
+.rules i{font-family:var(--mono);font-size:8px;font-style:normal;color:var(--accent);opacity:.75;padding-top:2px;flex:none}
+.rules b{display:block;font-size:11.5px;font-weight:500;color:var(--ink-2);line-height:1.3}
+.rules span{display:block;font-size:9.5px;color:var(--muted);line-height:1.5;margin-top:1px}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:auto}
+.stat{
+  padding:11px 12px;border-radius:12px;border:1px solid var(--line);
+  background:rgba(255,255,255,.035);
+}
+html[data-theme="light"] .stat{background:rgba(255,255,255,.36)}
+.stat span{display:block;font-family:var(--mono);font-size:8px;letter-spacing:.12em;color:var(--dim);text-transform:uppercase}
+.stat b{display:block;margin-top:3px;font-family:var(--display);font-size:23px;font-weight:500;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.stat b small{font-size:9px;color:var(--dim);font-family:var(--sans);letter-spacing:0;margin-left:2px}
+.stat i{display:block;margin-top:5px;height:2px;border-radius:2px;background:var(--line);overflow:hidden}
+.stat i::after{content:"";display:block;height:100%;width:var(--w,60%);border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .45s var(--ease)}
+.hero-foot{display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
+.pill-tag{
+  display:inline-flex;align-items:center;gap:6px;height:23px;padding:0 9px;border-radius:7px;
+  border:1px solid var(--line);font-family:var(--mono);font-size:8.5px;color:var(--muted);
+}
+.pill-tag b{color:var(--ink-2);font-weight:500}
+
+/* ---------------------------------------------------------------- panel */
+.panel{
+  grid-area:panel;
+  padding:15px 14px 12px;
+  display:flex;flex-direction:column;gap:12px;
+  overflow:auto;overscroll-behavior:contain;
+}
+.panel::-webkit-scrollbar{width:5px}
+.panel::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:4px}
+.group{display:flex;flex-direction:column;gap:8px}
+.group-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.group-head > span:first-child{font-size:10px;font-weight:600;letter-spacing:.06em;color:var(--ink-2)}
+.group-head .hint{font-family:var(--mono);font-size:8px;color:var(--dim);letter-spacing:.06em}
+.scene-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.scene-card{
+  display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:10px;
+  border:1px solid var(--line);text-align:left;color:var(--muted);
+  transition:border-color .25s,background .25s,transform .25s var(--spring);
+}
+.scene-card:hover{background:rgba(255,255,255,.05);color:var(--ink-2)}
+.scene-card.active{border-color:rgba(103,232,249,.42);background:rgba(103,232,249,.09);color:var(--ink)}
+.scene-card .sw{width:20px;height:20px;border-radius:6px}
+.scene-card b{display:block;font-size:10px;font-weight:500;line-height:1.3;white-space:nowrap}
+.scene-card i{display:block;font-style:normal;font-family:var(--mono);font-size:7.5px;color:var(--dim);white-space:nowrap}
+html[data-theme="light"] .scene-card:hover{background:rgba(255,255,255,.55)}
+html[data-theme="light"] .scene-card.active{background:rgba(255,255,255,.75)}
+.seg{
+  display:flex;padding:3px;border-radius:10px;border:1px solid var(--line);
+  background:rgba(0,0,0,.22);
+}
+html[data-theme="light"] .seg{background:rgba(255,255,255,.3)}
+.seg button{
+  flex:1;height:25px;border-radius:7px;font-size:10px;color:var(--muted);
+  transition:background .25s,color .25s,box-shadow .25s;
+}
+.seg button.active{
+  color:var(--ink);background:rgba(255,255,255,.11);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 2px 8px -3px rgba(0,0,0,.5);
+}
+html[data-theme="light"] .seg button.active{background:rgba(255,255,255,.8)}
+.seg button:hover{color:var(--ink-2)}
+.slider{display:flex;flex-direction:column;gap:3px}
+.slider .lab{display:flex;justify-content:space-between;align-items:baseline;font-size:9.5px;color:var(--muted)}
+.slider .lab output{font-family:var(--mono);font-size:8.5px;color:var(--ink-2)}
+input[type="range"]{
+  -webkit-appearance:none;appearance:none;width:100%;height:3px;border-radius:2px;
+  background:linear-gradient(90deg,var(--accent),var(--accent-2));outline:0;
+  opacity:.85;cursor:pointer;
+}
+input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:12px;height:12px;border-radius:50%;
+  background:#fff;border:2px solid rgba(10,20,35,.35);
+  box-shadow:0 2px 8px rgba(0,0,0,.4);transition:transform .2s var(--spring);
+}
+input[type="range"]::-webkit-slider-thumb:hover{transform:scale(1.25)}
+input[type="range"]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:#fff;border:2px solid rgba(10,20,35,.35)}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:9.5px;color:var(--muted);cursor:pointer;user-select:none}
+.toggle-row input{position:absolute;opacity:0;width:0;height:0}
+.toggle-row i{width:30px;height:17px;border-radius:9px;background:rgba(255,255,255,.10);border:1px solid var(--line);position:relative;flex:none;transition:background .25s,border-color .25s}
+.toggle-row i::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:var(--muted);transition:transform .3s var(--spring),background .25s}
+.toggle-row input:checked + i{background:rgba(103,232,249,.22);border-color:rgba(103,232,249,.48)}
+.toggle-row input:checked + i::after{transform:translateX(13px);background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.toggle-row input:focus-visible + i{outline:2px solid var(--accent);outline-offset:2px}
+.diag{border-top:1px solid var(--line);padding-top:10px}
+.meter-row{display:grid;grid-template-columns:46px minmax(0,1fr) 22px;align-items:center;gap:8px;font-size:9px;color:var(--muted)}
+.meter{height:3px;border-radius:2px;background:var(--line);overflow:hidden}
+.meter i{display:block;height:100%;width:50%;border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .5s var(--ease)}
+.meter-row b{font-family:var(--mono);font-size:8.5px;color:var(--ink-2);text-align:right;font-weight:500}
+.diag p{margin-top:7px;font-size:9.5px;line-height:1.65;color:var(--dim)}
+.panel-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:auto;padding-top:8px;border-top:1px solid var(--line);font-family:var(--mono);font-size:8px;color:var(--dim)}
+.panel-foot b{color:var(--ink-2);font-weight:500}
+
+/* ---------------------------------------------------------------- dock */
+.dock{
+  grid-area:dock;
+  display:flex;align-items:center;justify-content:center;gap:10px;
+  min-height:0;
+}
+.dock-btn{
+  width:48px;height:48px;border-radius:50%;
+  display:grid;place-items:center;flex:none;
+  transition:transform .3s var(--spring),border-color .25s;
+}
+.dock-btn:hover{transform:translateY(-2px)}
+.dock-btn:active{transform:scale(.94)}
+.dock-btn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;color:var(--muted)}
+.dock-pill{
+  height:48px;padding:0 20px 0 16px;border-radius:24px;
+  display:flex;align-items:center;gap:9px;
+  font-size:11px;color:var(--ink-2);cursor:grab;user-select:none;
+  transition:transform .3s var(--spring),border-color .25s;
+  white-space:nowrap;
+}
+.dock-pill:hover{transform:translateY(-2px)}
+.dock-pill.dragging{cursor:grabbing;border-color:rgba(103,232,249,.55);transform:scale(1.03)}
+.dock-pill kbd{font-family:var(--mono);font-size:8px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:1px 4px}
+.pill-orb{
+  width:14px;height:14px;border-radius:50%;flex:none;
+  background:radial-gradient(circle at 36% 32%,#fff,#67e8f9 40%,rgba(103,232,249,.12) 72%);
+  box-shadow:0 0 12px #67e8f9aa;
+}
+#light-hint{
+  position:fixed;z-index:4;width:150px;height:150px;border-radius:50%;
+  transform:translate(-50%,-50%);pointer-events:none;opacity:0;
+  background:radial-gradient(circle,rgba(255,255,255,.18),rgba(103,232,249,.12) 36%,transparent 68%);
+  filter:blur(4px);transition:opacity .2s;
+}
+body.is-dragging #light-hint{opacity:1}
+#notice{
+  position:fixed;left:50%;bottom:24px;z-index:9;transform:translate(-50%,12px);
+  padding:9px 14px;border-radius:10px;border:1px solid var(--line-2);
+  background:rgba(8,14,24,.9);color:var(--ink-2);font-size:11px;
+  opacity:0;pointer-events:none;transition:opacity .25s,transform .35s var(--ease);
+}
+#notice.show{opacity:1;transform:translate(-50%,0)}
+
+/* ---------------------------------------------------------------- responsive */
+@media (max-width:1240px){
+  .stage{grid-template-columns:186px minmax(0,1fr) 310px;gap:12px;padding:16px}
+  .hero{padding:22px 22px 18px}
+  .hero h1{font-size:clamp(28px,3vw,38px)}
+}
+@media (max-width:1040px){
+  .stage{
+    grid-template-columns:minmax(0,1fr) 300px;
+    grid-template-rows:58px minmax(0,1fr) 72px;
+    grid-template-areas:"top top" "hero panel" "dock panel";
+  }
+  .nav{display:none}
+  .hero h1{max-width:16ch}
+}
+@media (max-width:820px){
+  body{overflow:auto}
+  .stage{
+    height:auto;min-height:100vh;
+    grid-template-columns:minmax(0,1fr);
+    grid-template-rows:56px auto 72px auto;
+    grid-template-areas:"top" "hero" "dock" "panel";
+    padding:12px;gap:10px;
+  }
+  .hero{padding:18px 16px}
+  .hero h1{font-size:28px;max-width:none}
+  .hero .lede{font-size:12px}
+  .stats{grid-template-columns:repeat(3,1fr);gap:6px}
+  .stat b{font-size:19px}
+  .freq{height:88px}
+  .rules{display:none}
+  .panel{overflow:visible}
+  .panel .scene-grid{grid-template-columns:1fr 1fr}
+  .dock{position:static;padding:0}
+  .top-mid{display:none}
+  .brand span{display:none}
+  .hero-head .eyebrow{display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}
+}
+</style>
+</head>
+<body data-render="gl">
+
+<canvas id="scene" aria-hidden="true"></canvas>
+<div id="grain" aria-hidden="true"></div>
+<div id="light-hint" aria-hidden="true"></div>
+
+<div class="stage">
+  <header class="topbar glass" data-glass data-edge="14" data-tint="0.36" data-radius="22">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <div><b>LUMEN</b><span>GLASS LAB</span></div>
+    </div>
+    <div class="top-mid">
+      <span class="eyebrow">BACKGROUND STUDY</span>
+      <b id="top-scene">极光深渊</b>
+    </div>
+    <div class="top-right">
+      <span class="live"><i></i><span id="top-fps">— FPS</span></span>
+      <span class="chip" id="top-mode">WEBGL 2</span>
+    </div>
+  </header>
+
+  <aside class="nav glass" data-glass data-edge="18" data-tint="0.40" data-radius="22">
+    <div class="eyebrow">SCENES</div>
+    <button class="scene-link active" data-scene="aurora">
+      <i class="sw sw-aurora"></i><div><b>极光深渊</b><span>低频 · 星点</span></div>
+    </button>
+    <button class="scene-link" data-scene="neon">
+      <i class="sw sw-neon"></i><div><b>霓虹夜雨</b><span>高频 · 强对比</span></div>
+    </button>
+    <button class="scene-link" data-scene="paper">
+      <i class="sw sw-paper"></i><div><b>暖纸微光</b><span>浅色 · 低对比</span></div>
+    </button>
+    <button class="scene-link" data-scene="silk">
+      <i class="sw sw-silk"></i><div><b>流体丝绸</b><span>中频 · 折皱</span></div>
+    </button>
+    <div class="nav-foot">
+      <p>背景不是装饰。它决定玻璃有没有东西可折射、文字还能不能读。</p>
+      <div class="row"><span>光源</span><b id="nav-angle">135°</b></div>
+      <div class="row"><span>渲染</span><b id="nav-render">WEBGL</b></div>
+    </div>
+  </aside>
+
+  <main class="hero glass" data-glass data-edge="20" data-tint="0.31" data-radius="22">
+    <div class="hero-head">
+      <div>
+        <div class="eyebrow">MATERIAL STUDY / 01</div>
+        <h1>背景决定<br>玻璃的<em>上限</em></h1>
+      </div>
+      <span class="chip" id="hero-chip">AURORA</span>
+    </div>
+    <p class="lede">
+      同一块玻璃，放在不同背景上会变成完全不同的材料。它需要<b>暗底</b>托住亮边、
+      <b>几道细光</b>让边缘有东西可扭，还需要一块敢留白的地方放文字。
+    </p>
+
+    <div class="freq" aria-hidden="true">
+      <svg viewBox="0 0 900 112" preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="fg" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#67e8f9" stop-opacity=".15"/>
+            <stop offset=".5" stop-color="#67e8f9" stop-opacity=".9"/>
+            <stop offset="1" stop-color="#a78bfa" stop-opacity=".8"/>
+          </linearGradient>
+          <filter id="soft"><feGaussianBlur stdDeviation="10"/></filter>
+        </defs>
+        <path d="M0 78 C 90 78 150 44 240 52 S 390 96 480 70 S 620 22 720 36 S 840 74 900 58"
+              fill="none" stroke="rgba(103,232,249,.32)" stroke-width="26" filter="url(#soft)"/>
+        <path d="M0 78 C 90 78 150 44 240 52 S 390 96 480 70 S 620 22 720 36 S 840 74 900 58"
+              fill="none" stroke="url(#fg)" stroke-width="1.4"/>
+        <path d="M0 30 C 120 30 180 18 260 26 S 410 46 500 32 S 640 8 740 18 S 850 30 900 24"
+              fill="none" stroke="rgba(167,139,250,.5)" stroke-width="1" stroke-dasharray="2 5"/>
+      </svg>
+      <span class="tag l"><b>低频主体</b>文字安全区</span>
+      <span class="tag r"><b>高频细节</b>折射来源</span>
+    </div>
+
+    <div class="rules" aria-label="背景三原则">
+      <div><i>01</i><div><b>暗底托边</b><span>没有暗背景，亮边立不住</span></div></div>
+      <div><i>02</i><div><b>低频放字</b><span>正文后面避开高频细节</span></div></div>
+      <div><i>03</i><div><b>高频放边</b><span>折射需要东西可扭</span></div></div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><span>可读性</span><b id="stat-read">95<small>/100</small></b><i style="--w:95%"></i></div>
+      <div class="stat"><span>折射可见度</span><b id="stat-refract">55<small>/100</small></b><i style="--w:55%"></i></div>
+      <div class="stat"><span>光源角度</span><b id="stat-angle">135<small>°</small></b><i style="--w:38%"></i></div>
+    </div>
+
+    <div class="hero-foot">
+      <span class="pill-tag">边缘 <b id="tag-edge">20px</b></span>
+      <span class="pill-tag">模糊 <b id="tag-blur">18px</b></span>
+      <span class="pill-tag">高光 <b id="tag-spec">135°</b></span>
+      <span class="pill-tag" style="margin-left:auto">拖动下方光源 →</span>
+    </div>
+  </main>
+
+  <section class="panel glass" data-glass data-edge="14" data-tint="0.46" data-radius="22">
+    <div class="group">
+      <div class="group-head"><span>背景</span><span class="hint" id="scene-hint">LOW FREQ + STARS</span></div>
+      <div class="scene-grid">
+        <button class="scene-card active" data-scene="aurora"><i class="sw sw-aurora"></i><div><b>极光深渊</b><i>低频 · 星点</i></div></button>
+        <button class="scene-card" data-scene="neon"><i class="sw sw-neon"></i><div><b>霓虹夜雨</b><i>高频 · 强对比</i></div></button>
+        <button class="scene-card" data-scene="paper"><i class="sw sw-paper"></i><div><b>暖纸微光</b><i>浅色 · 低对比</i></div></button>
+        <button class="scene-card" data-scene="silk"><i class="sw sw-silk"></i><div><b>流体丝绸</b><i>中频 · 折皱</i></div></button>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="group-head"><span>材质</span><span class="hint" id="render-hint">REFRACTION ON</span></div>
+      <div class="seg" id="render-seg">
+        <button data-render="css">CSS 玻璃</button>
+        <button data-render="gl" class="active">液态折射</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="group-head"><span>折射风格</span><span class="hint" id="style-hint">iOS · 宽域平齐</span></div>
+      <div class="seg" id="style-seg">
+        <button data-style="flat" class="active">平齐</button>
+        <button data-style="stretch">外扩</button>
+      </div>
+    </div>
+
+    <div class="group" style="gap:9px">
+      <div class="slider">
+        <div class="lab"><span>模糊</span><output id="v-blur">18px</output></div>
+        <input id="s-blur" type="range" aria-label="模糊" min="0" max="34" value="18">
+      </div>
+      <div class="slider">
+        <div class="lab"><span>折射强度</span><output id="v-strength">0.85×</output></div>
+        <input id="s-strength" type="range" aria-label="折射强度" min="0" max="150" value="85">
+      </div>
+      <div class="slider">
+        <div class="lab"><span>边缘厚度</span><output id="v-edge">16px</output></div>
+        <input id="s-edge" type="range" aria-label="边缘厚度" min="4" max="34" value="16">
+      </div>
+      <div class="slider">
+        <div class="lab"><span>高光角度</span><output id="v-angle">135°</output></div>
+        <input id="s-angle" type="range" aria-label="高光角度" min="0" max="360" value="135">
+      </div>
+      <div class="slider">
+        <div class="lab"><span>泛光预取</span><output id="v-bloom">0.35</output></div>
+        <input id="s-bloom" type="range" aria-label="泛光预取" min="0" max="100" value="35">
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="group-head"><span>校准</span><span class="hint">SEE THE BEND</span></div>
+      <label class="toggle-row">
+        <span>叠加校准靶</span>
+        <input type="checkbox" id="grid-toggle">
+        <i></i>
+      </label>
+    </div>
+
+    <div class="group diag">
+      <div class="group-head"><span>诊断</span><span class="hint" id="diag-tag">AURORA</span></div>
+      <div class="meter-row"><span>可读性</span><div class="meter"><i id="m-read"></i></div><b id="v-read">95</b></div>
+      <div class="meter-row"><span>折射可见度</span><div class="meter"><i id="m-refract"></i></div><b id="v-refract">55</b></div>
+      <p id="diag-note">低频主体托住文字，星点和光带提供可供折射的高频细节。大面积玻璃最稳的一张底。</p>
+    </div>
+
+    <div class="panel-foot"><span>FPS <b id="fps">—</b></span><span id="gpu-label">GPU</span></div>
+  </section>
+
+  <div class="dock">
+    <button class="dock-btn glass" data-glass data-edge="7" data-tint="0.32" data-radius="24" id="pause-btn" aria-label="暂停环境流动" title="暂停环境流动">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5v14M15 5v14"/></svg>
+    </button>
+    <div class="dock-pill glass" data-glass data-edge="11" data-tint="0.34" data-radius="24" id="light-pill" role="slider" aria-label="拖动光源" aria-valuemin="0" aria-valuemax="360" aria-valuenow="135" tabindex="0">
+      <span class="pill-orb" aria-hidden="true"></span>
+      拖动光源
+      <kbd>DRAG</kbd>
+    </div>
+    <button class="dock-btn glass" data-glass data-edge="7" data-tint="0.32" data-radius="24" id="reset-btn" aria-label="恢复默认" title="恢复默认">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.4-5.7M20 4.5V9h-4.5"/></svg>
+    </button>
+  </div>
+</div>
+
+<div id="notice" role="status"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  const canvas = $("#scene");
+  const gl = canvas.getContext("webgl2", {
+    alpha: false, antialias: false, depth: false,
+    powerPreference: "high-performance", preserveDrawingBuffer: false,
+  });
+
+  const SCENES = {
+    aurora: {
+      name: "极光深渊", hint: "LOW FREQ + STARS", tag: "AURORA", dark: true,
+      read: 95, refract: 55,
+      note: "低频主体托住文字，星点和光带提供可供折射的高频细节。大面积玻璃最稳的一张底。",
+    },
+    neon: {
+      name: "霓虹夜雨", hint: "HIGH FREQ / NEON", tag: "NEON", dark: true,
+      read: 68, refract: 96,
+      note: "细亮线让边缘折射最明显，但文字后面必须压暗；适合小面积、强个性的玻璃。",
+    },
+    paper: {
+      name: "暖纸微光", hint: "LIGHT / LOW CONTRAST", tag: "PAPER", dark: false,
+      read: 74, refract: 34,
+      note: "浅色低对比最考验玻璃：必须加乳白底，否则文字发灰、边缘直接消失。",
+    },
+    silk: {
+      name: "流体丝绸", hint: "MID FREQ / FOLDS", tag: "SILK", dark: true,
+      read: 80, refract: 90,
+      note: "中频折皱加锐利高光，折射最漂亮；玻璃后面要留暗区，否则文字会被褶皱抢走。",
+    },
+  };
+
+  const DEFAULTS = {
+    scene: "aurora", render: "gl", style: "flat",
+    blur: 18, strength: 0.85, edge: 16, angle: 135, bloom: 0.35, grid: false,
+    light: { x: 0.22, y: 0.16 },
+  };
+
+  const state = {
+    ...DEFAULTS,
+    light: { ...DEFAULTS.light },
+    paused: false,
+  };
+
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+  if (reduced.matches) state.paused = true;
+
+  /* ------------------------------------------------------------------ shaders */
+
+  const VERT = `#version 300 es
+in vec2 a;
+out vec2 uv;
+void main() {
+  uv = a * 0.5 + 0.5;
+  gl_Position = vec4(a, 0.0, 1.0);
+}`;
+
+  const SCENE_FS = `#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 color;
+uniform vec2 res;
+uniform float time;
+uniform int mode;
+uniform vec2 light;
+uniform float dark;
+uniform float pattern;
+
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float noise2(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float band(float y, float c, float w) {
+  return exp(-pow((y - c) / w, 2.0));
+}
+float thin(float x, float c, float w) {
+  return exp(-abs(x - c) / w);
+}
+void main() {
+  float asp = res.x / max(1.0, res.y);
+  vec3 col = vec3(0.0);
+
+  if (mode == 0) {
+    col = mix(vec3(0.010, 0.022, 0.050), vec3(0.018, 0.055, 0.085), uv.y);
+    float y1 = 0.62 + 0.07 * sin(uv.x * 2.10 + time * 0.055) + 0.03 * sin(uv.x * 5.10 - time * 0.031);
+    float y2 = 0.80 + 0.06 * sin(uv.x * 1.55 - time * 0.042 + 1.7);
+    float y3 = 0.92 + 0.03 * sin(uv.x * 2.80 + time * 0.030 + 3.1);
+    col += vec3(0.05, 0.52, 0.48) * band(uv.y, y1, 0.095) * 0.52;
+    col += vec3(0.30, 0.20, 0.78) * band(uv.y, y2, 0.115) * 0.36;
+    col += vec3(0.95, 0.42, 0.22) * band(uv.y, y3, 0.040) * 0.11;
+    col += vec3(0.55, 1.00, 0.90) * exp(-abs(uv.y - y1) * 120.0) * 0.22;
+    col += vec3(0.65, 0.82, 1.00) * exp(-abs(uv.y - y2) * 170.0) * 0.09;
+    // 上半区压暗，给正文留一块干净的安全区
+    col *= mix(0.66, 1.0, smoothstep(0.0, 0.42, uv.y));
+    vec2 g = uv * vec2(asp, 1.0) * 210.0;
+    float h = hash21(floor(g));
+    float star = smoothstep(0.9972, 1.0, h) * (0.55 + 0.45 * sin(time * 1.7 + h * 40.0));
+    col += vec3(0.70, 0.88, 1.00) * star * 0.85;
+    float d = length((uv - light) * vec2(asp, 1.0));
+    col += vec3(0.35, 0.72, 1.00) * exp(-d * 6.5) * 0.11;
+    col += vec3(0.90, 1.00, 1.00) * exp(-d * 42.0) * 0.38;
+  } else if (mode == 1) {
+    col = vec3(0.010, 0.015, 0.036);
+    for (int i = 0; i < 8; i++) {
+      float fi = float(i);
+      float x = 0.06 + 0.88 * hash21(vec2(fi * 3.1, 7.2));
+      float w = 0.0010 + 0.0016 * hash21(vec2(fi, 2.2));
+      float l = thin(uv.x, x, w);
+      float flick = 0.55 + 0.45 * sin(time * (0.8 + fi * 0.11) + fi * 2.4);
+      vec3 cc = mix(vec3(0.10, 0.85, 1.00), vec3(1.00, 0.18, 0.65), hash21(vec2(fi, 9.0)));
+      col += cc * l * 0.50 * flick;
+    }
+    for (int i = 0; i < 12; i++) {
+      float fi = float(i);
+      vec2 c = vec2(hash21(vec2(fi, 1.3)), hash21(vec2(fi, 5.7)));
+      c.y = fract(c.y + time * 0.008 * (0.5 + hash21(vec2(fi, 6.6))));
+      float r = 0.0035 + 0.010 * hash21(vec2(fi, 8.8));
+      float d = length((uv - c) * vec2(asp, 1.0));
+      col += mix(vec3(0.20, 0.80, 1.00), vec3(1.00, 0.30, 0.80), hash21(vec2(fi, 4.4))) * exp(-d * d / (r * r)) * 0.16;
+    }
+    col += vec3(0.50, 0.80, 1.00) * exp(-abs(uv.y - 0.10) * 80.0) * 0.12;
+    float d2 = length((uv - light) * vec2(asp, 1.0));
+    col += vec3(0.40, 0.80, 1.00) * exp(-d2 * 8.0) * 0.10;
+  } else if (mode == 2) {
+    col = mix(vec3(0.972, 0.950, 0.905), vec3(0.905, 0.878, 0.815), uv.y);
+    float n = noise2(uv * vec2(340.0, 240.0));
+    col += (n - 0.5) * 0.030;
+    float c1 = 0.27 + 0.065 * sin(uv.x * 2.8 + 0.8);
+    float c2 = 0.63 + 0.050 * sin(uv.x * 3.7 - 1.1);
+    col = mix(col, vec3(0.42, 0.32, 0.22), band(uv.y, c1, 0.0045) * 0.22);
+    col = mix(col, vec3(0.50, 0.40, 0.30), band(uv.y, c2, 0.0035) * 0.14);
+    float d = length((uv - vec2(0.18, 0.12)) * vec2(asp, 1.0));
+    col += vec3(1.00, 0.86, 0.62) * exp(-d * 4.2) * 0.10;
+  } else {
+    col = mix(vec3(0.014, 0.055, 0.080), vec3(0.070, 0.018, 0.100), uv.x);
+    float f = uv.y + 0.10 * sin(uv.x * 3.4 + time * 0.030) + 0.04 * sin(uv.x * 7.0 - time * 0.020);
+    float fold = abs(sin(f * 16.0));
+    col += vec3(0.06, 0.60, 0.56) * pow(fold, 10.0) * 0.38;
+    col += vec3(0.52, 0.26, 0.84) * pow(abs(sin(f * 9.0 + 1.3)), 12.0) * 0.26;
+    col += vec3(0.90, 1.00, 0.95) * pow(1.0 - fold, 40.0) * 0.14;
+    float d = length((uv - light) * vec2(asp, 1.0));
+    col += vec3(0.38, 0.88, 0.88) * exp(-d * 6.0) * 0.14;
+    float safe = smoothstep(0.60, 0.10, length((uv - vec2(0.34, 0.30)) * vec2(asp * 0.78, 1.0)));
+    col *= mix(1.0, 0.42, safe * 0.66);
+  }
+
+  // 校准靶：同心圆 + 辐条。规则网格会被“整格位移”骗过去，环和辐条不会。
+  if (pattern > 0.5) {
+    vec2 d = (uv - vec2(0.5)) * vec2(asp, 1.0);
+    float rr = length(d);
+    float ring = smoothstep(0.468, 0.497, abs(fract(rr * 24.0) - 0.5));
+    float aa = atan(d.y, d.x) / 6.2831853 + 0.5;
+    float spoke = smoothstep(0.472, 0.498, abs(fract(aa * 64.0) - 0.5));
+    float target = max(ring, spoke * 0.62);
+    vec3 gc = dark > 0.5 ? vec3(0.50, 0.86, 1.00) : vec3(0.22, 0.18, 0.13);
+    col = mix(col, gc, target * 0.42);
+  }
+
+  float vig = length((uv - 0.5) * vec2(0.92, 0.78));
+  col *= 1.0 - vig * 0.20;
+  float grain = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+  col += grain * 0.0032;
+  color = vec4(col, 1.0);
+}`;
+
+  const GLASS_FS = `#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 color;
+uniform sampler2D scene;
+uniform vec2 res;
+uniform vec4 rects[12];
+uniform float radii[12];
+uniform float edges[12];
+uniform float tints[12];
+uniform int count;
+uniform float dark;
+uniform float blur;
+uniform float strength;
+uniform float specAngle;
+uniform float bloom;
+uniform float styleMode;
+
+float sdBox(vec2 p, vec2 h, float r) {
+  vec2 q = abs(p) - h + r;
+  return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+
+void main() {
+  vec2 u0 = vec2(uv.x, 1.0 - uv.y);
+  vec2 px = u0 * res;
+  vec3 col = texture(scene, u0).rgb;
+  float ang = radians(specAngle);
+  vec2 L = vec2(cos(ang), -sin(ang));
+
+  for (int i = 0; i < 12; i++) {
+    if (i >= count) break;
+    vec4 box = rects[i];
+    vec2 h = box.zw * 0.5;
+    vec2 c = box.xy + h;
+    vec2 local = px - c;
+    float r = min(radii[i], min(h.x, h.y));
+    float d = sdBox(local, h, r);
+    if (d > 46.0) continue;
+
+    if (d > 0.0) {
+      col *= 1.0 - exp(-d / 14.0) * mix(0.14, 0.16, dark);
+      col += vec3(0.55, 0.90, 1.00) * exp(-d * 3.0) * 0.045;
+      continue;
+    }
+
+    float edge = max(2.0, edges[i] * mix(1.0, 0.62, styleMode));
+    float t = clamp(-d / edge, 0.0, 1.0);
+    float curve = sqrt(max(0.0, 1.0 - pow(1.0 - t, 2.0)));
+    vec2 q = abs(local) - h + r;
+    vec2 normal = (q.x > 0.0 && q.y > 0.0)
+      ? normalize(max(q, vec2(0.0001))) * sign(local)
+      : (q.x > q.y ? vec2(sign(local.x), 0.0) : vec2(0.0, sign(local.y)));
+
+    float e = pow(t, 1.7);
+    vec2 lens = normal * (1.0 - curve) * edge * 1.20 * strength;
+    vec2 bulge = local / max(h, vec2(1.0)) * 0.85 * strength;
+    vec2 off = lens + bulge;
+    off.x *= mix(1.0, 1.55, styleMode);
+    off.y *= mix(1.0, 0.72, styleMode);
+
+    float spread = max(0.5, blur * 0.9);
+    vec2 s = vec2(spread) / res;
+    vec2 ouv = vec2(off.x / res.x, -off.y / res.y);
+
+    vec3 glass = texture(scene, u0 + ouv).rgb * 0.42;
+    glass += texture(scene, u0 + ouv + vec2(s.x, s.y)).rgb * 0.145;
+    glass += texture(scene, u0 + ouv + vec2(-s.x, s.y)).rgb * 0.145;
+    glass += texture(scene, u0 + ouv + vec2(s.x, -s.y)).rgb * 0.145;
+    glass += texture(scene, u0 + ouv + vec2(-s.x, -s.y)).rgb * 0.145;
+
+    vec3 tint = mix(vec3(0.040, 0.070, 0.115), vec3(0.948, 0.928, 0.880), 1.0 - dark);
+    float ta = dark > 0.5 ? tints[i] : min(0.90, tints[i] + 0.40);
+    glass = mix(glass, tint, ta);
+
+    // 表面不是纯色：上沿微亮、下沿略暗，给平面一点“厚度”
+    float gy = clamp(local.y / max(h.y, 1.0), -1.0, 1.0);
+    float sheen = 0.5 - gy * 0.5;
+    glass += mix(vec3(0.055, 0.070, 0.085), vec3(0.090, 0.095, 0.100), 1.0 - dark) * sheen * 0.95;
+    // 一道斜向柔光：让大面积暗玻璃也有“面”，不是纯色滤镜
+    float streak = exp(-abs((local.x / max(h.x, 1.0)) * 0.55 + (local.y / max(h.y, 1.0)) * 0.83 - 0.28) * 3.6);
+    glass += mix(vec3(0.045, 0.058, 0.072), vec3(0.078, 0.084, 0.090), 1.0 - dark) * streak * 0.55;
+    glass *= 1.0 - max(0.0, gy) * 0.055;
+
+    vec2 bp = u0 + vec2(normal.x, -normal.y) * (edge + 28.0) / res;
+    glass += texture(scene, bp).rgb * bloom * e * 0.30;
+
+    float spec = pow(max(0.0, dot(normal, L)), 4.0);
+    float rim = exp(-abs(d + 1.2) * 1.9);
+    float border = exp(-abs(d + 0.9) * 8.0);
+    vec3 edgeCol = mix(vec3(0.30, 0.24, 0.16), vec3(0.55, 0.82, 1.00), dark);
+    glass += vec3(1.0, 0.985, 0.960) * (rim * (0.12 + spec * 0.70) + spec * e * 0.10);
+    glass += edgeCol * border * (0.10 + spec * 0.12);
+    glass += vec3(0.35, 0.75, 1.00) * pow(t, 3.0) * 0.10 * (1.0 - dark * 0.4);
+    glass *= 1.0 - e * 0.045;
+
+    col = mix(col, glass, smoothstep(-1.2, 0.0, d));
+  }
+
+  color = vec4(col, 1.0);
+}`;
+
+  /* ------------------------------------------------------------------ gl setup */
+
+  let sceneProg = null;
+  let glassProg = null;
+  let vao = null;
+  let sceneTex = null;
+  let fbo = null;
+  let ok = false;
+
+  const rectData = new Float32Array(12 * 4);
+  const radiusData = new Float32Array(12);
+  const edgeData = new Float32Array(12);
+  const tintData = new Float32Array(12);
+  let rectCount = 0;
+  let layoutDirty = true;
+
+  let raf = 0;
+  let running = !state.paused;
+  let last = 0;
+  let elapsed = 0;
+  let fpsFrames = 0;
+  let fpsAt = 0;
+
+  const compile = (type, src) => {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      gl.deleteShader(sh);
+      throw new Error(log || "shader compile failed");
+    }
+    return sh;
+  };
+
+  const buildProgram = (frag) => {
+    const p = gl.createProgram();
+    const v = compile(gl.VERTEX_SHADER, VERT);
+    const f = compile(gl.FRAGMENT_SHADER, frag);
+    gl.attachShader(p, v);
+    gl.attachShader(p, f);
+    gl.linkProgram(p);
+    gl.deleteShader(v);
+    gl.deleteShader(f);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(p) || "program link failed");
+    }
+    const u = {};
+    const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++) {
+      const info = gl.getActiveUniform(p, i);
+      u[info.name.replace("[0]", "")] = gl.getUniformLocation(p, info.name);
+    }
+    return { p, u };
+  };
+
+  const resize = () => {
+    if (!ok) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const w = Math.max(1, Math.round(window.innerWidth * dpr));
+    const h = Math.max(1, Math.round(window.innerHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneTex, 0);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) throw new Error("framebuffer incomplete");
+    }
+    layoutDirty = true;
+    requestDraw();
+  };
+
+  const initGL = () => {
+    sceneProg = buildProgram(SCENE_FS);
+    glassProg = buildProgram(GLASS_FS);
+    vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    for (const prog of [sceneProg, glassProg]) {
+      const loc = gl.getAttribLocation(prog.p, "a");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    }
+    sceneTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    fbo = gl.createFramebuffer();
+    ok = true;
+    resize();
+  };
+
+  /* ------------------------------------------------------------------ layout */
+
+  const collect = () => {
+    rectCount = 0;
+    const scale = state.edge / 16;
+    for (const el of $$("[data-glass]")) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      if (r.bottom < -2 || r.top > window.innerHeight + 2) continue;
+      if (rectCount >= 12) break;
+      rectData[rectCount * 4 + 0] = r.left;
+      rectData[rectCount * 4 + 1] = r.top;
+      rectData[rectCount * 4 + 2] = r.width;
+      rectData[rectCount * 4 + 3] = r.height;
+
+      const cs = getComputedStyle(el);
+      const raw = el.dataset.radius || cs.borderRadius || "0";
+      let rad = parseFloat(raw) || 0;
+      if (String(raw).includes("%")) rad = Math.min(r.width, r.height) * (parseFloat(raw) / 100);
+      radiusData[rectCount] = Math.min(rad, Math.min(r.width, r.height) / 2);
+      edgeData[rectCount] = (parseFloat(el.dataset.edge) || 16) * scale;
+      tintData[rectCount] = parseFloat(el.dataset.tint) || 0.2;
+      rectCount++;
+    }
+    layoutDirty = false;
+  };
+
+  /* ------------------------------------------------------------------ render */
+
+  const draw = (now) => {
+    if (!ok) return;
+    const dt = last ? Math.min(now - last, 50) : 16;
+    last = now;
+    if (running) elapsed += dt / 1000;
+
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    const scene = SCENES[state.scene];
+    const dark = scene.dark ? 1 : 0;
+
+    gl.bindVertexArray(vao);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+    gl.clearColor(0, 0, 0, 1);
+
+    // scene pass
+    if (state.render === "gl") {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(sceneProg.p);
+    gl.uniform2f(sceneProg.u.res, cssW, cssH);
+    gl.uniform1f(sceneProg.u.time, elapsed);
+    gl.uniform1i(sceneProg.u.mode, ["aurora", "neon", "paper", "silk"].indexOf(state.scene));
+    gl.uniform2f(sceneProg.u.light, state.light.x, state.light.y);
+    gl.uniform1f(sceneProg.u.dark, dark);
+    gl.uniform1f(sceneProg.u.pattern, state.grid ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    if (state.render === "gl") {
+      if (layoutDirty) collect();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.useProgram(glassProg.p);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+      gl.uniform1i(glassProg.u.scene, 0);
+      gl.uniform2f(glassProg.u.res, cssW, cssH);
+      gl.uniform4fv(glassProg.u.rects, rectData);
+      gl.uniform1fv(glassProg.u.radii, radiusData);
+      gl.uniform1fv(glassProg.u.edges, edgeData);
+      gl.uniform1fv(glassProg.u.tints, tintData);
+      gl.uniform1i(glassProg.u.count, rectCount);
+      gl.uniform1f(glassProg.u.dark, dark);
+      gl.uniform1f(glassProg.u.blur, state.blur);
+      gl.uniform1f(glassProg.u.strength, state.strength);
+      gl.uniform1f(glassProg.u.specAngle, state.angle);
+      gl.uniform1f(glassProg.u.bloom, state.bloom);
+      gl.uniform1f(glassProg.u.styleMode, state.style === "stretch" ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    fpsFrames++;
+    if (now - fpsAt > 480) {
+      const fps = Math.round((fpsFrames * 1000) / Math.max(1, now - fpsAt));
+      $("#fps").textContent = String(fps);
+      $("#top-fps").textContent = `${fps} FPS`;
+      fpsFrames = 0;
+      fpsAt = now;
+    }
+  };
+
+  const loop = (now) => {
+    raf = 0;
+    draw(now);
+    if (running) raf = requestAnimationFrame(loop);
+  };
+
+  const requestDraw = () => {
+    if (!ok) return;
+    if (!running) {
+      draw(performance.now());
+      return;
+    }
+    if (!raf) raf = requestAnimationFrame(loop);
+  };
+
+  /* ------------------------------------------------------------------ ui */
+
+  const GRID_NOTE = "校准靶叠加：盯住面板边缘的圆环和辐条，被拉弯、错位或断开的地方就是折射；CSS 档只会把它糊掉。";
+  const CSS_NOTE = "CSS 档只保留背景模糊和底色，没有边缘折射；切回液态折射再调强度、边缘、角度和泛光。";
+
+  function syncNote() {
+    const scene = SCENES[state.scene];
+    $("#diag-note").textContent = state.render === "css"
+      ? CSS_NOTE
+      : (state.grid ? GRID_NOTE : scene.note);
+  }
+
+  const notice = (text) => {
+    const el = $("#notice");
+    el.textContent = text;
+    el.classList.add("show");
+    clearTimeout(notice.timer);
+    notice.timer = setTimeout(() => el.classList.remove("show"), 2800);
+  };
+
+  const syncPause = () => {
+    const btn = $("#pause-btn");
+    btn.innerHTML = running
+      ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5v14M15 5v14"/></svg>'
+      : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg>';
+    btn.title = running ? "暂停环境流动" : "继续环境流动";
+    btn.setAttribute("aria-label", btn.title);
+  };
+
+  const syncAngle = (angle, source) => {
+    state.angle = Math.round(angle) % 360;
+    const value = String(state.angle);
+    $("#s-angle").value = value;
+    $("#v-angle").value = `${value}°`;
+    $("#tag-spec").textContent = `${value}°`;
+    $("#stat-angle").innerHTML = `${value}<small>°</small>`;
+    $("#nav-angle").textContent = `${value}°`;
+    $("#light-pill").setAttribute("aria-valuenow", value);
+    if (source !== "drag") {
+      // 手动调角度时，把光源放到同一个方向，场景里的亮斑跟着走。
+      const rad = (state.angle * Math.PI) / 180;
+      state.light = {
+        x: clamp(0.5 + Math.cos(rad) * 0.42, 0.04, 0.96),
+        y: clamp(0.5 - Math.sin(rad) * 0.42, 0.04, 0.96),
+      };
+    }
+    requestDraw();
+  };
+
+  const applyScene = (id, quiet = false) => {
+    const scene = SCENES[id] || SCENES.aurora;
+    state.scene = SCENES[id] ? id : "aurora";
+    document.documentElement.dataset.theme = scene.dark ? "dark" : "light";
+    $("#top-scene").textContent = scene.name;
+    $("#hero-chip").textContent = scene.tag;
+    $("#scene-hint").textContent = scene.hint;
+    $("#diag-tag").textContent = scene.tag;
+    $("#stat-read").innerHTML = `${scene.read}<small>/100</small>`;
+    $("#stat-refract").innerHTML = `${scene.refract}<small>/100</small>`;
+    $("#stat-read").parentElement.querySelector("i").style.setProperty("--w", `${scene.read}%`);
+    $("#stat-refract").parentElement.querySelector("i").style.setProperty("--w", `${scene.refract}%`);
+    $("#m-read").style.width = `${scene.read}%`;
+    $("#m-refract").style.width = `${scene.refract}%`;
+    $("#v-read").textContent = String(scene.read);
+    $("#v-refract").textContent = String(scene.refract);
+    syncNote();
+    $$("[data-scene]").forEach((b) => b.classList.toggle("active", b.dataset.scene === state.scene));
+    layoutDirty = true;
+    requestDraw();
+    if (!quiet) {
+      // 背景切换后，如果当前是 CSS 档，让面板的模糊重新采样一次
+      if (state.render === "css") {
+        document.body.style.setProperty("--blur", `${state.blur}px`);
+      }
+    }
+  };
+
+  const setRender = (mode) => {
+    if (mode === "gl" && !ok) {
+      notice("WebGL 2 不可用，已保留 CSS 玻璃");
+      mode = "css";
+    }
+    state.render = mode;
+    document.body.dataset.render = mode;
+    $("#top-mode").textContent = mode === "gl" ? "WEBGL 2" : "CSS";
+    $("#nav-render").textContent = mode === "gl" ? "WEBGL" : "CSS";
+    $("#render-hint").textContent = mode === "gl" ? "REFRACTION ON" : "BLUR ONLY";
+    $$("#render-seg button").forEach((b) => b.classList.toggle("active", b.dataset.render === mode));
+    syncNote();
+    layoutDirty = true;
+    requestDraw();
+  };
+
+  const setStyle = (style) => {
+    state.style = style === "stretch" ? "stretch" : "flat";
+    $("#style-hint").textContent = state.style === "flat" ? "iOS · 宽域平齐" : "鸿蒙 · 窄圈外扩";
+    $$("#style-seg button").forEach((b) => b.classList.toggle("active", b.dataset.style === state.style));
+    requestDraw();
+  };
+
+  const setSlider = (key, value, format) => {
+    state[key] = value;
+    const out = $(`#v-${key === "strength" ? "strength" : key}`);
+    if (out) out.textContent = format;
+    if (key === "blur") {
+      document.documentElement.style.setProperty("--blur", `${value}px`);
+      $("#tag-blur").textContent = `${value}px`;
+    }
+    if (key === "edge") {
+      $("#v-edge").textContent = `${value}px`;
+      $("#tag-edge").textContent = `${value}px`;
+      layoutDirty = true;
+    }
+    if (key === "bloom") $("#v-bloom").textContent = value.toFixed(2);
+    if (key === "strength") $("#v-strength").textContent = `${value.toFixed(2)}×`;
+    requestDraw();
+  };
+
+  const moveLight = (clientX, clientY) => {
+    const x = clamp(clientX / window.innerWidth, 0.02, 0.98);
+    const y = clamp(clientY / window.innerHeight, 0.02, 0.98);
+    state.light = { x, y };
+    const hint = $("#light-hint");
+    hint.style.left = `${x * 100}%`;
+    hint.style.top = `${y * 100}%`;
+    const ang = (Math.atan2(
+      -(y * window.innerHeight - window.innerHeight / 2),
+      x * window.innerWidth - window.innerWidth / 2,
+    ) * 180) / Math.PI;
+    syncAngle((ang + 360) % 360, "drag");
+  };
+
+  const reset = () => {
+    state.blur = DEFAULTS.blur;
+    state.strength = DEFAULTS.strength;
+    state.edge = DEFAULTS.edge;
+    state.angle = DEFAULTS.angle;
+    state.bloom = DEFAULTS.bloom;
+    state.light = { ...DEFAULTS.light };
+    state.style = DEFAULTS.style;
+    state.grid = false;
+    $("#grid-toggle").checked = false;
+    $("#s-blur").value = String(state.blur);
+    $("#s-strength").value = String(Math.round(state.strength * 100));
+    $("#s-edge").value = String(state.edge);
+    $("#s-angle").value = String(state.angle);
+    $("#s-bloom").value = String(Math.round(state.bloom * 100));
+    $("#v-blur").textContent = `${state.blur}px`;
+    $("#v-strength").textContent = `${state.strength.toFixed(2)}×`;
+    $("#v-edge").textContent = `${state.edge}px`;
+    $("#v-angle").textContent = `${state.angle}°`;
+    $("#v-bloom").textContent = state.bloom.toFixed(2);
+    $("#tag-blur").textContent = `${state.blur}px`;
+    $("#tag-edge").textContent = `${state.edge}px`;
+    $("#tag-spec").textContent = `${state.angle}°`;
+    $("#stat-angle").innerHTML = `${state.angle}<small>°</small>`;
+    $("#nav-angle").textContent = `${state.angle}°`;
+    document.documentElement.style.setProperty("--blur", `${state.blur}px`);
+    setStyle(DEFAULTS.style);
+    applyScene(DEFAULTS.scene, true);
+    setRender(ok ? DEFAULTS.render : "css");
+    syncNote();
+    layoutDirty = true;
+    requestDraw();
+  };
+
+  /* ------------------------------------------------------------------ bind */
+
+  const bind = () => {
+    $$("[data-scene]").forEach((b) => b.addEventListener("click", () => applyScene(b.dataset.scene)));
+    $$("#render-seg button").forEach((b) => b.addEventListener("click", () => setRender(b.dataset.render)));
+    $$("#style-seg button").forEach((b) => b.addEventListener("click", () => setStyle(b.dataset.style)));
+
+    $("#s-blur").addEventListener("input", (e) => setSlider("blur", Number(e.target.value), `${e.target.value}px`));
+    $("#s-strength").addEventListener("input", (e) => setSlider("strength", Number(e.target.value) / 100, `${(Number(e.target.value) / 100).toFixed(2)}×`));
+    $("#s-edge").addEventListener("input", (e) => setSlider("edge", Number(e.target.value), `${e.target.value}px`));
+    $("#s-angle").addEventListener("input", (e) => syncAngle(Number(e.target.value), "slider"));
+    $("#s-bloom").addEventListener("input", (e) => setSlider("bloom", Number(e.target.value) / 100, (Number(e.target.value) / 100).toFixed(2)));
+    $("#grid-toggle").addEventListener("change", (e) => {
+      state.grid = e.target.checked;
+      syncNote();
+      requestDraw();
+    });
+
+    $("#pause-btn").addEventListener("click", () => {
+      running = !running;
+      last = 0;
+      syncPause();
+      $("#top-fps").textContent = running ? "— FPS" : "PAUSED";
+      $("#fps").textContent = running ? "—" : "PAUSED";
+      if (running) requestDraw();
+      else draw(performance.now());
+    });
+    $("#reset-btn").addEventListener("click", reset);
+
+    const pill = $("#light-pill");
+    let dragging = false;
+    pill.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      pill.classList.add("dragging");
+      document.body.classList.add("is-dragging");
+      moveLight(e.clientX, e.clientY);
+      e.preventDefault();
+    });
+    window.addEventListener("pointermove", (e) => {
+      if (dragging) moveLight(e.clientX, e.clientY);
+    }, { passive: true });
+    const stop = () => {
+      dragging = false;
+      pill.classList.remove("dragging");
+      document.body.classList.remove("is-dragging");
+    };
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+
+    pill.addEventListener("keydown", (e) => {
+      const step = e.shiftKey ? 0.08 : 0.03;
+      if (e.key === "ArrowLeft") { state.light.x = clamp(state.light.x - step, 0.03, 0.97); }
+      else if (e.key === "ArrowRight") { state.light.x = clamp(state.light.x + step, 0.03, 0.97); }
+      else if (e.key === "ArrowUp") { state.light.y = clamp(state.light.y - step, 0.03, 0.97); }
+      else if (e.key === "ArrowDown") { state.light.y = clamp(state.light.y + step, 0.03, 0.97); }
+      else return;
+      e.preventDefault();
+      const hint = $("#light-hint");
+      hint.style.left = `${state.light.x * 100}%`;
+      hint.style.top = `${state.light.y * 100}%`;
+      const ang = (Math.atan2(
+        -(state.light.y * window.innerHeight - window.innerHeight / 2),
+        state.light.x * window.innerWidth - window.innerWidth / 2,
+      ) * 180) / Math.PI;
+      syncAngle((ang + 360) % 360, "drag");
+    });
+
+    window.addEventListener("resize", () => {
+      layoutDirty = true;
+      try { resize(); } catch (err) { fallback(err); }
+    });
+    window.addEventListener("scroll", () => { layoutDirty = true; requestDraw(); }, { passive: true });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      } else {
+        last = 0;
+        requestDraw();
+      }
+    });
+    reduced.addEventListener("change", () => {
+      state.paused = reduced.matches;
+      running = !state.paused;
+      syncPause();
+      last = 0;
+      requestDraw();
+    });
+
+    canvas.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      ok = false;
+      cancelAnimationFrame(raf);
+      raf = 0;
+      setRender("css");
+      notice("GPU 上下文丢失，已回退 CSS 玻璃");
+    });
+    canvas.addEventListener("webglcontextrestored", () => {
+      try {
+        initGL();
+        setRender("gl");
+        notice("GPU 已恢复，重新启用折射");
+      } catch (err) {
+        fallback(err);
+      }
+    });
+  };
+
+  const fallback = (err) => {
+    console.warn("[lumen] WebGL fallback:", err);
+    ok = false;
+    state.render = "css";
+    document.body.dataset.render = "css";
+    $$("#render-seg button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.render === "css");
+    });
+    $("#top-mode").textContent = "CSS";
+    $("#nav-render").textContent = "CSS";
+    $("#render-hint").textContent = "BLUR ONLY";
+    syncNote();
+    notice("WebGL 初始化失败，已回退 CSS 玻璃");
+  };
+
+  /* ------------------------------------------------------------------ boot */
+
+  const boot = () => {
+    bind();
+    syncPause();
+    document.documentElement.style.setProperty("--blur", `${state.blur}px`);
+    applyScene(state.scene, true);
+    setStyle(state.style);
+    if (!gl) {
+      fallback(new Error("WebGL 2 unavailable"));
+      return;
+    }
+    try {
+      initGL();
+      setRender("gl");
+      requestDraw();
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(() => { layoutDirty = true; requestDraw(); });
+      }
+    } catch (err) {
+      fallback(err);
+    }
+  };
+
+  // 控制台入口：__lumen.state 可直接改参数，__lumen.rects() 看当前玻璃矩形数。
+  window.__lumen = { state, rects: () => rectCount, collect };
+  boot();
+})();
+
+</script>
+</body>
+</html>

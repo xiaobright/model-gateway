@@ -5,6 +5,7 @@
 - [四种风格对比](home-style-gallery.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/home-styles/home-style-gallery.html>。顶部可切换单版或并排比较，也可在浏览器内收藏喜欢的风格。
 - [控制台重构样稿](../console-redesign/console-demo.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/console-redesign/console-demo.html>。石墨工作台、流水线候选卡片、三列流量关系图、实时请求瀑布轴与统一排查抽屉。
 - [NEXUS 控制台样稿](../nexus-console/index.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/nexus-console/index.html>。深空玻璃、路由星系、实时总览与命令面板；直接读取真实 Admin API，操作会落到当前配置。
+- [液态玻璃背景实验](liquid-glass-playground.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/home-styles/liquid-glass-playground.html>。四种为玻璃设计的背景（极光、霓虹、暖纸、丝绸），可切 CSS / WebGL、平齐 / 外扩、校准靶与可拖动光源。单文件无依赖，默认不参与正式页面。
 - [液态玻璃实验](liquid-glass-lab.html)：网关运行时打开 <http://127.0.0.1:8317/static/experiments/home-styles/liquid-glass-lab.html>。保留 CSS、均衡、极致三档和测量面板。
 - [液态玻璃性能记录](liquid-glass-benchmark.md)及[原始测量数据](liquid-glass-benchmark.json)：保留实验当时的对照结果与适用边界。
 
