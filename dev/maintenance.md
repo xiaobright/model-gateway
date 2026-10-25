@@ -533,6 +533,8 @@ pwsh -NoProfile -File dev\capture-net.ps1 -Stop    # 停止并转成 pcapng
 - Windows 托盘模式有单实例检查。虚拟环境的 `pythonw.exe` 出现父子两个进程可能是正常启动方式，不等于开了两套服务。
 - 托盘等待服务线程就绪的上限为 60 秒；线程提前退出或已记录启动错误时立即结束等待。超时会请求停止本次启动，避免迟到启动继续作为正常服务运行；这不是端口占用的证据。
 - 启动失败优先查看 `data/startup.log`。弹窗区分端口被占用、系统拒绝绑定、其他绑定失败、初始化异常、线程异常和等待超时；无控制台的 `pythonw.exe` 也会保留后台线程异常（含 Uvicorn 的 `SystemExit`）。日志无法写入时弹窗会提示检查目录权限。
+- `winerror 10013`（拒绝访问）和 `10048`（已被占用）是两回事：前者多是端口被系统保留或临时借作客户端端口，后者说明确有进程在监听。绑定被拒时会退避重试 `BIND_ATTEMPTS` 次（间隔 `BIND_RETRY_DELAY`），仍失败才弹窗；`10048` 不重试，避免把明确结论拖成慢失败。
+- 重试也失败时查端口保留：`netsh int ipv4 show excludedportrange protocol=tcp` 和 `netsh int ipv4 show dynamicport tcp`。本机 `MaxUserPort=15000` 把动态端口段压到 1024–15000，8317 落在其中，会被出站连接偶发借用。
 - 双击脚本的健康检查绕过代理，并至少留出上述等待窗口；收到非成功 HTTP 状态不会判定为已启动。开机自启快捷方式直接运行托盘入口，不经过 BAT。
 - 优先用托盘「退出」；前台模式用 `Ctrl+C`。管理接口也提供 `POST /admin/api/shutdown`，不要在有重要请求时调用。
 

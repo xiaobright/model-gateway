@@ -12,6 +12,11 @@ from .app import create_app
 from .startup import StartupError, logger
 
 STARTUP_TIMEOUT = 60.0
+# 10013 多发生在端口正被系统当作临时端口借用：本机动态端口段被压到 1024 起时，
+# 8317 这类服务端口会偶发撞车，冲突窗口通常只有毫秒级。短暂退避后重试即可，
+# 总重试窗口（BIND_ATTEMPTS - 1）× BIND_RETRY_DELAY 远小于 STARTUP_TIMEOUT。
+BIND_ATTEMPTS = 4
+BIND_RETRY_DELAY = 0.4
 
 
 class GatewayServer(uvicorn.Server):
@@ -23,13 +28,18 @@ class _StartupErrors(logging.Handler):
         super().__init__(logging.WARNING)
         self.server = server
         self.thread_id = threading.get_ident()
+        # 先记在本地：退避重试期间不能让等待方误以为已经失败。
+        self.error: StartupError | None = None
+
+    def reset(self) -> None:
+        self.error = None
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.thread != self.thread_id or self.server.started:
             return
         detail = self.format(record)
         logger.log(record.levelno, "%s", detail)
-        if record.levelno < logging.ERROR or self.server.startup_error is not None:
+        if record.levelno < logging.ERROR or self.error is not None:
             return
         kind = "thread_failed"
         if isinstance(record.msg, OSError):
@@ -40,7 +50,15 @@ class _StartupErrors(logging.Handler):
                 kind = "bind_denied"
             else:
                 kind = "bind_failed"
-        self.server.startup_error = StartupError(kind, detail)
+        self.error = StartupError(kind, detail)
+
+
+def _should_retry_bind(server: GatewayServer, error: StartupError | None, attempt: int) -> bool:
+    """只有 10013 值得重试：它多半是端口被临时借用，退避一下就能拿到。"""
+    if server.started or server.should_exit or attempt >= BIND_ATTEMPTS:
+        return False
+    # 10048 说明确实有进程在监听，重试只会把明确结论拖成慢失败。
+    return error is not None and error.kind == "bind_denied"
 
 
 def wait_for_startup(
@@ -100,12 +118,35 @@ def start_server_thread(port: int, host: str = "127.0.0.1") -> tuple[GatewayServ
         uvicorn_logger = logging.getLogger("uvicorn.error")
         uvicorn_logger.addHandler(errors)
         try:
-            server.run()
-        except BaseException as exc:
-            # Uvicorn 的监听/生命周期失败会在后台线程中抛 SystemExit。
-            if not server.started and server.startup_error is None:
-                server.startup_error = StartupError("thread_failed", f"{type(exc).__name__}: {exc}")
-            logger.exception("服务线程退出 started=%s", server.started)
+            attempt = 0
+            while True:
+                attempt += 1
+                errors.reset()
+                try:
+                    server.run()
+                except BaseException as exc:
+                    # Uvicorn 的监听/生命周期失败会在后台线程中抛 SystemExit。
+                    failure = errors.error or StartupError("thread_failed", f"{type(exc).__name__}: {exc}")
+                    if _should_retry_bind(server, failure, attempt):
+                        logger.warning(
+                            "绑定 %s:%s 被瞬时占用，%.1f 秒后重试（第 %d/%d 次）",
+                            host, port, BIND_RETRY_DELAY, attempt, BIND_ATTEMPTS - 1,
+                        )
+                        time.sleep(BIND_RETRY_DELAY)
+                        continue
+                    # 确定不再重试才对外公布，否则等待方会在退避期间提前弹窗。
+                    server.startup_error = failure
+                    if failure.kind == "bind_denied":
+                        logger.error(
+                            "已尝试绑定 %d 次仍被拒绝；可查端口保留："
+                            "netsh int ipv4 show excludedportrange protocol=tcp，"
+                            "以及 netsh int ipv4 show dynamicport tcp",
+                            attempt,
+                        )
+                    logger.exception("服务线程退出 started=%s", server.started)
+                    break
+                else:
+                    break
         finally:
             uvicorn_logger.removeHandler(errors)
             errors.close()

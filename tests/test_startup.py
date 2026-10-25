@@ -8,6 +8,7 @@ import logging
 import socket
 import sys
 import threading
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -145,12 +146,129 @@ def test_bind_errors_retain_their_specific_reason(monkeypatch, code, kind):
 
     monkeypatch.setattr(server_mod.GatewayServer, "run", fail_run)
     server, thread = server_mod.start_server_thread(0)
-    thread.join(timeout=5)
+    thread.join(timeout=15)
     assert not thread.is_alive()
     with pytest.raises(startup.StartupError) as caught:
         server_mod.wait_for_startup(server, thread)
     assert caught.value.kind == kind
     assert "test bind error" in str(caught.value)
+
+
+def test_transient_bind_denial_is_retried_and_then_starts(monkeypatch):
+    """10013 多为端口被临时借用；退避一次就该成功，而不是直接弹窗退出。"""
+    log_path = startup.configure_logging()
+    monkeypatch.setattr(server_mod, "create_app", FastAPI)
+    calls = []
+
+    def flaky_run(self):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            logging.getLogger("uvicorn.error").error(OSError(errno.EACCES, "transient-bind-denial"))
+            raise SystemExit(3)
+        self.started = True
+
+    monkeypatch.setattr(server_mod.GatewayServer, "run", flaky_run)
+    server, thread = server_mod.start_server_thread(0)
+    thread.join(timeout=15)
+    assert not thread.is_alive()
+    assert len(calls) == 2
+    assert server.started and server.startup_error is None
+    text = log_path.read_text(encoding="utf-8")
+    assert "transient-bind-denial" in text and "重试" in text
+
+
+def test_backoff_does_not_publish_the_transient_error_to_waiters(monkeypatch):
+    """退避期间 wait_for_startup 必须继续等待；提前公布会当场变成失败弹窗。"""
+    monkeypatch.setattr(server_mod, "create_app", FastAPI)
+    monkeypatch.setattr(server_mod, "BIND_RETRY_DELAY", 1.0)
+    first_failed = threading.Event()
+    calls = []
+
+    def flaky_run(self):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            logging.getLogger("uvicorn.error").error(OSError(errno.EACCES, "backoff-window"))
+            first_failed.set()
+            raise SystemExit(3)
+        self.started = True
+
+    monkeypatch.setattr(server_mod.GatewayServer, "run", flaky_run)
+    server, thread = server_mod.start_server_thread(0)
+    assert first_failed.wait(5)
+    assert server.startup_error is None
+    thread.join(timeout=15)
+    assert not thread.is_alive()
+    assert len(calls) == 2
+    assert server.started and server.startup_error is None
+
+
+def test_persistent_bind_denial_gives_up_after_the_retry_budget(monkeypatch):
+    monkeypatch.setattr(server_mod, "create_app", FastAPI)
+    calls = []
+
+    def always_denied(self):
+        calls.append(len(calls) + 1)
+        logging.getLogger("uvicorn.error").error(OSError(errno.EACCES, "persistent-bind-denial"))
+        raise SystemExit(3)
+
+    monkeypatch.setattr(server_mod.GatewayServer, "run", always_denied)
+    server, thread = server_mod.start_server_thread(0)
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert len(calls) == server_mod.BIND_ATTEMPTS
+    with pytest.raises(startup.StartupError) as caught:
+        server_mod.wait_for_startup(server, thread)
+    assert caught.value.kind == "bind_denied"
+    assert "persistent-bind-denial" in str(caught.value)
+
+
+def test_requested_stop_is_not_retried(monkeypatch):
+    """启动超时已经把 should_exit 置位时不能再拉起一轮，否则弹窗后服务仍会活着。"""
+    monkeypatch.setattr(server_mod, "create_app", FastAPI)
+    calls = []
+
+    def stopping_run(self):
+        calls.append(len(calls) + 1)
+        self.should_exit = True
+        logging.getLogger("uvicorn.error").error(OSError(errno.EACCES, "denied-after-stop"))
+        raise SystemExit(3)
+
+    monkeypatch.setattr(server_mod.GatewayServer, "run", stopping_run)
+    server, thread = server_mod.start_server_thread(0)
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert len(calls) == 1
+
+
+@pytest.mark.network
+def test_uvicorn_instance_starts_again_after_a_real_bind_failure(monkeypatch):
+    """重试复用同一个 Server 实例；这里用真实 uvicorn 验证失败后确实能再监听。"""
+    monkeypatch.setattr(server_mod, "create_app", FastAPI)
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    port = blocker.getsockname()[1]
+    server, thread = server_mod.start_server_thread(port)
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert server.startup_error.kind == "port_in_use"
+    blocker.close()
+
+    server.should_exit = False
+    server.started = False
+    server.startup_error = None
+    retry_thread = threading.Thread(target=server.run, name="gateway-server-retry", daemon=True)
+    retry_thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline and retry_thread.is_alive():
+            time.sleep(0.02)
+        assert server.started, "同一实例在绑定失败后无法再次监听"
+        assert server.servers[0].sockets[0].getsockname()[1] == port
+    finally:
+        server.should_exit = True
+        retry_thread.join(timeout=5)
+    assert not retry_thread.is_alive()
 
 
 def test_logging_is_bounded_and_reconfiguration_does_not_duplicate_records():
